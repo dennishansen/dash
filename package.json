@@ -1,0 +1,43 @@
+{
+  "name": "@dennishansen/dash",
+  "version": "0.1.0",
+  "description": "A self-hostable kanban board + browser terminal dashboard, backed by your own Supabase project.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Dennis Hansen",
+  "bin": {
+    "dash": "bin/dash.mjs"
+  },
+  "files": [
+    "dist",
+    "server",
+    "bin",
+    "supabase",
+    "index.html",
+    "vite.config.js",
+    "README.md",
+    "LICENSE",
+    ".env.example"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "start": "node bin/dash.mjs"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "0.12.0-beta.287",
+    "@xterm/addon-webgl": "0.20.0-beta.286",
+    "@xterm/xterm": "6.1.0-beta.287",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.30.3",
+    "vite": "^7.3.1",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.7.0"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.1.0"
+  }
+}

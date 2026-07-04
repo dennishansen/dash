@@ -1,0 +1,135 @@
+#!/usr/bin/env node
+// dash — serve the built Dash app + its backend from a single Node http server.
+//
+// This is how end users run Dash after `npm install && npm run build`:
+//
+//   dash              # serves dist/ on PORT (default 5173)
+//   PORT=8080 dash    # pick a port
+//
+// It does three things on one http.Server:
+//   1. Static-serves the built SPA out of dist/ (index.html fallback for the
+//      HashRouter client routes).
+//   2. Mounts the dash API middleware (dashApi + gifsServe) at /api/dash & the
+//      GIF redirect — the same middleware the dev server uses.
+//   3. Upgrades /api/dash/terminal WebSocket connections to a real PTY, IF the
+//      optional native dep node-pty is installed (terminal.js). Without it, the
+//      board/corpus/hypotheses still work; only the browser terminal is off.
+//
+// Dependency-light on purpose: Node's own http + the `ws` server, plus the
+// existing server modules. No Express, no Vite at runtime.
+
+import http from 'http';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { WebSocketServer } from 'ws';
+
+// Load DASH_SUPABASE_* from .env / .env.local into process.env before the store
+// reads them. Node-only side-effect import.
+import '../server/node-env.mjs';
+import { dashApi, gifsServe } from '../server/dash-api.js';
+import { assertConfigured } from '../server/dash-config.mjs';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, '..');
+const DIST = path.join(ROOT, 'dist');
+const PORT = Number(process.env.PORT) || 5173;
+
+// Fail loudly if the user hasn't brought a Supabase project.
+try {
+  assertConfigured();
+} catch (e) {
+  console.error('\n' + e.message + '\n');
+  process.exit(1);
+}
+
+if (!fs.existsSync(path.join(DIST, 'index.html'))) {
+  console.error(
+    `\nNo build found at ${DIST}.\nRun \`npm run build\` first, then \`dash\`.\n`,
+  );
+  process.exit(1);
+}
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.mp4': 'video/mp4',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ico': 'image/x-icon',
+  '.map': 'application/json; charset=utf-8',
+};
+
+const api = dashApi();
+const gifs = gifsServe();
+
+// Static file serve out of dist/, with SPA fallback to index.html. Path is
+// contained to DIST (no traversal).
+function serveStatic(req, res) {
+  const urlPath = decodeURIComponent((req.url || '/').split('?')[0]);
+  let rel = urlPath === '/' ? '/index.html' : urlPath;
+  let filePath = path.join(DIST, rel);
+  if (!filePath.startsWith(DIST + path.sep) && filePath !== DIST) {
+    res.writeHead(403);
+    res.end('forbidden');
+    return;
+  }
+  fs.stat(filePath, (err, stat) => {
+    if (err || !stat.isFile()) {
+      // SPA fallback: unknown non-asset path → index.html (client router owns it).
+      filePath = path.join(DIST, 'index.html');
+    }
+    const ext = path.extname(filePath).toLowerCase();
+    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
+    fs.createReadStream(filePath).pipe(res);
+  });
+}
+
+const server = http.createServer((req, res) => {
+  const url = req.url || '/';
+  // Backend middlewares first (each calls next() when it doesn't handle the req).
+  if (url.startsWith('/api/dash')) {
+    return api(req, res, () => serveStatic(req, res));
+  }
+  if (url.startsWith('/dash/gifs/')) {
+    return gifs(req, res, () => serveStatic(req, res));
+  }
+  return serveStatic(req, res);
+});
+
+// Terminal WebSocket upgrade — optional (needs node-pty). If it isn't installed,
+// terminal connections are simply refused and the rest of the app is unaffected.
+let attachChat = null;
+try {
+  const term = await import('../server/terminal.js');
+  attachChat = term.attachChat;
+} catch (e) {
+  console.log('[dash] terminal disabled (node-pty not installed):', e.message);
+}
+
+if (attachChat) {
+  const termWss = new WebSocketServer({ noServer: true });
+  server.on('upgrade', (req, socket, head) => {
+    const u = new URL(req.url || '/', 'http://localhost');
+    if (u.pathname !== '/api/dash/terminal') { socket.destroy(); return; }
+    const issueId = u.searchParams.get('issue');
+    const sessionId = u.searchParams.get('session');
+    const mode = u.searchParams.get('mode') || 'resume';
+    if (!issueId || (issueId !== 'main' && !sessionId)) { socket.destroy(); return; }
+    termWss.handleUpgrade(req, socket, head, (ws) => {
+      attachChat(ws, { issueId, sessionId, mode });
+    });
+  });
+}
+
+server.listen(PORT, () => {
+  console.log(`\n  Dash running → http://localhost:${PORT}\n`);
+});

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- Inline SVG favicon: stops the /favicon.ico 404 on load, no asset needed. -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%2322c55e'/%3E%3C/svg%3E" />
+  <title>Dash</title>
+  <!-- Oxanium — the dash UI typeface (a techy, angular geometric sans). The
+       live chat terminal stays monospace (set by xterm). -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Oxanium:wght@400;500;600;700&display=swap" />
+  <!-- Pre-paint theme: set the attribute before the stylesheet applies so a
+       light-theme user never sees a dark flash. Absence = dark (default). -->
+  <script>
+    if (localStorage.getItem('dash-theme') === 'light') {
+      document.documentElement.dataset.theme = 'light';
+    }
+  </script>
+  <link rel="stylesheet" href="/src/styles.css" />
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="/src/main.jsx"></script>
+</body>
+</html>
