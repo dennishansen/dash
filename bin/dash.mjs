@@ -29,11 +29,15 @@ import { WebSocketServer } from 'ws';
 import '../server/node-env.mjs';
 import { dashApi, gifsServe } from '../server/dash-api.js';
 import { assertConfigured } from '../server/dash-config.mjs';
+import { isAllowedWsOrigin } from '../server/ws-guard.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const DIST = path.join(ROOT, 'dist');
 const PORT = Number(process.env.PORT) || 5173;
+// Bind loopback by default so the terminal PTY isn't exposed to the network.
+// Opt into exposure with DASH_HOST=0.0.0.0 (and set DASH_ALLOWED_ORIGINS).
+const HOST = process.env.DASH_HOST || '127.0.0.1';
 
 // Fail loudly if the user hasn't brought a Supabase project.
 try {
@@ -120,6 +124,8 @@ if (attachChat) {
   server.on('upgrade', (req, socket, head) => {
     const u = new URL(req.url || '/', 'http://localhost');
     if (u.pathname !== '/api/dash/terminal') { socket.destroy(); return; }
+    // Reject cross-origin handshakes — this socket grants a PTY (see ws-guard).
+    if (!isAllowedWsOrigin(req)) { socket.destroy(); return; }
     const issueId = u.searchParams.get('issue');
     const sessionId = u.searchParams.get('session');
     const mode = u.searchParams.get('mode') || 'resume';
@@ -130,6 +136,14 @@ if (attachChat) {
   });
 }
 
-server.listen(PORT, () => {
-  console.log(`\n  Dash running → http://localhost:${PORT}\n`);
+server.listen(PORT, HOST, () => {
+  const shown = HOST === '127.0.0.1' || HOST === 'localhost' ? 'localhost' : HOST;
+  console.log(`\n  Dash running → http://${shown}:${PORT}\n`);
+  if (HOST === '0.0.0.0') {
+    console.log(
+      '  ⚠ Bound to all interfaces (DASH_HOST=0.0.0.0): the terminal is reachable\n' +
+      '    from your network. Only do this on a trusted network, and set\n' +
+      '    DASH_ALLOWED_ORIGINS to your deployment origin.\n',
+    );
+  }
 });

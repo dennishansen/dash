@@ -62,6 +62,8 @@ npm run dev        # Vite dev server with HMR + the same backend middleware
 | `DASH_SUPABASE_URL` | yes | node + browser (baked at build) | Your project URL, e.g. `https://xxxx.supabase.co` |
 | `DASH_SUPABASE_ANON_KEY` | yes | node + browser (baked at build) | Public anon/publishable key. Identifies the project; grants nothing on its own (RLS gates access). |
 | `DASH_SUPABASE_SERVICE_KEY` | for local writes | **node only** — never shipped to the browser | Service-role key. Bypasses RLS so the local server can read/write the board and mint a local dev session. Keep it secret. |
+| `DASH_HOST` | no | node (`npm start`) | Interface to bind. Defaults to `127.0.0.1` (loopback only). Set to `0.0.0.0` to expose on your network — only on a trusted network. |
+| `DASH_ALLOWED_ORIGINS` | no | node (`npm start` / dev) | Comma-separated extra origins allowed to open the terminal websocket (e.g. `https://dash.example.com`). Loopback origins are always allowed. Needed if you expose Dash beyond localhost. |
 
 Set these in `.env` / `.env.local` (git-ignored) or in the real environment. The
 browser values are injected at **build time**, so re-run `npm run build` after
@@ -93,6 +95,25 @@ features light up only when the local backend is running (probed once at boot vi
 
 If all you want is a clean, self-hosted, realtime kanban, you can ignore the lab
 views entirely — they degrade gracefully.
+
+## Security
+
+The browser terminal spawns a **real shell/PTY on the host** for any signed-in
+user. Treat access to a running Dash the way you'd treat SSH to that machine.
+Two protections are on by default:
+
+- **Loopback bind.** `npm start` binds `127.0.0.1`, so the server (and the
+  terminal) is reachable only from the same machine. Expose it deliberately with
+  `DASH_HOST=0.0.0.0`, and only on a network you trust.
+- **Same-origin terminal handshake.** The terminal websocket rejects any
+  handshake whose `Origin` isn't loopback (or listed in `DASH_ALLOWED_ORIGINS`).
+  Browsers don't apply the same-origin policy to websockets, so without this a
+  page you merely *visit* could open the terminal socket — this closes that
+  drive-by (and DNS-rebinding) class of attack.
+
+If you deploy Dash behind a real origin, set `DASH_ALLOWED_ORIGINS` to that
+origin and put it behind your own auth/TLS. Access is otherwise gated by
+Supabase email-OTP sign-in against the `dash_allowed_emails` allow-list.
 
 ## How it works
 

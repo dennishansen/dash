@@ -18,6 +18,7 @@
 
 import { WebSocketServer } from 'ws';
 import react from '@vitejs/plugin-react';
+import { isAllowedWsOrigin } from './server/ws-guard.mjs';
 // Load DASH_SUPABASE_* from .env / .env.local into process.env BEFORE anything
 // reads it (the dev middleware store writes with the service role). The browser
 // bundle never imports this file.
@@ -81,6 +82,8 @@ export default {
           server.httpServer.on('upgrade', (req, socket, head) => {
             const url = new URL(req.url || '/', 'http://localhost');
             if (url.pathname !== '/api/dash/terminal') return;
+            // Reject cross-origin handshakes — this socket grants a PTY.
+            if (!isAllowedWsOrigin(req)) { socket.destroy(); return; }
             const issueId = url.searchParams.get('issue');
             const sessionId = url.searchParams.get('session');
             const mode = url.searchParams.get('mode') || 'resume';
