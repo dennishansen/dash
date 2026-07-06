@@ -9,6 +9,7 @@ import { useLocalBackend } from '../capabilities.js';
 import { Plus, X } from '../icons.jsx';
 import { viewportText, spinnerState } from '../spinner.js';
 import { reportActivity, clearActivity } from '../activity-store.js';
+import { getTerminalToken } from '../terminal-token.js';
 
 // Per-issue dev environment in the right sidebar.
 //
@@ -87,11 +88,15 @@ function ChatPane({ issueId, sessionId, mode, active }) {
     requestAnimationFrame(() => { try { fit.fit(); } catch {} if (!isMain) term.focus(); });
 
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    // The token is only required when Dash is network-exposed; on loopback it's
+    // empty and omitted (see terminal-token.js / server/ws-guard.mjs).
+    const token = getTerminalToken();
     const ws = new WebSocket(
       `${proto}//${location.host}/api/dash/terminal`
       + `?issue=${encodeURIComponent(issueId)}`
       + (sessionId ? `&session=${encodeURIComponent(sessionId)}` : '')
       + `&mode=${encodeURIComponent(mode || 'resume')}`
+      + (token ? `&token=${encodeURIComponent(token)}` : '')
     );
 
     const sendResize = () => {

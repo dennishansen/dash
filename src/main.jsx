@@ -1,3 +1,5 @@
+// Capture + strip the terminal ?token= from the URL before anything renders.
+import './terminal-token.js';
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import {

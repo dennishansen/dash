@@ -64,6 +64,7 @@ npm run dev        # Vite dev server with HMR + the same backend middleware
 | `DASH_SUPABASE_SERVICE_KEY` | for local writes | **node only** — never shipped to the browser | Service-role key. Bypasses RLS so the local server can read/write the board and mint a local dev session. Keep it secret. |
 | `DASH_HOST` | no | node (`npm start`) | Interface to bind. Defaults to `127.0.0.1` (loopback only). Set to `0.0.0.0` to expose on your network — only on a trusted network. |
 | `DASH_ALLOWED_ORIGINS` | no | node (`npm start` / dev) | Comma-separated extra origins allowed to open the terminal websocket (e.g. `https://dash.example.com`). Loopback origins are always allowed. Needed if you expose Dash beyond localhost. |
+| `DASH_TERMINAL_TOKEN` | no | node (`npm start` / dev) | Secret required on the terminal handshake. Auto-generated (and the URL printed) whenever Dash binds a non-loopback host; set it to pin a stable token, or to require one on loopback too. |
 
 Set these in `.env` / `.env.local` (git-ignored) or in the real environment. The
 browser values are injected at **build time**, so re-run `npm run build` after
@@ -110,10 +111,18 @@ Two protections are on by default:
   Browsers don't apply the same-origin policy to websockets, so without this a
   page you merely *visit* could open the terminal socket — this closes that
   drive-by (and DNS-rebinding) class of attack.
+- **Secret token when exposed.** The Origin check only constrains *browsers* — a
+  direct network client (curl, a script) can send any `Origin` it likes. So the
+  moment Dash binds a routable host, the handshake also requires a secret token.
+  Dash generates one at startup and prints the URL to open (`…/?token=…`); the
+  browser reads the token from that URL and it never rides in the page HTML, so a
+  network attacker can't fetch it. This is what actually secures the exposed PTY
+  (the Origin list alone does not). Pin your own with `DASH_TERMINAL_TOKEN`.
 
 If you deploy Dash behind a real origin, set `DASH_ALLOWED_ORIGINS` to that
-origin and put it behind your own auth/TLS. Access is otherwise gated by
-Supabase email-OTP sign-in against the `dash_allowed_emails` allow-list.
+origin, open the tokenized URL Dash prints, and put it behind your own auth/TLS.
+Access is otherwise gated by Supabase email-OTP sign-in against the
+`dash_allowed_emails` allow-list.
 
 ## How it works
 

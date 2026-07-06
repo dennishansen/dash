@@ -18,7 +18,7 @@
 
 import { WebSocketServer } from 'ws';
 import react from '@vitejs/plugin-react';
-import { isAllowedWsOrigin } from './server/ws-guard.mjs';
+import { isAllowedWsHandshake, ensureTerminalToken, isLoopbackHost } from './server/ws-guard.mjs';
 // Load DASH_SUPABASE_* from .env / .env.local into process.env BEFORE anything
 // reads it (the dev middleware store writes with the service role). The browser
 // bundle never imports this file.
@@ -37,13 +37,42 @@ const defineSupabase = {
   __DASH_SUPABASE_ANON_KEY__: JSON.stringify(process.env.DASH_SUPABASE_ANON_KEY || ''),
 };
 
+// Dev server exposure mirrors bin/dash.mjs: loopback by default, opt into the
+// network with DASH_HOST. The dev server has its OWN DNS-rebinding surface
+// (Vite advisory GHSA-vg6x-rcgg-rjx6) separate from the WS handler, closed by
+// Host-header validation — so pin server.allowedHosts to the loopback names plus
+// whatever hostnames DASH_ALLOWED_ORIGINS names, never the permissive `true`.
+const DEV_HOST = process.env.DASH_HOST || '127.0.0.1';
+const DEV_TOKEN = ensureTerminalToken(!isLoopbackHost(DEV_HOST));
+const ALLOWED_HOSTS = ['localhost', '127.0.0.1', '[::1]'].concat(
+  (process.env.DASH_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((o) => { try { return new URL(o).hostname; } catch { return null; } })
+    .filter(Boolean),
+);
+
 export default {
   define: defineSupabase,
+  server: {
+    host: DEV_HOST,
+    allowedHosts: ALLOWED_HOSTS,
+  },
   plugins: [
     react({ include: /\.(jsx|tsx)$/ }),
     {
       name: 'dash-api',
       async configureServer(server) {
+        // When the dev server is network-exposed, the terminal handshake needs a
+        // token — print the tokenized URL (the only one that connects) once Vite
+        // is listening, since the client reads the token from its own address bar.
+        if (DEV_TOKEN) {
+          server.httpServer?.once('listening', () => {
+            const port = server.config.server.port || 5173;
+            console.log(`\n  [dash] terminal token required — open: http://localhost:${port}/?token=${DEV_TOKEN}\n`);
+          });
+        }
         // Terminal sidecar (browser terminal via node-pty). Optional: if node-pty
         // isn't installed, skip the terminal wiring but keep the board working.
         let attachChat = null;
@@ -82,8 +111,9 @@ export default {
           server.httpServer.on('upgrade', (req, socket, head) => {
             const url = new URL(req.url || '/', 'http://localhost');
             if (url.pathname !== '/api/dash/terminal') return;
-            // Reject cross-origin handshakes — this socket grants a PTY.
-            if (!isAllowedWsOrigin(req)) { socket.destroy(); return; }
+            // Gate the handshake — this socket grants a PTY: Origin allow-list,
+            // plus a secret token when the dev server is network-exposed.
+            if (!isAllowedWsHandshake(req)) { socket.destroy(); return; }
             const issueId = url.searchParams.get('issue');
             const sessionId = url.searchParams.get('session');
             const mode = url.searchParams.get('mode') || 'resume';

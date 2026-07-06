@@ -29,7 +29,7 @@ import { WebSocketServer } from 'ws';
 import '../server/node-env.mjs';
 import { dashApi, gifsServe } from '../server/dash-api.js';
 import { assertConfigured } from '../server/dash-config.mjs';
-import { isAllowedWsOrigin } from '../server/ws-guard.mjs';
+import { isAllowedWsHandshake, ensureTerminalToken, isLoopbackHost } from '../server/ws-guard.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -38,6 +38,11 @@ const PORT = Number(process.env.PORT) || 5173;
 // Bind loopback by default so the terminal PTY isn't exposed to the network.
 // Opt into exposure with DASH_HOST=0.0.0.0 (and set DASH_ALLOWED_ORIGINS).
 const HOST = process.env.DASH_HOST || '127.0.0.1';
+// When Dash is bound to a routable host, the Origin check no longer stops a
+// non-browser network client — so require a secret token on the terminal
+// handshake. Auto-generated here (and printed below) unless the operator pinned
+// DASH_TERMINAL_TOKEN. Loopback stays token-free.
+const TERMINAL_TOKEN = ensureTerminalToken(!isLoopbackHost(HOST));
 
 // Fail loudly if the user hasn't brought a Supabase project.
 try {
@@ -124,8 +129,9 @@ if (attachChat) {
   server.on('upgrade', (req, socket, head) => {
     const u = new URL(req.url || '/', 'http://localhost');
     if (u.pathname !== '/api/dash/terminal') { socket.destroy(); return; }
-    // Reject cross-origin handshakes — this socket grants a PTY (see ws-guard).
-    if (!isAllowedWsOrigin(req)) { socket.destroy(); return; }
+    // Gate the handshake — this socket grants a PTY (see ws-guard): Origin
+    // allow-list, plus a secret token when Dash is network-exposed.
+    if (!isAllowedWsHandshake(req)) { socket.destroy(); return; }
     const issueId = u.searchParams.get('issue');
     const sessionId = u.searchParams.get('session');
     const mode = u.searchParams.get('mode') || 'resume';
@@ -138,12 +144,17 @@ if (attachChat) {
 
 server.listen(PORT, HOST, () => {
   const shown = HOST === '127.0.0.1' || HOST === 'localhost' ? 'localhost' : HOST;
-  console.log(`\n  Dash running → http://${shown}:${PORT}\n`);
-  if (HOST === '0.0.0.0') {
+  const base = `http://${shown}:${PORT}`;
+  // With a token, the ONLY working entry point is the tokenized URL — the client
+  // reads the token from its own address bar (see src/terminal-token.js). Print
+  // that URL so the operator opens the one that actually connects the terminal.
+  console.log(`\n  Dash running → ${TERMINAL_TOKEN ? `${base}/?token=${TERMINAL_TOKEN}` : base}\n`);
+  if (!isLoopbackHost(HOST)) {
     console.log(
-      '  ⚠ Bound to all interfaces (DASH_HOST=0.0.0.0): the terminal is reachable\n' +
-      '    from your network. Only do this on a trusted network, and set\n' +
-      '    DASH_ALLOWED_ORIGINS to your deployment origin.\n',
+      '  ⚠ Bound to a routable address: the terminal is reachable from your\n' +
+      '    network. Only do this on a trusted network, set DASH_ALLOWED_ORIGINS\n' +
+      '    to your deployment origin, and open the tokenized URL above (the token\n' +
+      '    is what keeps the terminal from being an open shell to the network).\n',
     );
   }
 });
