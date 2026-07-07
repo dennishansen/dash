@@ -18,7 +18,7 @@
 
 import { WebSocketServer } from 'ws';
 import react from '@vitejs/plugin-react';
-import { isAllowedWsHandshake, ensureTerminalToken, isLoopbackHost } from './server/ws-guard.mjs';
+import { isAllowedWsHandshake, ensureTerminalToken, isLoopbackHost, selectTerminalSubprotocol } from './server/ws-guard.mjs';
 // Load DASH_SUPABASE_* from .env / .env.local into process.env BEFORE anything
 // reads it (the dev middleware store writes with the service role). The browser
 // bundle never imports this file.
@@ -107,7 +107,7 @@ export default {
         // Terminal sidecar WS: one socket per chat, carrying a real PTY. Upgrade
         // only /api/dash/terminal so it doesn't clobber Vite's HMR socket.
         if (attachChat && server.httpServer) {
-          const termWss = new WebSocketServer({ noServer: true });
+          const termWss = new WebSocketServer({ noServer: true, handleProtocols: selectTerminalSubprotocol });
           server.httpServer.on('upgrade', (req, socket, head) => {
             const url = new URL(req.url || '/', 'http://localhost');
             if (url.pathname !== '/api/dash/terminal') return;

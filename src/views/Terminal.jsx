@@ -89,14 +89,15 @@ function ChatPane({ issueId, sessionId, mode, active }) {
 
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     // The token is only required when Dash is network-exposed; on loopback it's
-    // empty and omitted (see terminal-token.js / server/ws-guard.mjs).
+    // empty and omitted. It rides in the WS subprotocol, NOT the query string, so
+    // it stays out of reverse-proxy/tunnel access logs (see server/ws-guard.mjs).
     const token = getTerminalToken();
     const ws = new WebSocket(
       `${proto}//${location.host}/api/dash/terminal`
       + `?issue=${encodeURIComponent(issueId)}`
       + (sessionId ? `&session=${encodeURIComponent(sessionId)}` : '')
-      + `&mode=${encodeURIComponent(mode || 'resume')}`
-      + (token ? `&token=${encodeURIComponent(token)}` : '')
+      + `&mode=${encodeURIComponent(mode || 'resume')}`,
+      token ? [`dash.token.${token}`] : undefined,
     );
 
     const sendResize = () => {

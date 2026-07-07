@@ -12,9 +12,15 @@ import {
   ensureTerminalToken,
   isLoopbackHost,
   terminalToken,
+  terminalSubprotocol,
+  selectTerminalSubprotocol,
 } from '../server/ws-guard.mjs';
 
-const req = (origin, url = '/api/dash/terminal') => ({ headers: origin ? { origin } : {}, url });
+// `sub` is a Sec-WebSocket-Protocol header value (the token's transport).
+const req = (origin, url = '/api/dash/terminal', sub) => ({
+  headers: { ...(origin ? { origin } : {}), ...(sub ? { 'sec-websocket-protocol': sub } : {}) },
+  url,
+});
 
 function withEnv(env, fn) {
   const saved = { ...process.env };
@@ -90,4 +96,26 @@ test('token compare is length-safe and exact', () => {
     assert.equal(isAllowedWsHandshake(req('http://localhost', '/x?token=abcdefg')), false); // longer
     assert.equal(isAllowedWsHandshake(req('http://localhost', '/x?token=abcdef')), true);
   });
+});
+
+test('token accepted via the WS subprotocol (kept out of the URL/logs)', () => {
+  withEnv({ DASH_TERMINAL_TOKEN: 'sekret' }, () => {
+    const sub = terminalSubprotocol('sekret'); // 'dash.token.sekret'
+    // Right token in the subprotocol, no ?token= in the URL.
+    assert.equal(isAllowedWsHandshake(req('http://localhost', '/api/dash/terminal', sub)), true);
+    // Wrong subprotocol token rejected; extra offered protocols are ignored.
+    assert.equal(isAllowedWsHandshake(req('http://localhost', '/api/dash/terminal', 'dash.token.wrong')), false);
+    assert.equal(isAllowedWsHandshake(req('http://localhost', '/api/dash/terminal', `chat, ${sub}`)), true);
+    // Subprotocol is preferred, but a valid ?token= still works as a fallback.
+    assert.equal(isAllowedWsHandshake(req('http://localhost', '/api/dash/terminal?token=sekret')), true);
+    // Disallowed Origin still rejected even with the right subprotocol.
+    assert.equal(isAllowedWsHandshake(req('https://evil.example.com', '/api/dash/terminal', sub)), false);
+  });
+});
+
+test('selectTerminalSubprotocol echoes the token protocol back, else false', () => {
+  assert.equal(selectTerminalSubprotocol(new Set(['dash.token.abc'])), 'dash.token.abc');
+  assert.equal(selectTerminalSubprotocol(new Set(['chat', 'dash.token.xyz'])), 'dash.token.xyz');
+  assert.equal(selectTerminalSubprotocol(new Set(['chat'])), false);
+  assert.equal(selectTerminalSubprotocol(new Set()), false);
 });

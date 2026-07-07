@@ -80,18 +80,51 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(ba, bb);
 }
 
+// The token rides in the WebSocket subprotocol, NOT the URL. A network-exposed
+// Dash is usually fronted by something that access-logs the request line (nginx,
+// Caddy, cloudflared/ngrok/Tailscale) — a `?token=` there writes the long-lived
+// PTY secret into plaintext logs on every reconnect (OWASP: secrets in query
+// strings leak into server/proxy logs + Referer). The browser WS API forbids
+// custom headers but DOES allow a subprotocol, so we carry the token as
+// `dash.token.<token>` (the pattern Jupyter/Kubernetes use) — it stays out of
+// access logs by default. `?token=` is still read as a fallback so any older
+// tokenized WS URL keeps working.
+const TOKEN_SUBPROTOCOL_PREFIX = 'dash.token.';
+
+export function terminalSubprotocol(token) {
+  return TOKEN_SUBPROTOCOL_PREFIX + token;
+}
+
+// The subprotocol the server echoes back so a browser handshake that offered the
+// token subprotocol completes. `protocols` is the Set `ws` passes to
+// handleProtocols; returns the matching offered value, or false to select none.
+export function selectTerminalSubprotocol(protocols) {
+  for (const p of protocols) if (p.startsWith(TOKEN_SUBPROTOCOL_PREFIX)) return p;
+  return false;
+}
+
+// The token the client presented: the subprotocol offer first, then ?token=.
+function providedToken(req) {
+  const offered = req && req.headers && req.headers['sec-websocket-protocol'];
+  if (offered) {
+    for (const raw of String(offered).split(',')) {
+      const p = raw.trim();
+      if (p.startsWith(TOKEN_SUBPROTOCOL_PREFIX)) return p.slice(TOKEN_SUBPROTOCOL_PREFIX.length);
+    }
+  }
+  try {
+    return new URL(req.url || '/', 'http://localhost').searchParams.get('token') || '';
+  } catch {
+    return '';
+  }
+}
+
 // The full handshake gate used by every terminal WS upgrade: Origin allow-list
-// AND — when a token is configured — a matching ?token= query param. With no
-// token configured the Origin check is the only gate (loopback default).
+// AND — when a token is configured — a matching token (subprotocol or ?token=).
+// With no token configured the Origin check is the only gate (loopback default).
 export function isAllowedWsHandshake(req) {
   if (!isAllowedWsOrigin(req)) return false;
   const token = terminalToken();
   if (!token) return true;
-  let provided = '';
-  try {
-    provided = new URL(req.url || '/', 'http://localhost').searchParams.get('token') || '';
-  } catch {
-    provided = '';
-  }
-  return safeEqual(provided, token);
+  return safeEqual(providedToken(req), token);
 }

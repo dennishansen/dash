@@ -29,7 +29,7 @@ import { WebSocketServer } from 'ws';
 import '../server/node-env.mjs';
 import { dashApi, gifsServe } from '../server/dash-api.js';
 import { assertConfigured } from '../server/dash-config.mjs';
-import { isAllowedWsHandshake, ensureTerminalToken, isLoopbackHost } from '../server/ws-guard.mjs';
+import { isAllowedWsHandshake, ensureTerminalToken, isLoopbackHost, selectTerminalSubprotocol } from '../server/ws-guard.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -125,7 +125,9 @@ try {
 }
 
 if (attachChat) {
-  const termWss = new WebSocketServer({ noServer: true });
+  // handleProtocols echoes the token subprotocol back so the browser handshake
+  // completes when a token is presented that way (see ws-guard).
+  const termWss = new WebSocketServer({ noServer: true, handleProtocols: selectTerminalSubprotocol });
   server.on('upgrade', (req, socket, head) => {
     const u = new URL(req.url || '/', 'http://localhost');
     if (u.pathname !== '/api/dash/terminal') { socket.destroy(); return; }
