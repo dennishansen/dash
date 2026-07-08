@@ -9,9 +9,8 @@
 // What this DELIBERATELY drops vs the local /api/dash/changes path: git-derived
 // liveness (the live-worktree dot, branch subject) and the synthetic
 // "unclaimed live researcher branch" cards. Those need a local git checkout —
-// they're machine-specific and correctly absent remotely. Terminals, worktrees,
-// the corpus gallery and hypotheses are likewise local-only (see capabilities.js
-// + the guarded views).
+// they're machine-specific and correctly absent remotely. The browser terminal
+// is likewise local-only (see capabilities.js).
 
 import {
   listAll, get, create, update, setRanks, moveColumn, setStatus, remove, VALID_STATUS,

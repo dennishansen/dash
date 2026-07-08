@@ -116,7 +116,7 @@ export async function renameChange(id, title) {
   return { ok: true, id, title: t };
 }
 
-// Unified change corpus: every issue IS a change. On top of those we surface any
+// Unified change feed: every issue IS a change. On top of those we surface any
 // LIVE in-flight branch (a running researcher) that no issue references yet — so
 // work-in-flight is never invisible. We deliberately do NOT dump historical
 // merged/rejected branch refs; those are legacy raw experiments.

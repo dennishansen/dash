@@ -1,15 +1,15 @@
 // Local-backend capability probe — the linchpin of model A.
 //
 // The board itself works anywhere (Supabase-direct, see board-store.js). But
-// terminals, worktrees, the corpus gallery and hypotheses need a real machine
-// running the dev middleware with a repo checkout + `claude` CLI. That backend
-// exists at /api/dash on localhost dev and does NOT exist on Vercel.
+// the browser terminal needs a real machine running the dev middleware with a
+// repo checkout + `claude` CLI. That backend exists at /api/dash on localhost
+// dev and does NOT exist on Vercel.
 //
 // We probe ONCE at boot: GET /api/dash returns `{ok:true}` JSON locally, but
 // Vercel answers any unknown path with an HTML 404. JSON ⇒ local backend
-// present (enable terminal/corpus/hypotheses); HTML/404 ⇒ remote, board-only
-// — the guarded views render "not on this machine" instead
-// of crashing on `res.json()` of an HTML page.
+// present (enable the terminal); HTML/404 ⇒ remote, board-only — the guarded
+// UI renders "not on this machine" instead of crashing on `res.json()` of an
+// HTML page.
 
 import { useEffect, useState } from 'react';
 

@@ -225,7 +225,6 @@ export function normalizeDecision(d) {
 //   merged-partial — merged with caveats (per human-authored recap)
 //   rejected       — tagged rejected/<name> (tag is the record; branch may be deleted)
 //   archived       — legacy synonym for 'rejected' (kept for back-compat with old data)
-//   falsified/parked/open/active — from hypothesis-graph, for H-nodes
 export function normalizeStatus(s) {
   if (!s) return null;
   const low = String(s).toLowerCase();

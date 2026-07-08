@@ -5,13 +5,8 @@ import { createRoot } from 'react-dom/client';
 import {
   HashRouter, Routes, Route, NavLink, Link, useLocation,
 } from 'react-router-dom';
-import { Dashboard } from './views/Dashboard.jsx';
 import { ChangesBoard } from './views/ChangesBoard.jsx';
 import { ChangeDetail } from './views/ChangeDetail.jsx';
-import { TestsList } from './views/TestsList.jsx';
-import { TestDetail } from './views/TestDetail.jsx';
-import { HypothesesList } from './views/HypothesesList.jsx';
-import { HypothesisDetail } from './views/HypothesisDetail.jsx';
 import { IssueTerminal, MainTerminal } from './views/Terminal.jsx';
 import { SignIn } from './views/SignIn.jsx';
 import { SelectionProvider } from './selection.jsx';
@@ -63,8 +58,8 @@ function ThemeToggle() {
 }
 
 function Sidebar({ onCollapse }) {
-  // `state` is local-only (branch, in-flight, corpus counts) — null remotely.
-  // The Issues count comes from Supabase directly so it's correct everywhere.
+  // `state` is local-only (branch) — null remotely. The Issues count comes from
+  // Supabase directly so it's correct everywhere.
   const { data: state } = useFetch('/api/dash/state');
   const { data: counts } = useAsync('state-counts', stateCounts, { pollMs: 60000 });
   return (
@@ -82,16 +77,8 @@ function Sidebar({ onCollapse }) {
 
       <nav>
         <NavLink to="/" end>
-          <span>Dashboard</span>
-          <span className="ct">{state?.in_flight_count ?? ''}</span>
-        </NavLink>
-        <NavLink to="/changes">
-          <span>Issues</span>
+          <span>Board</span>
           <span className="ct">{counts?.change_count ?? state?.change_count ?? ''}</span>
-        </NavLink>
-        <NavLink to="/tests">
-          <span>Tests</span>
-          <span className="ct">{state?.corpus_count ?? ''}</span>
         </NavLink>
       </nav>
 
@@ -113,12 +100,12 @@ function Sidebar({ onCollapse }) {
 function useCrumbs() {
   const { pathname } = useLocation();
   const parts = pathname.split('/').filter(Boolean); // e.g. ['changes', 'abc1']
-  if (parts.length === 0) return [{ label: 'dashboard' }];
-  const SECTION = { changes: 'issues', tests: 'tests', hypotheses: 'hypotheses' };
+  if (parts.length === 0) return [{ label: 'board' }];
+  const SECTION = { changes: 'board' };
   const crumbs = [];
   const section = SECTION[parts[0]];
   if (section) {
-    crumbs.push({ label: section, to: `/${parts[0]}` });
+    crumbs.push({ label: section, to: '/' });
     if (parts[1]) crumbs.push({ label: decodeURIComponent(parts[1]), copy: true });
   } else {
     crumbs.push({ label: decodeURIComponent(parts[0]) });
@@ -284,7 +271,7 @@ function Shell() {
   // The chat is universal: an issue detail shows that issue's chat; every other
   // page shows the persistent main thread. Both stay mounted in the pool below.
   const activeEnv = issueId ?? MAIN_ENV;
-  const onBoard = parts.length === 1 && parts[0] === 'changes';
+  const onBoard = parts.length === 0;
 
   // The active issue's reserved dev-server port, read from the board's cache
   // (shared key — no extra fetch). null for the main env, where the app panel
@@ -528,23 +515,19 @@ function Shell() {
           appPort={activePort}
         />
         <div className="main">
-          {/* The board mounts ONCE for the whole session and is only hidden when
-              you're off the Issues route — never unmounted. Its realtime stream
-              stays connected the entire time, so a card that moved while you were
-              elsewhere is already in place on return: instant, no stale-paint
-              flash. Same persistent-mount pattern as the chat panels below.
-              `display:contents` makes the wrapper vanish from layout when shown,
-              so the board lays out exactly as a direct .main child would. */}
+          {/* The board is home: it mounts ONCE for the whole session and is only
+              hidden when you're off the home route (a change detail) — never
+              unmounted. Its realtime stream stays connected the entire time, so a
+              card that moved while you were elsewhere is already in place on
+              return: instant, no stale-paint flash. Same persistent-mount pattern
+              as the chat panels below. `display:contents` makes the wrapper vanish
+              from layout when shown, so the board lays out exactly as a direct
+              .main child would. */}
           <div className="board-mount" style={{ display: onBoard ? 'contents' : 'none' }}>
             <ChangesBoard visible={onBoard} />
           </div>
           <Routes>
-            <Route path="/" element={<Dashboard />} />
             <Route path="/changes/:id" element={<ChangeDetail />} />
-            <Route path="/tests" element={<TestsList />} />
-            <Route path="/tests/:name" element={<TestDetail />} />
-            <Route path="/hypotheses" element={<HypothesesList />} />
-            <Route path="/hypotheses/:id" element={<HypothesisDetail />} />
           </Routes>
         </div>
       </div>

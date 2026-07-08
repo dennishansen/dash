@@ -73,10 +73,10 @@ function ChatPane({ issueId, sessionId, mode, active }) {
       // to a route, so it leaves the shortcut alone (passes through to the shell).
       if (!isMain && e.type === 'keydown' && e.key === 'ArrowLeft' && (e.metaKey || e.ctrlKey)) {
         // preventDefault stops the browser's native Cmd+Left = Back, which would
-        // otherwise double-navigate (our push to /changes, then a history pop
-        // back to the detail — the visible flash).
+        // otherwise double-navigate (our push to /, then a history pop back to
+        // the detail — the visible flash).
         e.preventDefault();
-        navigate('/changes');
+        navigate('/');
         return false;
       }
       return true;

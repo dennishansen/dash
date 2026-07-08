@@ -7,9 +7,8 @@ as atomic server-side functions, and updates stream to every open tab over
 Supabase Realtime. Sign-in is email one-time-code, gated to an allow-list you
 control.
 
-It also ships some optional "lab" views (a metrics dashboard, a corpus gallery,
-hypotheses, and a `claude`-style terminal per card) that came from the project
-this was extracted out of. Those need extra setup and a local machine — see
+Each card also gets a built-in `claude`-style **browser terminal** — a real
+shell/PTY on the host — when you run Dash on your own machine. See
 [Which features need what](#which-features-need-what).
 
 > Bring your own Supabase. Nothing here is hardcoded to any project — you point
@@ -87,15 +86,8 @@ features light up only when the local backend is running (probed once at boot vi
 
 - **Browser terminal** per card — requires the optional native dependency
   `node-pty`. Spawns a real shell/CLI; this is powerful and machine-specific.
-- **Metrics dashboard** — reads a `metric_runs` table you'd populate yourself.
-- **Corpus gallery / session recordings** — read from Supabase Storage buckets
-  (`corpus-gifs`, `corpus-sessions`) you'd create and fill.
-- **Hypotheses / tests / git-worktree** views — these came from the original
-  research-lab app and assume a specific repo layout + tooling. They render a
-  "not on this machine" guard when the backend or those assets are absent.
-
-If all you want is a clean, self-hosted, realtime kanban, you can ignore the lab
-views entirely — they degrade gracefully.
+  On a remote/static deploy (no local backend) the terminal renders a "not on
+  this machine" guard, and the kanban keeps working.
 
 ## Security
 

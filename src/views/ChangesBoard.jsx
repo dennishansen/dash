@@ -77,7 +77,7 @@ export function ChangesBoard({ visible = true }) {
     return next;
   });
 
-  // All tags present across the corpus, for the filter chips.
+  // All tags present across the board, for the filter chips.
   const allTags = useMemo(() => {
     const s = new Set();
     for (const i of data ?? []) for (const t of i.tags ?? []) s.add(t);
@@ -278,7 +278,7 @@ export function ChangesBoard({ visible = true }) {
   useEffect(() => {
     // The board stays mounted while you're on other routes (hidden via CSS), so
     // only the visible board owns the arrow/Enter keys — otherwise it would
-    // hijack them on the Tests/Dashboard pages.
+    // hijack them on a change-detail page.
     if (!visible) return undefined;
     const onKey = (e) => {
       const t = e.target;

@@ -9,11 +9,11 @@
 // It does three things on one http.Server:
 //   1. Static-serves the built SPA out of dist/ (index.html fallback for the
 //      HashRouter client routes).
-//   2. Mounts the dash API middleware (dashApi + gifsServe) at /api/dash & the
-//      GIF redirect — the same middleware the dev server uses.
+//   2. Mounts the dash API middleware (dashApi) at /api/dash — the same
+//      middleware the dev server uses.
 //   3. Upgrades /api/dash/terminal WebSocket connections to a real PTY, IF the
 //      optional native dep node-pty is installed (terminal.js). Without it, the
-//      board/corpus/hypotheses still work; only the browser terminal is off.
+//      board still works; only the browser terminal is off.
 //
 // Dependency-light on purpose: Node's own http + the `ws` server, plus the
 // existing server modules. No Express, no Vite at runtime.
@@ -27,7 +27,7 @@ import { WebSocketServer } from 'ws';
 // Load DASH_SUPABASE_* from .env / .env.local into process.env before the store
 // reads them. Node-only side-effect import.
 import '../server/node-env.mjs';
-import { dashApi, gifsServe } from '../server/dash-api.js';
+import { dashApi } from '../server/dash-api.js';
 import { assertConfigured } from '../server/dash-config.mjs';
 import { isAllowedWsHandshake, ensureTerminalToken, isLoopbackHost, selectTerminalSubprotocol } from '../server/ws-guard.mjs';
 
@@ -78,7 +78,6 @@ const MIME = {
 };
 
 const api = dashApi();
-const gifs = gifsServe();
 
 // Static file serve out of dist/, with SPA fallback to index.html. Path is
 // contained to DIST (no traversal).
@@ -107,9 +106,6 @@ const server = http.createServer((req, res) => {
   // Backend middlewares first (each calls next() when it doesn't handle the req).
   if (url.startsWith('/api/dash')) {
     return api(req, res, () => serveStatic(req, res));
-  }
-  if (url.startsWith('/dash/gifs/')) {
-    return gifs(req, res, () => serveStatic(req, res));
   }
   return serveStatic(req, res);
 });

@@ -185,20 +185,17 @@ function applyBoldItalicLink(text) {
   ];
 }
 
-// Auto-link H-ids (H001) and bench-N entries to Dash routes
+// Auto-link worktree-agent-* references to their board change route.
 function linkify(text) {
   if (typeof text !== 'string') return text;
-  const re = /\b(H\d{3}[a-z]?(?!\w)|bench-\d+[a-z0-9-]*|worktree-agent-[a-z0-9]+)\b/g;
+  const re = /\b(worktree-agent-[a-z0-9]+)\b/g;
   const out = [];
   let lastIdx = 0;
   let m;
   while ((m = re.exec(text))) {
     if (m.index > lastIdx) out.push(text.slice(lastIdx, m.index));
     const token = m[0];
-    let href = '';
-    if (/^H\d/.test(token)) href = `#/hypotheses/${encodeURIComponent(token)}`;
-    else if (/^bench-/.test(token)) href = `#/tests/${encodeURIComponent(token)}`;
-    else if (/^worktree-agent-/.test(token)) href = `#/changes/${encodeURIComponent(token.replace(/^worktree-agent-/, ''))}`;
+    const href = `#/changes/${encodeURIComponent(token.replace(/^worktree-agent-/, ''))}`;
     out.push(<a key={m.index} href={href}>{token}</a>);
     lastIdx = m.index + token.length;
   }

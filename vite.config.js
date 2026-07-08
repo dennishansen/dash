@@ -10,8 +10,8 @@
 //      isomorphic store/auth/realtime modules resolve the project + anon key
 //      the SAME way in the browser as node does from process.env. The SERVICE
 //      key is deliberately NOT injected — it must never reach the browser.
-//   3. Wire the dev-server backend: the dash API middleware (dashApi + gifsServe)
-//      and the terminal WebSocket upgrade on /api/dash/terminal.
+//   3. Wire the dev-server backend: the dash API middleware (dashApi) and the
+//      terminal WebSocket upgrade on /api/dash/terminal.
 //
 // For a production run (after `vite build`), the same backend is mounted by
 // bin/dash.mjs on a plain Node http server serving dist/. See that file.
@@ -23,7 +23,7 @@ import { isAllowedWsHandshake, ensureTerminalToken, isLoopbackHost, selectTermin
 // reads it (the dev middleware store writes with the service role). The browser
 // bundle never imports this file.
 import './server/node-env.mjs';
-import { dashApi, gifsServe } from './server/dash-api.js';
+import { dashApi } from './server/dash-api.js';
 // terminal.js requires the native optionalDependency node-pty. It is imported
 // LAZILY inside configureServer so `vite build` (which never runs
 // configureServer) never tries to resolve node-pty — the build must succeed
@@ -98,11 +98,9 @@ export default {
           });
         }
 
-        // The dash API (board CRUD proxy to Supabase, corpus, hypotheses, tests)
-        // and the GIF static-serve. Registered before the SPA fallback so
-        // /api/dash and /dash/gifs win.
+        // The dash API (board CRUD proxy to Supabase). Registered before the
+        // SPA fallback so /api/dash wins.
         server.middlewares.use(dashApi());
-        server.middlewares.use(gifsServe());
 
         // Terminal sidecar WS: one socket per chat, carrying a real PTY. Upgrade
         // only /api/dash/terminal so it doesn't clobber Vite's HMR socket.

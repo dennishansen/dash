@@ -341,7 +341,7 @@ export function ChangeDetail() {
       // ⌘← (not bare ←, which collides with text-cursor / nav) or Esc → board.
       if ((e.key === 'ArrowLeft' && (e.metaKey || e.ctrlKey)) || e.key === 'Escape') {
         e.preventDefault();
-        navigate('/changes');
+        navigate('/');
       }
     };
     window.addEventListener('keydown', onKey);
@@ -379,7 +379,7 @@ export function ChangeDetail() {
             {data.created ? <span className="dim" style={{ marginLeft: 8 }}>created {fmtDate(data.created)}</span> : null}
           </div>
         </div>
-        {isIssue ? <DeleteIssue id={data.id} onDeleted={() => navigate('/changes')} /> : null}
+        {isIssue ? <DeleteIssue id={data.id} onDeleted={() => navigate('/')} /> : null}
       </div>
 
       <div className="issue-fields">
