@@ -89,17 +89,31 @@ function safeEqual(a, b) {
 // `dash.token.<token>` (the pattern Jupyter/Kubernetes use) — it stays out of
 // access logs by default. `?token=` is still read as a fallback so any older
 // tokenized WS URL keeps working.
+//
+// Two subprotocols are offered: a token-free BASE plus the token-bearing one.
+// The server echoes back ONLY the base — never the token subprotocol — so the
+// secret doesn't reappear in the handshake's 101 RESPONSE headers (visible in
+// DevTools' Network tab, captured by any response-header logging). This is the
+// exact reason Jupyter (JEP-119) and Kubernetes (#47740) offer a base protocol
+// alongside the token one and select the base. The token is read only off the
+// client's REQUEST offer (providedToken), never reflected back.
 const TOKEN_SUBPROTOCOL_PREFIX = 'dash.token.';
+const TERMINAL_SUBPROTOCOL_BASE = 'dash.terminal.v1';
 
-export function terminalSubprotocol(token) {
-  return TOKEN_SUBPROTOCOL_PREFIX + token;
+// The subprotocols the client offers: the token-free base, plus the token one
+// when a token is configured. (base64url tokens are already valid RFC 7230
+// subprotocol tokens — no `,` `/` `=` or whitespace to mis-split.)
+export function terminalSubprotocols(token) {
+  return token ? [TERMINAL_SUBPROTOCOL_BASE, TOKEN_SUBPROTOCOL_PREFIX + token]
+               : [TERMINAL_SUBPROTOCOL_BASE];
 }
 
-// The subprotocol the server echoes back so a browser handshake that offered the
-// token subprotocol completes. `protocols` is the Set `ws` passes to
-// handleProtocols; returns the matching offered value, or false to select none.
+// What the server echoes back so the browser handshake completes. `protocols` is
+// the Set `ws` passes to handleProtocols. Return the token-free base if offered;
+// otherwise select NONE (false) — NEVER echo the `dash.token.*` value, or the
+// token lands in the response headers. Selecting none still completes the 101.
 export function selectTerminalSubprotocol(protocols) {
-  for (const p of protocols) if (p.startsWith(TOKEN_SUBPROTOCOL_PREFIX)) return p;
+  for (const p of protocols) if (p === TERMINAL_SUBPROTOCOL_BASE) return p;
   return false;
 }
 

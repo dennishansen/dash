@@ -12,7 +12,7 @@ import {
   ensureTerminalToken,
   isLoopbackHost,
   terminalToken,
-  terminalSubprotocol,
+  terminalSubprotocols,
   selectTerminalSubprotocol,
 } from '../server/ws-guard.mjs';
 
@@ -100,7 +100,7 @@ test('token compare is length-safe and exact', () => {
 
 test('token accepted via the WS subprotocol (kept out of the URL/logs)', () => {
   withEnv({ DASH_TERMINAL_TOKEN: 'sekret' }, () => {
-    const sub = terminalSubprotocol('sekret'); // 'dash.token.sekret'
+    const sub = terminalSubprotocols('sekret').join(', '); // 'dash.terminal.v1, dash.token.sekret'
     // Right token in the subprotocol, no ?token= in the URL.
     assert.equal(isAllowedWsHandshake(req('http://localhost', '/api/dash/terminal', sub)), true);
     // Wrong subprotocol token rejected; extra offered protocols are ignored.
@@ -113,9 +113,22 @@ test('token accepted via the WS subprotocol (kept out of the URL/logs)', () => {
   });
 });
 
-test('selectTerminalSubprotocol echoes the token protocol back, else false', () => {
-  assert.equal(selectTerminalSubprotocol(new Set(['dash.token.abc'])), 'dash.token.abc');
-  assert.equal(selectTerminalSubprotocol(new Set(['chat', 'dash.token.xyz'])), 'dash.token.xyz');
+test('selectTerminalSubprotocol echoes only the token-free base, never the token', () => {
+  // Normal client: offers base + token → server selects the base.
+  assert.equal(selectTerminalSubprotocol(new Set(['dash.terminal.v1', 'dash.token.abc'])), 'dash.terminal.v1');
+  // Base offered alongside other protocols → base wins.
+  assert.equal(selectTerminalSubprotocol(new Set(['chat', 'dash.terminal.v1'])), 'dash.terminal.v1');
+  // Only a token subprotocol (no base) → select NONE. NEVER echo the token.
+  assert.equal(selectTerminalSubprotocol(new Set(['dash.token.xyz'])), false);
   assert.equal(selectTerminalSubprotocol(new Set(['chat'])), false);
   assert.equal(selectTerminalSubprotocol(new Set()), false);
+});
+
+test('the accepted subprotocol never carries the token (no response-header leak)', () => {
+  // Whatever the server selects from a real client offer must not contain the
+  // secret — else it reappears in the 101 response's Sec-WebSocket-Protocol.
+  const offered = terminalSubprotocols('sekret'); // ['dash.terminal.v1', 'dash.token.sekret']
+  const accepted = selectTerminalSubprotocol(new Set(offered));
+  assert.equal(accepted, 'dash.terminal.v1');
+  assert.ok(!String(accepted).includes('sekret'), 'accepted subprotocol leaked the token');
 });
