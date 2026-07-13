@@ -50,6 +50,51 @@ export function isAllowedWsOrigin(req) {
   return extra.includes(origin);
 }
 
+// ── HTTP API guard (DNS-rebinding defense) ──────────────────────────────────
+// The terminal WS is gated above, but the /api/dash HTTP endpoints run git and
+// serve/mutate board + session state, and on the loopback default they take no
+// token — so same-origin policy is the ONLY thing between a malicious web page
+// and the API. DNS rebinding defeats exactly that: the victim visits evil.com,
+// it re-resolves to 127.0.0.1, and the page is now "same-origin" with the API.
+// The defense is the Host header: a browser ALWAYS sends it (page JS can't
+// forge it) and in a rebinding attack it carries the attacker's domain, not
+// 127.0.0.1. So accept only loopback Host values plus any operator-configured
+// host. This is the same check Jupyter enforces on every route; Hermes Agent
+// shipped a CVE for gating only the WS upgrade and leaving the HTTP path open.
+
+// Host names the API accepts: loopback, plus the hostnames of
+// DASH_ALLOWED_ORIGINS and any explicit DASH_ALLOWED_HOSTS. Ports are ignored
+// (the Host header may carry one).
+function allowedApiHosts() {
+  const hosts = new Set(LOCAL_HOSTS);
+  for (const o of (process.env.DASH_ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean)) {
+    try { hosts.add(new URL(o).hostname); } catch {}
+  }
+  for (const h of (process.env.DASH_ALLOWED_HOSTS || '').split(',').map((s) => s.trim()).filter(Boolean)) {
+    hosts.add(h);
+  }
+  return hosts;
+}
+
+// Gate every /api/dash HTTP request. Reject unless the Host header is an allowed
+// name AND — when an Origin is present — that Origin is on the WS allow-list too
+// (a cross-site fetch carries the attacker's Origin; a same-origin GET or a
+// non-browser client sends none, which is fine). Returns true = allow.
+export function isAllowedApiRequest(req) {
+  const rawHost = req && req.headers && req.headers.host;
+  if (!rawHost) return false; // HTTP/1.1 always sends Host; absent = reject
+  let host;
+  try {
+    host = new URL(`http://${rawHost}`).hostname;
+  } catch {
+    return false;
+  }
+  if (!allowedApiHosts().has(host)) return false;
+  const origin = req.headers.origin;
+  if (origin && !isAllowedWsOrigin(req)) return false;
+  return true;
+}
+
 // The terminal token in effect, or '' when none is configured (loopback default).
 export function terminalToken() {
   return process.env.DASH_TERMINAL_TOKEN || '';

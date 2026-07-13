@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import {
   isAllowedWsOrigin,
   isAllowedWsHandshake,
+  isAllowedApiRequest,
   ensureTerminalToken,
   isLoopbackHost,
   terminalToken,
@@ -20,6 +21,13 @@ import {
 const req = (origin, url = '/api/dash/terminal', sub) => ({
   headers: { ...(origin ? { origin } : {}), ...(sub ? { 'sec-websocket-protocol': sub } : {}) },
   url,
+});
+
+// An HTTP API request: Host is always present from a real client; Origin only
+// when a browser makes a cross-context request.
+const apiReq = (host, origin) => ({
+  headers: { ...(host ? { host } : {}), ...(origin ? { origin } : {}) },
+  url: '/api/dash/state',
 });
 
 function withEnv(env, fn) {
@@ -110,6 +118,43 @@ test('token accepted via the WS subprotocol (kept out of the URL/logs)', () => {
     assert.equal(isAllowedWsHandshake(req('http://localhost', '/api/dash/terminal?token=sekret')), true);
     // Disallowed Origin still rejected even with the right subprotocol.
     assert.equal(isAllowedWsHandshake(req('https://evil.example.com', '/api/dash/terminal', sub)), false);
+  });
+});
+
+test('HTTP API guard: loopback Host allowed, foreign Host (DNS rebinding) rejected', () => {
+  withEnv({ DASH_ALLOWED_ORIGINS: undefined, DASH_ALLOWED_HOSTS: undefined }, () => {
+    // Legit local access — Host is a loopback name (with or without a port).
+    assert.equal(isAllowedApiRequest(apiReq('localhost:5173')), true);
+    assert.equal(isAllowedApiRequest(apiReq('127.0.0.1:5173')), true);
+    assert.equal(isAllowedApiRequest(apiReq('[::1]:5173')), true);
+    // DNS rebinding: the page's Host carries the attacker's domain, which
+    // resolves to 127.0.0.1 — the Host check is what rejects it.
+    assert.equal(isAllowedApiRequest(apiReq('evil.example.com')), false);
+    assert.equal(isAllowedApiRequest(apiReq('evil.example.com:5173')), false);
+    // A request with no Host header at all is rejected (HTTP/1.1 always sends one).
+    assert.equal(isAllowedApiRequest(apiReq(null)), false);
+  });
+});
+
+test('HTTP API guard: a present-but-disallowed Origin is rejected even on a loopback Host', () => {
+  withEnv({ DASH_ALLOWED_ORIGINS: undefined }, () => {
+    // A cross-site fetch reaches a loopback Host but carries the attacker Origin.
+    assert.equal(isAllowedApiRequest(apiReq('localhost:5173', 'https://evil.example.com')), false);
+    // Same-origin request (matching Origin) is fine; no Origin (curl) is fine.
+    assert.equal(isAllowedApiRequest(apiReq('localhost:5173', 'http://localhost:5173')), true);
+    assert.equal(isAllowedApiRequest(apiReq('localhost:5173')), true);
+  });
+});
+
+test('HTTP API guard: DASH_ALLOWED_ORIGINS/HOSTS extend the accepted Host set', () => {
+  withEnv({ DASH_ALLOWED_ORIGINS: 'https://dash.example.com' }, () => {
+    // The configured origin's hostname becomes an accepted Host, and that Origin passes.
+    assert.equal(isAllowedApiRequest(apiReq('dash.example.com', 'https://dash.example.com')), true);
+    // A look-alike host is still rejected.
+    assert.equal(isAllowedApiRequest(apiReq('dash.example.com.evil.com')), false);
+  });
+  withEnv({ DASH_ALLOWED_HOSTS: '192.168.1.5' }, () => {
+    assert.equal(isAllowedApiRequest(apiReq('192.168.1.5:5173')), true);
   });
 });
 

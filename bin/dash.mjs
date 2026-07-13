@@ -29,7 +29,7 @@ import { WebSocketServer } from 'ws';
 import '../server/node-env.mjs';
 import { dashApi } from '../server/dash-api.js';
 import { assertConfigured } from '../server/dash-config.mjs';
-import { isAllowedWsHandshake, ensureTerminalToken, isLoopbackHost, selectTerminalSubprotocol } from '../server/ws-guard.mjs';
+import { isAllowedWsHandshake, ensureTerminalToken, isLoopbackHost, selectTerminalSubprotocol, isAllowedApiRequest } from '../server/ws-guard.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -105,6 +105,15 @@ const server = http.createServer((req, res) => {
   const url = req.url || '/';
   // Backend middlewares first (each calls next() when it doesn't handle the req).
   if (url.startsWith('/api/dash')) {
+    // Gate the HTTP API the same way the terminal WS is gated: the endpoints run
+    // git and serve/mutate state with no token on the loopback default, so a
+    // Host/Origin check is all that stands between a DNS-rebinding page and the
+    // API (see ws-guard). The WS upgrade path is gated separately below.
+    if (!isAllowedApiRequest(req)) {
+      res.writeHead(403, { 'content-type': 'text/plain' });
+      res.end('Forbidden');
+      return;
+    }
     return api(req, res, () => serveStatic(req, res));
   }
   return serveStatic(req, res);
