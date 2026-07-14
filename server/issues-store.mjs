@@ -29,8 +29,11 @@ import { SUPABASE_URL, SUPABASE_ANON, SUPABASE_SERVICE } from './dash-config.mjs
 
 export const URL = SUPABASE_URL;
 export const ANON = SUPABASE_ANON;
+// The board's table. A single fixed table here (no test-isolation split) — the
+// browser's realtime subscription (realtime.js) and this store must name the same one.
+export const TABLE = 'issues';
 
-const REST = `${URL}/rest/v1/issues`;
+const REST = `${URL}/rest/v1/${TABLE}`;
 const RPC = `${URL}/rest/v1/rpc`;
 
 // PostgREST wants two things: `apikey` (the public project key, always ANON —
@@ -141,51 +144,12 @@ export async function removeFromArray(id, field, values) {
   return update(id, { [field]: kept });
 }
 
-// --- dev-server port allocation ---
-//
-// Each active issue's worktree gets a stable dev-server port in [5200,5299]
-// (never 5173, the main repo's server). The PERSISTED `port` column IS the
-// allocation registry: a non-null port on an issue row means that port is
-// reserved for it; clearing it (free) releases the port. Allocation is:
-//   stable     — once set, an issue keeps its port (allocatePort is a no-op if
-//                the row already has one)
-//   collision-free — the lowest port not already held by ANY issue row
-//   idempotent — re-running for an issue that has a port returns the same port
-const PORT_MIN = 5200;
-const PORT_MAX = 5299;
-
-// All ports currently reserved across every issue row (the live registry).
-async function reservedPorts() {
+// All dev-server ports currently reserved across every issue row (the live
+// registry). The lifecycle around it — allocate with an OS probe, free with
+// listener teardown — is node-only and lives in ports.mjs.
+export async function reservedPorts() {
   const rows = await rest(REST, 'GET', `?select=id,port&port=not.is.null`);
   return new Map((rows || []).map(r => [r.id, Number(r.port)]));
-}
-
-// Reserve a port for an issue, idempotently. If the row already holds a port,
-// return it unchanged. Otherwise pick the lowest free port in range and persist
-// it (the persist IS the reservation). Returns { ok, port } or { error }.
-export async function allocatePort(id) {
-  const row = await get(id);
-  if (!row) return { error: `no issue "${id}"` };
-  if (row.port != null) return { ok: true, port: Number(row.port), reused: true };
-  const reserved = await reservedPorts();
-  const taken = new Set(reserved.values());
-  let port = null;
-  for (let p = PORT_MIN; p <= PORT_MAX; p++) {
-    if (!taken.has(p)) { port = p; break; }
-  }
-  if (port == null) return { error: `no free dev-server port in ${PORT_MIN}-${PORT_MAX}` };
-  await update(id, { port });
-  return { ok: true, port, reused: false };
-}
-
-// Release an issue's reserved port (clear the field). Idempotent — clearing an
-// already-null port is a no-op. This is the "free" half of the registry.
-export async function freePort(id) {
-  const row = await get(id);
-  if (!row) return { error: `no issue "${id}"` };
-  const had = row.port != null ? Number(row.port) : null;
-  if (had != null) await update(id, { port: null });
-  return { ok: true, freed: had };
 }
 
 export async function setStatus(id, status) {

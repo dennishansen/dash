@@ -11,15 +11,14 @@
 
 export function recencyKey(i) { return i.created || ''; }
 
-// Column order: explicit rank (set by drag) wins, unranked fall to the bottom —
-// live cards first among ties, then created desc, then id (the total-order
-// guard). Shared by the display sort and by the create path, which ranks a new
-// card against the FULL column (not the filtered view).
+// Column order: explicit rank (set by drag) wins, unranked fall to the bottom,
+// then created desc, then id (the total-order guard). Shared by the display sort
+// and by the create path, which ranks a new card against the FULL column (not
+// the filtered view).
 export function columnCompare(a, z) {
   const ao = a.order == null ? Infinity : a.order;
   const zo = z.order == null ? Infinity : z.order;
   if (ao !== zo) return ao - zo;
-  if (!!a.live !== !!z.live) return a.live ? -1 : 1;
   const byRecency = recencyKey(z).localeCompare(recencyKey(a));
   if (byRecency) return byRecency;
   return a.id.localeCompare(z.id);

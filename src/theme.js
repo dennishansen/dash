@@ -1,21 +1,35 @@
 // Theme source of truth is the data-theme attribute on <html> — set pre-paint
-// by an inline script in dash/index.html, persisted under 'dash-theme'. Absence
-// of the attribute means dark. Everything CSS reads the attribute via
+// by an inline script in dash/index.html. The user's CHOICE (mode) is persisted
+// under 'dash-theme': 'light' | 'dark' | absent = automatic (follow the OS).
+// Absence of the attribute means dark. Everything CSS reads the attribute via
 // :root[data-theme='light']; JS consumers (xterm) subscribe via onThemeChange.
+
+const systemLight = window.matchMedia('(prefers-color-scheme: light)');
 
 export function getTheme() {
   return document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
 }
 
-export function setTheme(theme) {
-  if (theme === 'light') document.documentElement.dataset.theme = 'light';
-  else delete document.documentElement.dataset.theme;
-  localStorage.setItem('dash-theme', theme);
+export function getMode() {
+  const m = localStorage.getItem('dash-theme');
+  return m === 'light' || m === 'dark' ? m : 'auto';
 }
 
-export function toggleTheme() {
-  setTheme(getTheme() === 'light' ? 'dark' : 'light');
+export function setMode(mode) {
+  if (mode === 'auto') localStorage.removeItem('dash-theme');
+  else localStorage.setItem('dash-theme', mode);
+  apply();
 }
+
+function apply() {
+  const mode = getMode();
+  const light = mode === 'auto' ? systemLight.matches : mode === 'light';
+  if (light) document.documentElement.dataset.theme = 'light';
+  else delete document.documentElement.dataset.theme;
+}
+
+// In automatic mode, follow the OS live.
+systemLight.addEventListener('change', () => { if (getMode() === 'auto') apply(); });
 
 // Watch the <html> attribute itself so every consumer follows ANY theme
 // change (toggle button, another tab via storage, devtools). Returns unsubscribe.

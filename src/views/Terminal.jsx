@@ -1,15 +1,51 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
 import { Terminal as Xterm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
-import { WebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
 import { getTheme, onThemeChange, XTERM_THEMES } from '../theme.js';
 import { useLocalBackend } from '../capabilities.js';
 import { Plus, X } from '../icons.jsx';
-import { viewportText, spinnerState } from '../spinner.js';
+import { viewportText } from '../spinner.js';
+import { agentById, agentChoices, DEFAULT_AGENT } from '../agents.js';
 import { reportActivity, clearActivity } from '../activity-store.js';
+import { useSessionOwner } from '../session-pool.js';
+import { acquireWebgl, releaseWebgl } from './term-renderer.js';
+import { CopyButton } from './CopyButton.jsx';
+import { emitIssuesChange } from '../realtime.js';
 import { getTerminalToken } from '../terminal-token.js';
+
+const AGENTS = agentChoices();
+const LAST_AGENT_KEY = 'dash-chat-agent';
+const lastAgent = () => {
+  try { const v = localStorage.getItem(LAST_AGENT_KEY); return AGENTS.some(a => a.id === v) ? v : DEFAULT_AGENT; }
+  catch { return DEFAULT_AGENT; }
+};
+const rememberAgent = (id) => { try { localStorage.setItem(LAST_AGENT_KEY, id); } catch {} };
+
+// A small type pill so a Codex chat reads apart from a Claude one at a glance.
+function AgentBadge({ agent }) {
+  const m = agentById(agent);
+  return <span className={`agent-badge agent-badge-${m.id}`} title={m.label}>{m.short}</span>;
+}
+
+// The choice popover shared by the "+" button and the empty state: one row per
+// agent. Selecting fires onPick(agentId). Absolute-positioned; the caller owns
+// the open/close and outside-click.
+function AgentMenu({ onPick, className = '' }) {
+  return (
+    <ul className={`agent-menu ${className}`} role="menu">
+      {AGENTS.map(a => (
+        <li key={a.id} role="none">
+          <button role="menuitem" className={`agent-menu-item agent-menu-item-${a.id}`}
+            onClick={() => onPick(a.id)}>
+            <AgentBadge agent={a.id} />
+            <span className="agent-menu-label">{a.label}</span>
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 // Per-issue dev environment in the right sidebar.
 //
@@ -24,15 +60,42 @@ import { getTerminalToken } from '../terminal-token.js';
 // detaches one claude and attaches another. Each chat persists server-side, so
 // a refresh re-attaches the same running session.
 
+// Mounted terminals by session id — a test/debug seam (window.__dashViewport)
+// for reading what a session's terminal actually shows, e.g. asserting that
+// typed keystrokes echo back through the attached PTY.
+const liveTerms = new Map();
+if (typeof window !== 'undefined') {
+  window.__dashViewport = (sessionId) => {
+    const t = liveTerms.get(sessionId);
+    return t ? viewportText(t) : null;
+  };
+}
+
 // One live xterm wired to one chat's PTY (issue + session id). Re-mounted (via
 // React key) whenever the selected session changes, so teardown/reattach is clean.
 // The terminal speaks for itself (cursor, output, an inline "[chat exited]"
 // notice) — no separate connection-status text in the bar.
-function ChatPane({ issueId, sessionId, mode, active }) {
+function ChatPane({ issueId, sessionId, mode, active, onSession, agent }) {
   const hostRef = useRef(null);
+  // The PTY's `ready` names the real session id — the only place the MAIN chat
+  // (which connects without one) can learn it. Ref-carried so the mount effect
+  // needn't depend on the callback's identity.
+  const onSessionRef = useRef(onSession);
+  onSessionRef.current = onSession;
   const termRef = useRef(null);
   const webglRef = useRef(null);
-  const navigate = useNavigate();
+  const resizeRef = useRef(null); // calls the live pane's sendResize (set on mount)
+  // The chat's PTY may be hosted by ANOTHER dash server on this machine (one
+  // owner per session, machine-wide). This server answers the attach with
+  // { type: 'redirect', port } and we reconnect there — set here, effect re-runs.
+  const [hostPort, setHostPort] = useState(null);
+  // The protocol allows EXACTLY ONE redirect: the server you connect to either
+  // owns the chat or names the single machine-wide owner to go to. A second
+  // redirect (or one pointing back at the server we're already on) means the
+  // owner moved or died — not something to chase, so we stop and show a visible
+  // notice instead of looping or silently blanking. This ref persists across the
+  // hostPort-driven remount; a fresh chat (new React key) resets it.
+  const redirectedRef = useRef(false);
   // The main chat rides --continue and carries no client session id; every
   // other chat must name one before it can connect.
   const isMain = issueId === 'main';
@@ -48,6 +111,12 @@ function ChatPane({ issueId, sessionId, mode, active }) {
       allowProposedApi: true,
     });
     termRef.current = term;
+    // Test hook (same pattern as __dashActivity): the suite reads grid geometry
+    // and buffer text straight off the live xterm — no DOM scraping, renderer-
+    // agnostic (a WebGL pane has no readable text nodes).
+    const termKey = `${issueId}:${sessionId || 'main'}`;
+    (window.__dashTerms ??= new Map()).set(termKey, term);
+    if (sessionId) liveTerms.set(sessionId, term);
     const offTheme = onThemeChange((t) => { term.options.theme = XTERM_THEMES[t]; });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -58,123 +127,300 @@ function ChatPane({ issueId, sessionId, mode, active }) {
     // into a hidden pool, handing each hidden terminal a context would starve
     // the one the user is actually looking at. Hidden panes never paint, so they
     // need no accelerator — their working/idle detection reads the buffer, not
-    // the canvas. Visible panes get WebGL for Claude's heavy TUI redraws — and on
-    // a visible pane WebGL is the ONLY renderer: xterm's DOM renderer paints those
-    // redraws synchronously on the main thread, which freezes keystroke input
-    // (type → freeze → keystrokes burst in), so degrading a visible pane to it is
-    // worse than not rendering. There is no DOM fallback on the visible path (see
-    // the active-gated effect).
-    // ⌘← / Ctrl← is the "back to board" shortcut, but the terminal owns keystrokes
-    // while focused (its hidden textarea swallows them before the window handler).
-    // Intercept it here: navigate, and return false so xterm doesn't forward it
-    // to the PTY. Everything else passes through to the shell untouched.
-    term.attachCustomKeyEventHandler((e) => {
-      // ⌘← jumps back to the board from an ISSUE chat. The main chat isn't scoped
-      // to a route, so it leaves the shortcut alone (passes through to the shell).
-      if (!isMain && e.type === 'keydown' && e.key === 'ArrowLeft' && (e.metaKey || e.ctrlKey)) {
-        // preventDefault stops the browser's native Cmd+Left = Back, which would
-        // otherwise double-navigate (our push to /, then a history pop back to
-        // the detail — the visible flash).
-        e.preventDefault();
-        navigate('/');
-        return false;
-      }
-      return true;
-    });
-    // Fit on mount. Focus too — EXCEPT the main chat, which is an ambient panel
-    // shown on every page: auto-focusing it would steal the arrow keys from the
-    // board (its window-level cursor nav), so the board keeps focus and the main
-    // chat is typeable on click. Issue chats are opened deliberately → focus.
-    requestAnimationFrame(() => { try { fit.fit(); } catch {} if (!isMain) term.focus(); });
+    // the canvas. Visible panes get WebGL for Claude's heavy TUI redraws; only a
+    // client with no WebGL2 at all falls back to the DOM renderer (see
+    // term-renderer.js) — slower under TUI floods, but alive.
+    // Route chords (⌘← back to board, ⌘↑/⌘↓ prev/next) are NOT handled here: a
+    // focused issue terminal only exists on its own detail route, whose capture-
+    // phase window listener (ChangeDetail) intercepts them before xterm's own
+    // keydown handler — and on the board, main.jsx's capture handler owns ⌘←/⌘→.
+    // Everything else passes through to the shell untouched.
+    // A pane's grid has exactly two legitimate sources: the LAYOUT when the host
+    // is visible (fit proposes cols/rows from real pixels), and the PTY when it
+    // isn't (a `display:none` pool pane has no pixels — FitAddon would collapse
+    // to its 2×1 floor and the scrollback replay would render into confetti).
+    // `unsized` picks the source: no layout → mirror the PTY grid, bytes render
+    // in the geometry they were formatted for.
+    const unsized = () => {
+      const el = hostRef.current;
+      return !el || el.offsetParent === null || el.clientHeight === 0;
+    };
+
+    // Fit on mount — only if the host has layout (a pool pane mounts hidden; its
+    // grid arrives with the PTY's `ready` below). Focus is NOT handled here:
+    // panes also mount hidden (pool seeding, shadow panes for sibling live
+    // chats), where grabbing focus would be wrong — the active-gated effect
+    // below already focuses a pane the moment it's the visible one, which
+    // includes a deliberate fresh open.
+    requestAnimationFrame(() => { if (!unsized()) { try { fit.fit(); } catch {} } });
 
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    // After a redirect, the socket goes to the owning server's port (same
+    // machine, different dev server) instead of the one serving this page.
+    const wsHost = hostPort ? `${location.hostname}:${hostPort}` : location.host;
     // The token is only required when Dash is network-exposed; on loopback it's
     // empty and omitted. It rides in the WS subprotocol, NOT the query string, so
     // it stays out of reverse-proxy/tunnel access logs. We offer a token-free
     // base subprotocol alongside it; the server echoes back only the base, so the
     // token never appears in the response headers either (see server/ws-guard.mjs).
     const token = getTerminalToken();
-    const ws = new WebSocket(
-      `${proto}//${location.host}/api/dash/terminal`
-      + `?issue=${encodeURIComponent(issueId)}`
-      + (sessionId ? `&session=${encodeURIComponent(sessionId)}` : '')
-      + `&mode=${encodeURIComponent(mode || 'resume')}`,
-      token ? ['dash.terminal.v1', `dash.token.${token}`] : ['dash.terminal.v1'],
-    );
 
+    // The socket is a SUPERVISED resource, not a single-shot one: it can die
+    // while the pane is mounted (a backgrounded tab — Chrome tab freeze, sleep,
+    // a network change — kills it with no action in the page), and the PTY
+    // stays alive server-side by design. So the pane reconnects on any
+    // ABNORMAL close and reattaches (the server replays scrollback), instead
+    // of sitting frozen until a manual refresh (issue i-terminal-freeze).
+    //
+    // DELIBERATE server closes must NOT reconnect — each carries a close frame
+    // with our own codes: 1000 (sent to the redirect target — the chat lives
+    // in another dash server) and 1011 (refusals: not resumable, claim
+    // refused). Reconnecting on those would chase a server that just told us
+    // where (or why not) to attach. A socket that dies WITHOUT one of those
+    // frames (1006 abnormal, or anything else) is the freeze condition, and
+    // reconnecting is always safe: the server just reattaches — multi-attach
+    // means joining alongside any other pane, never stealing from it.
+    let ws = null;
+    let disposed = false;
+    let exited = false;    // PTY is gone — reconnecting would resurrect claude
+    let ready = false;     // this socket got an answer (gates redirect fallback)
+    let everReady = false; // this term has shown a session → reset before replay
+    let retryTimer = null;
+    let retryDelay = 300;
+
+    const scheduleReconnect = () => {
+      if (disposed || retryTimer) return;
+      retryTimer = setTimeout(() => { retryTimer = null; if (!disposed) connect(); }, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, 15000);
+    };
+    // A hidden tab throttles timers, so a pending retry can sit for minutes —
+    // returning to the tab (or the network coming back) brings it forward to
+    // NOW. Only ever accelerates a retry the close handler already judged
+    // legitimate; it never initiates one, so a superseded pane stays detached.
+    const wake = () => {
+      if (disposed || !retryTimer) return;
+      clearTimeout(retryTimer);
+      retryTimer = null;
+      connect();
+    };
+
+    // Resize is driven ONLY by real layout intent — a window resize or a user
+    // dragging a pane's width (the Shell broadcasts 'dash:refit' on both) — never
+    // by watching the host element. Watching it fired on every incidental reflow
+    // (a board re-render when the needs-input dot flips, a pool show/hide), and
+    // each resize makes Claude's TUI repaint its whole screen instead of echoing
+    // keystrokes — that was the "freeze → keys burst in" and the squished-on-
+    // reopen text. Two guards keep it quiet: skip while hidden (a 0×0 host would
+    // collapse the grid), and only message the PTY when the integer cols/rows
+    // ACTUALLY change (pixel drags rarely cross a cell boundary), so a refit that
+    // lands on the same grid sends nothing.
+    //
+    // DELIVERY IS GUARANTEED, NOT BEST-EFFORT (issue i-term-corrupt): sentCols/
+    // sentRows record what the PTY was actually TOLD, so they change only when a
+    // send happens. Recording before the readyState check poisoned the dedupe —
+    // a refit that ran while the socket was still connecting (the mount-time
+    // rAF refit reliably beats the handshake on a busy dev server) marked the
+    // fitted grid as sent, every later refit early-returned, and the PTY kept
+    // its stale grid forever: claude formatted every byte for a grid the pane
+    // didn't have — the persistently mangled terminal that only a width nudge
+    // (a real cols change) healed.
+    let sentCols = 0, sentRows = 0;
     const sendResize = () => {
-      // Panes live in a pool and are hidden with display:none when not active.
-      // A hidden host measures 0×0, and fitting to that collapses the grid to ~1
-      // row — which both mangles Claude's TUI (it's told the terminal is 1 row
-      // tall) AND pushes the spinner line out of the visible window, so the
-      // working/idle detector reads a bare "❯" and falsely reports idle. Skip the
-      // reflow while hidden; the ResizeObserver fires again with real dimensions
-      // the moment the pane is shown.
-      const el = hostRef.current;
-      if (!el || el.offsetParent === null || el.clientHeight === 0) return;
+      if (unsized()) return;
       try { fit.fit(); } catch {}
-      if (ws.readyState === 1) {
-        ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
-      }
+      if (ws?.readyState !== 1) return; // not connected — nothing sent, nothing recorded
+      if (term.cols === sentCols && term.rows === sentRows) return;
+      sentCols = term.cols; sentRows = term.rows;
+      ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
     };
 
-    // Working/idle is read off the rendered VIEWPORT on a timer (see the
-    // detection effect below), not off this stream — so reattach buffer replays
-    // and stream silence don't matter here. Just write the bytes through.
-    ws.onopen = () => sendResize();
-    ws.onmessage = (ev) => {
-      let msg;
-      try { msg = JSON.parse(ev.data); } catch { return; }
-      if (msg.type === 'output') {
-        term.write(msg.data);
-      }
-      else if (msg.type === 'exit') {
-        term.write(`\r\n\x1b[2m[chat exited${msg.code != null ? ` (${msg.code})` : ''}]\x1b[0m\r\n`);
-      }
+    const connect = () => {
+      ready = false;
+      // Fresh dedupe per socket: the guard exists to suppress chatter within a
+      // connection, but a NEW socket has seen nothing — a grid change during
+      // the outage must not be skipped because the OLD socket saw the size.
+      sentCols = 0; sentRows = 0;
+      // The FIRST connect carries the pane's mode ('new' spawns with the intro
+      // prompt, 'main-init' runs /main); every reconnect is a plain reattach —
+      // re-sending a spawning mode could double-run the first turn.
+      const wireMode = everReady ? (isMain ? 'main' : 'resume') : (mode || 'resume');
+      ws = new WebSocket(
+        `${proto}//${wsHost}/api/dash/terminal`
+        + `?issue=${encodeURIComponent(issueId)}`
+        + (sessionId ? `&session=${encodeURIComponent(sessionId)}` : '')
+        + `&mode=${encodeURIComponent(wireMode)}`
+        // Tell the server which CLI this chat is, so a cold resume reopens with
+        // the right one (claude --resume vs codex resume). Absent → claude.
+        + (agent ? `&agent=${encodeURIComponent(agent)}` : ''),
+        token ? ['dash.terminal.v1', `dash.token.${token}`] : ['dash.terminal.v1'],
+      );
+      // Test hook (same key as __dashTerms): the live socket, so the suite can
+      // kill it out from under the pane — the shape a backgrounded tab produces.
+      (window.__dashSockets ??= new Map()).set(termKey, ws);
+
+      // Working/idle is read off the rendered VIEWPORT on a timer (see the
+      // detection effect below), not off this stream — so reattach buffer replays
+      // and stream silence don't matter here. Just write the bytes through.
+      ws.onopen = () => { retryDelay = 300; };
+      ws.onmessage = (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { return; }
+        if (msg.type === 'ready') {
+          ready = true; // the server answered — a later close is teardown, not a failed redirect
+          // A reconnect replays scrollback this term has already rendered —
+          // reset first so the replay repaints the screen instead of
+          // duplicating it (same clean slate a refresh would give).
+          if (everReady) { try { term.reset(); } catch {} }
+          everReady = true;
+          // The PTY announces its grid, then replays scrollback formatted for
+          // exactly that grid. A hidden pane can't fit from layout, so it MIRRORS
+          // the announced grid — the replay (and all output while hidden) renders
+          // in the geometry it was written for. A visible pane pushes ITS grid to
+          // the PTY instead: `ready` is the delivery anchor (not ws.onopen) —
+          // it proves the server's message handler is installed, where a resize
+          // sent at onopen can land before a slow attach registers one and
+          // silently evaporate. sendResize self-gates: hidden panes skip it.
+          if (unsized() && msg.cols > 0 && msg.rows > 0) {
+            try { term.resize(msg.cols, msg.rows); } catch {}
+          }
+          sendResize();
+          if (msg.sessionId) onSessionRef.current?.(msg.sessionId);
+        }
+        else if (msg.type === 'output') {
+          ready = true;
+          everReady = true;
+          term.write(msg.data);
+        }
+        else if (msg.type === 'grid') {
+          // Another attached pane owns the PTY grid now (last resize assertion
+          // wins — see attachChat). Mirror it so output keeps rendering in the
+          // geometry it's formatted for; our own resizes are ignored server-
+          // side until ownership comes back, so don't record them as sent.
+          if (msg.cols > 0 && msg.rows > 0) {
+            sentCols = 0; sentRows = 0;
+            try { term.resize(msg.cols, msg.rows); } catch {}
+          }
+        }
+        else if (msg.type === 'owner') {
+          // The grid's owner detached — assert our fit to claim it. A hidden
+          // pane self-gates inside sendResize (unsized) and stays a mirror;
+          // a visible pane re-fits and pushes its geometry (dedupe reset:
+          // what the PTY has is the DEPARTED pane's grid, whatever we
+          // recorded before is stale).
+          sentCols = 0; sentRows = 0;
+          sendResize();
+        }
+        else if (msg.type === 'exit') {
+          ready = true;
+          exited = true; // the PTY is gone; a socket close after this must not respawn it
+          term.write(`\r\n\x1b[2m[chat exited${msg.code != null ? ` (${msg.code})` : ''}${msg.error ? ` — ${msg.error}` : ''}]\x1b[0m\r\n`);
+        }
+        else if (msg.type === 'redirect') {
+          // Another dash server owns this chat's PTY — reconnect there once, rather
+          // than letting this one fork a duplicate claude (i-chat-collision). A
+          // redirect to the port we're already on, or a SECOND redirect, is a
+          // protocol violation (the owner moved or died): surface it, don't chase.
+          const current = hostPort || Number(location.port);
+          const target = msg.port;
+          if (!target || target === current || redirectedRef.current) {
+            term.write(`\r\n\x1b[2m[chat owner unavailable — reopen this chat to retry]\x1b[0m\r\n`);
+            return;
+          }
+          redirectedRef.current = true;
+          setHostPort(target);
+        }
+      };
+
+      ws.onclose = (ev) => {
+        if (disposed) return;
+        // A redirected socket dying before the owner ever answered — the owning
+        // server exited between the redirect and our reconnect — falls back to
+        // the origin server once (clear hostPort → remount). The origin
+        // re-resolves ownership: a cleanly-exited owner released its claim, so
+        // the origin resumes locally; a CRASHED owner's claim is deliberately
+        // never auto-reclaimed (server-side race-safety), so the origin
+        // surfaces the honest stale-record error instead of stranding a dead
+        // pane silently. redirectedRef stays set, so it can't bounce us again.
+        if (hostPort && !ready) { setHostPort(null); return; }
+        if (exited) return;
+        if (ev.code === 1000 || ev.code === 1011) return; // deliberate server close
+        scheduleReconnect();
+      };
     };
+    connect();
+
+    document.addEventListener('visibilitychange', wake);
+    window.addEventListener('focus', wake);
+    window.addEventListener('online', wake);
 
     const dataDisp = term.onData((data) => {
-      if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'input', data }));
+      if (ws?.readyState === 1) ws.send(JSON.stringify({ type: 'input', data }));
     });
 
-    const ro = new ResizeObserver(() => sendResize());
-    ro.observe(hostRef.current);
+    // Refit on the only two real triggers: the window changing size, and the
+    // Shell telling us a pane width was dragged. Both refit every mounted pane so
+    // "drag one width → they all reflow" holds, but the cols/rows guard above
+    // means hidden/unchanged panes stay silent.
+    window.addEventListener('resize', sendResize);
+    window.addEventListener('dash:refit', sendResize);
+    resizeRef.current = sendResize;
 
     return () => {
+      disposed = true;
+      if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+      document.removeEventListener('visibilitychange', wake);
+      window.removeEventListener('focus', wake);
+      window.removeEventListener('online', wake);
       offTheme();
-      ro.disconnect();
+      window.removeEventListener('resize', sendResize);
+      window.removeEventListener('dash:refit', sendResize);
+      resizeRef.current = null;
       dataDisp.dispose();
-      try { ws.close(); } catch {}
-      try { webglRef.current?.dispose(); } catch {}
+      try { ws?.close(); } catch {}
+      releaseWebgl(webglRef.current);
       webglRef.current = null;
+      window.__dashTerms?.delete(termKey);
+      if (window.__dashSockets?.get(termKey) === ws) window.__dashSockets.delete(termKey);
+      if (sessionId && liveTerms.get(sessionId) === term) liveTerms.delete(sessionId);
       term.dispose();
       termRef.current = null;
     };
-  }, [issueId, sessionId, mode]);
+  }, [issueId, sessionId, mode, hostPort, agent]);
 
   // Attach the GPU renderer only while this pane is visible, and release its
   // context when it goes hidden — so the pool of attached-but-hidden chats holds
-  // zero GPU contexts and the visible chat always has one. loadAddon must run
-  // after open() (the canvas must exist). WebGL is the visible pane's ONLY
-  // renderer: there is NO DOM fallback. If the addon can't load it throws (loud,
-  // surfaced — not silently swallowed into a DOM render), and a lost context is
-  // logged for diagnosis, not disposed-to-DOM. Disposing on HIDE below is a
+  // zero GPU contexts and the visible chat always has one. acquireWebgl runs
+  // after open() (the canvas must exist) and never throws: a WebGL-less client
+  // degrades to the DOM renderer, and a context lost mid-flight releases the
+  // addon and clears the ref (via onLost) so the next activation reacquires —
+  // see term-renderer.js for the full contract. Disposing on HIDE is a
   // deliberate context release, not a fallback — a hidden pane never paints, so
   // xterm's idle DOM baseline costs nothing.
   useEffect(() => {
     const term = termRef.current;
     if (!term) return undefined;
     if (active && !webglRef.current) {
-      const webgl = new WebglAddon();
-      webgl.onContextLoss((e) => { console.error('[dash terminal] WebGL context lost', e); });
-      term.loadAddon(webgl);
-      webglRef.current = webgl;
+      webglRef.current = acquireWebgl(term, () => { webglRef.current = null; });
     } else if (!active && webglRef.current) {
-      try { webglRef.current.dispose(); } catch {}
+      releaseWebgl(webglRef.current);
       webglRef.current = null;
     }
     return undefined;
-  }, [active, issueId, sessionId, mode]);
+    // hostPort is a dep because a redirect remounts the xterm (the mount effect
+    // depends on it and disposes the old term + WebGL addon on teardown). Without
+    // hostPort here, a redirected VISIBLE pane would get a fresh term with no
+    // renderer — and WebGL is its ONLY renderer, so the pane would go blank.
+  }, [active, issueId, sessionId, mode, hostPort]);
+
+  // Becoming visible is the one moment a pane may be stale: a window or pane-width
+  // change while it was hidden was skipped (a hidden host is 0×0). Refit once on
+  // show — the cols/rows guard makes it a no-op (no PTY message, no Claude redraw)
+  // unless the grid genuinely changed, so a plain chat-switch stays silent.
+  useEffect(() => {
+    if (!active) return undefined;
+    const id = requestAnimationFrame(() => { try { resizeRef.current?.(); } catch {} });
+    return () => cancelAnimationFrame(id);
+  }, [active]);
 
   // Opening an item with the chat already mounted (in the pool) doesn't remount
   // this pane, so the mount-focus above won't fire — focus when it becomes the
@@ -203,15 +449,14 @@ function ChatPane({ issueId, sessionId, mode, active }) {
   }, [active]);
 
   // Working/idle detection, read from the RENDERED VIEWPORT (not the stream).
-  // Each tick snapshots the visible grid: working iff a live spinner glyph is on
-  // screen OR the viewport changed since the last sample (covers text streaming,
-  // which shows no spinner). A frozen viewport with no spinner == idle (the input
-  // box, or a menu awaiting the human). Reading the buffer works for a hidden
-  // pane too (term.write updates it regardless of painting) and survives stream
-  // silence (the frozen frame keeps the spinner). GRACE bridges the gap between
-  // viewport changes so steady work doesn't flicker idle. See spinner.js.
+  // The shared loop owns sampling and recent-change tracking; the client agent
+  // adapter owns what a frozen viewport means for its TUI. Reading the buffer
+  // works for hidden panes too and survives stream silence. GRACE bridges the
+  // gap between viewport changes so steady streaming doesn't flicker idle.
   useEffect(() => {
     if (!issueId || !sessionId) return;
+    const adapter = agentById(agent);
+    const activityKey = adapter.activityKey(sessionId);
     const GRACE_MS = 2500;
     const SETTLE_MS = 2500;  // ignore the mount-time replay burst (see below)
     const mountedAt = Date.now();
@@ -236,22 +481,19 @@ function ChatPane({ issueId, sessionId, mode, active }) {
       if (lastText === null) lastText = text;
       else if (changed) { lastText = text; if (!settling) changes.push(now); }
       changes = changes.filter((t) => now - t < GRACE_MS);
-      const spin = spinnerState(text);
-      // Working iff a live spinner is on screen, OR the grid is actively changing.
-      // The two clauses cover the two phases of a turn, because they DON'T
-      // overlap: Claude shows the "✻ Verb…" spinner while THINKING / between tool
-      // calls (no text moving), then the spinner DISAPPEARS while it STREAMS the
-      // answer (the bare input box sits at the bottom and text pours in above it).
-      // So streaming has no spinner at all — its only tell is the viewport
-      // changing. ≥2 changes in the grace window is "streaming" (one lone repaint
-      // at a turn boundary isn't). The replay burst is excluded by the settle
-      // window above, so a changing grid here means real output.
-      const working = spin === 'live' || changes.length >= 2;
-      reportActivity(sessionId, issueId, working ? 'working' : 'idle');
+      // The adapter combines its frozen-status grammar with the common
+      // streaming fallback (>=2 changes). The replay burst is excluded by the
+      // settle window above, so recent changes here mean real output.
+      const working = adapter.isWorking({ viewport: text, recentChanges: changes });
+      reportActivity(activityKey, working ? 'working' : 'idle');
     };
+    // First tick immediately, not at +300ms: on an ownership handoff the
+    // predecessor's unmount cleared this session's activity in the same commit,
+    // and an immediate report closes the dot gap before the board can repaint.
+    tick();
     const iv = setInterval(tick, 300);
-    return () => { clearInterval(iv); clearActivity(sessionId); };
-  }, [issueId, sessionId]);
+    return () => { clearInterval(iv); clearActivity(activityKey); };
+  }, [issueId, sessionId, agent]);
 
   return (
     <div className="issue-terminal">
@@ -260,8 +502,34 @@ function ChatPane({ issueId, sessionId, mode, active }) {
   );
 }
 
+// A hidden pane for a LIVE chat that isn't the issue's selected one — so every
+// live session stays mounted (socket + working/idle detector) even when the
+// switcher shows a sibling, and an issue with two live chats dots correctly for
+// both. Ownership-gated like the main pane: if another issue's pane owns the
+// session (it's selected/visible there), this renders nothing. display:none is
+// safe for a pane — hidden panes skip resize and hold no GPU context, and the
+// detector reads the buffer, not the paint (same contract as pool-hidden panels).
+function ShadowChatPane({ issueId, sessionId, agent }) {
+  const owned = useSessionOwner(issueId, sessionId, false);
+  if (!owned) return null;
+  return (
+    <div style={{ display: 'none' }}>
+      <ChatPane issueId={issueId} sessionId={sessionId} mode="resume" active={false} agent={agent} />
+    </div>
+  );
+}
+
 function chatLabel(c, i) {
   return `chat ${i + 1} · ${c.sessionId.slice(0, 8)}${c.resumable ? '' : ' (unavailable)'}`;
+}
+
+// Copy icon for the open chat's session id — the address other agents use to
+// message this chat (agent-chat). Icon-only; the tooltip carries the short id.
+function ChatCopy({ sessionId }) {
+  // 'main' is the server's env key, not an addressable session — a warm main
+  // chat spawned before the server learned to resolve the real uuid reports it.
+  if (!sessionId || sessionId === 'main') return null;
+  return <CopyButton text={sessionId} title={`Copy chat session id (${sessionId.slice(0, 8)})`} />;
 }
 
 // Custom chat dropdown (a native <select> can't carry a per-row unlink button).
@@ -270,25 +538,37 @@ function chatLabel(c, i) {
 // show disabled but are still unlinkable. Closes on outside-click / select.
 function ChatSwitcher({ chats, selected, onSelect, onNew, onUnlink, busy }) {
   const [open, setOpen] = useState(false);
+  const [newOpen, setNewOpen] = useState(false); // the "+" agent-choice popover
   const [confirmId, setConfirmId] = useState(null); // chat awaiting unlink confirm
   const ref = useRef(null);
+  const newRef = useRef(null);
   useEffect(() => {
     if (!open) return;
     const onDoc = (e) => { if (ref.current && !ref.current.contains(e.target)) { setOpen(false); setConfirmId(null); } };
     document.addEventListener('mousedown', onDoc);
     return () => document.removeEventListener('mousedown', onDoc);
   }, [open]);
+  useEffect(() => {
+    if (!newOpen) return;
+    const onDoc = (e) => { if (newRef.current && !newRef.current.contains(e.target)) setNewOpen(false); };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [newOpen]);
 
   const selIdx = chats.findIndex(c => c.sessionId === selected);
+  const selChat = selIdx >= 0 ? chats[selIdx] : null;
   const triggerLabel = chats.length === 0 ? 'no chats'
-    : selIdx >= 0 ? chatLabel(chats[selIdx], selIdx)
+    : selChat ? chatLabel(selChat, selIdx)
     : `${chats.length} chats`;
+
+  const pickNew = (agent) => { setNewOpen(false); rememberAgent(agent); onNew(agent); };
 
   return (
     <div className="issue-chat-switch" ref={ref}>
       <div className="issue-chat-menu-wrap">
         <button className="issue-chat-trigger" onClick={() => setOpen(v => !v)}
           disabled={!chats.length} aria-haspopup="listbox" aria-expanded={open}>
+          {selChat ? <AgentBadge agent={selChat.agent} /> : null}
           <span className="issue-chat-trigger-label">{triggerLabel}</span>
           <svg className="issue-chat-caret" width="10" height="6" viewBox="0 0 10 6" aria-hidden="true">
             <path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
@@ -299,7 +579,11 @@ function ChatSwitcher({ chats, selected, onSelect, onNew, onUnlink, busy }) {
             {chats.map((c, i) => (
               <li key={c.sessionId} className={`issue-chat-item${c.sessionId === selected ? ' is-current' : ''}`}>
                 <button className="issue-chat-pick" disabled={!c.resumable}
-                  onClick={() => { onSelect(c.sessionId); setOpen(false); }}>{chatLabel(c, i)}</button>
+                  onClick={() => { onSelect(c.sessionId); setOpen(false); }}>
+                  <AgentBadge agent={c.agent} />
+                  <span className="issue-chat-pick-label">{chatLabel(c, i)}</span>
+                </button>
+                <CopyButton text={c.sessionId} title="Copy chat session id" />
                 {confirmId === c.sessionId ? (
                   <span className="issue-chat-confirm">
                     <button className="issue-chat-confirm-yes" title="Confirm unlink"
@@ -316,7 +600,12 @@ function ChatSwitcher({ chats, selected, onSelect, onNew, onUnlink, busy }) {
           </ul>
         ) : null}
       </div>
-      <button className="icon-btn issue-chat-new" onClick={onNew} disabled={busy} title="New chat in this worktree" aria-label="New chat"><Plus /></button>
+      <ChatCopy sessionId={selected} />
+      <div className="issue-chat-new-wrap" ref={newRef}>
+        <button className="icon-btn issue-chat-new" onClick={() => setNewOpen(v => !v)} disabled={busy}
+          title="New chat in this worktree" aria-label="New chat" aria-haspopup="menu" aria-expanded={newOpen}><Plus /></button>
+        {newOpen ? <AgentMenu className="issue-chat-new-menu" onPick={pickNew} /> : null}
+      </div>
     </div>
   );
 }
@@ -334,12 +623,16 @@ export function MainTerminal({ active }) {
     localStorage.setItem('dash-main-started', '1');
     return started ? 'main' : 'main-init';
   });
+  // The main chat connects without a session id — the PTY's `ready` names the
+  // real one, surfaced here so the header can show a copyable address.
+  const [sid, setSid] = useState(null);
   return (
     <div className="issue-terminal-wrap">
       <div className="issue-terminal-bar">
         <span className="main-chat-label">main</span>
+        <ChatCopy sessionId={sid} />
       </div>
-      <ChatPane key="main" issueId="main" sessionId={null} mode={mode} active={active} />
+      <ChatPane key="main" issueId="main" sessionId={null} mode={mode} active={active} onSession={setSid} />
     </div>
   );
 }
@@ -358,6 +651,12 @@ export function IssueTerminal({ issueId, requestSession, active }) {
   const [mode, setMode] = useState('resume'); // 'new' for a just-minted chat
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  // Issue↔chat linking is many-to-many, but a session mounts ONE pane app-wide:
+  // only the owning issue renders the ChatPane (socket + activity detector).
+  // The visible pane takes the session over; hidden co-linkers wait their turn
+  // (see session-pool.js). Activity still reaches every linked card via the
+  // session-keyed store join, so dots don't depend on owning the pane.
+  const owned = useSessionOwner(issueId, selected, active);
 
   const refresh = useCallback(async () => {
     if (!issueId) return;
@@ -418,17 +717,23 @@ export function IssueTerminal({ issueId, requestSession, active }) {
     }
   }, [requestSession?.nonce, requestSession?.sessionId]);
 
-  const createWorktreeAndChat = async () => {
+  // Create a worktree (if needed) + a new chat of the given agent. For codex the
+  // server spawns eagerly and returns the id it minted; for claude it mints the
+  // id up front. Either way `data.sessionId` is the chat to open.
+  const createWorktreeAndChat = async (agent = lastAgent()) => {
     setBusy(true);
     setError(null);
     try {
       const r = await fetch('/api/dash/terminal/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ issue: issueId }),
+        body: JSON.stringify({ issue: issueId, agent }),
       });
       const data = await r.json();
       if (!r.ok || data.error) { setError(data.error || 'create failed'); return; }
+      // The server just wrote this issue's row (conversation link, port) on our
+      // behalf — announce it like any local write so every view refetches.
+      emitIssuesChange('UPDATE', { id: issueId });
       await refresh();
       setSelected(data.sessionId);
       setMode('new');
@@ -439,10 +744,10 @@ export function IssueTerminal({ issueId, requestSession, active }) {
     }
   };
 
-  const newChat = async () => {
+  const newChat = async (agent) => {
     // Same endpoint as create — the worktree already exists, so it just mints a
-    // new linked session.
-    await createWorktreeAndChat();
+    // new linked session of the chosen agent.
+    await createWorktreeAndChat(agent);
   };
 
   // Unlink a chat from this issue (drops the association; transcript untouched).
@@ -457,6 +762,8 @@ export function IssueTerminal({ issueId, requestSession, active }) {
       });
       const data = await r.json();
       if (!r.ok || data.error) { setError(data.error || 'unlink failed'); return; }
+      // Server-mediated row write (conversation unlink) — announce it too.
+      emitIssuesChange('UPDATE', { id: issueId });
       if (localStorage.getItem(`dash-chat-last:${issueId}`) === sessionId) {
         localStorage.removeItem(`dash-chat-last:${issueId}`);
       }
@@ -512,11 +819,17 @@ export function IssueTerminal({ issueId, requestSession, active }) {
           <p className="issue-empty-title">No dev environment yet</p>
           <p className="dim">
             Create an isolated git worktree for <code>{issueId}</code> and open a
-            claude chat inside it.
+            chat inside it — pick the agent:
           </p>
-          <button className="issue-empty-btn" onClick={createWorktreeAndChat} disabled={busy}>
-            {busy ? 'Creating…' : 'Create worktree & open chat'}
-          </button>
+          <div className="issue-empty-agents">
+            {AGENTS.map(a => (
+              <button key={a.id} className={`issue-empty-btn issue-empty-btn-${a.id}`}
+                onClick={() => { rememberAgent(a.id); createWorktreeAndChat(a.id); }} disabled={busy}>
+                <AgentBadge agent={a.id} />
+                <span>{busy ? 'Creating…' : a.label}</span>
+              </button>
+            ))}
+          </div>
           {error && <p className="issue-empty-err">{error}</p>}
         </div>
       </div>
@@ -536,9 +849,16 @@ export function IssueTerminal({ issueId, requestSession, active }) {
         />
       </div>
       {error && <p className="issue-empty-err">{error}</p>}
-      {selected && (
-        <ChatPane key={selected} issueId={issueId} sessionId={selected} mode={mode} active={active} />
+      {selected && owned && (
+        <ChatPane key={selected} issueId={issueId} sessionId={selected} mode={mode} active={active}
+          agent={(state.chats || []).find(c => c.sessionId === selected)?.agent || DEFAULT_AGENT} />
       )}
+      {/* Every OTHER live chat of this issue keeps a hidden pane mounted, so
+          "one pane per live session" holds even with several live chats on one
+          card — switching the switcher never kills a sibling's detection. */}
+      {(state.chats || []).filter((c) => c.live && c.sessionId !== selected).map((c) => (
+        <ShadowChatPane key={c.sessionId} issueId={issueId} sessionId={c.sessionId} agent={c.agent} />
+      ))}
     </div>
   );
 }

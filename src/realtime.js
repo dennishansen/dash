@@ -30,7 +30,7 @@
 // likewise receives everything. Signed out ⇒ no token ⇒ no socket (the board
 // shows the sign-in gate anyway).
 
-import { URL as SUPA_URL, ANON } from '../server/issues-store.mjs';
+import { URL as SUPA_URL, ANON, TABLE } from '../server/issues-store.mjs';
 import { currentSession, onAuth } from './auth.js';
 
 const TOPIC = 'realtime:issues';
@@ -77,18 +77,31 @@ export function buildJoinFrame(ref, token) {
     topic: TOPIC,
     event: 'phx_join',
     payload: {
-      config: { postgres_changes: [{ event: '*', schema: 'public', table: 'issues' }] },
+      config: { postgres_changes: [{ event: '*', schema: 'public', table: TABLE }] },
       access_token: token,
     },
     ref: String(ref),
   });
 }
 
+// Every current subscriber. Module-level (not per-connection) because change
+// signals have more than one source: socket frames AND this client's own writes
+// (emitIssuesChange) — a local write must reach the views even while the socket
+// is down, reconnecting, or rejected.
+const listeners = new Set();
+
+// Local write echo. board-store calls this after every successful browser-side
+// write, so the writer's own views refetch deterministically instead of waiting
+// on the write's realtime echo (which never arrives over a dead socket). The
+// socket path covers OTHER clients; this covers the one that typed.
+export function emitIssuesChange(event, record = null) {
+  for (const fn of listeners) fn({ event, record });
+}
+
 // The one shared connection. Null when no one is subscribed.
 let conn = null;
 
 function createConnection() {
-  const listeners = new Set();
   let ws = null;
   let ref = 0;
   let heartbeat = null;
@@ -138,6 +151,9 @@ function createConnection() {
         // a TCP connection that accepts then drops (or whose join is rejected)
         // must not look healthy and reset the backoff to 1s.
         reconnectMs = RECONNECT_MIN_MS;
+        // Changes that happened while disconnected were never delivered, so a
+        // (re)join is itself a change signal: everyone refetches to resync.
+        emitIssuesChange('RESYNC');
       } else if (v.kind === 'change') {
         for (const fn of listeners) fn({ event: v.event, record: v.record });
       } else if (v.kind === 'error') {
@@ -171,7 +187,6 @@ function createConnection() {
   });
 
   return {
-    listeners,
     add(fn) { listeners.add(fn); },
     remove(fn) {
       listeners.delete(fn);

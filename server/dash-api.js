@@ -9,6 +9,7 @@ import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { startArchiveWatcher } from './archive-watcher.js';
 import { listChanges, issueDetail, reorderChanges, moveChange, renameChange, createChange } from './dash-issues.js';
+import { CodeBrowserError, environmentSnapshot, environmentFile } from './code-browser.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -117,6 +118,23 @@ export function dashApi() {
           access_token: key, refresh_token: 'dev', token_type: 'bearer',
           expires_at: 4102444800, user: { email: process.env.DASH_DEV_EMAIL || 'dev@localhost' },
         });
+      }
+      // Code browser: a read-only view of an issue worktree's files. `env` is the
+      // issue/environment id; GET /code/<env> is the file-tree snapshot, and
+      // GET /code/<env>/file?path=… returns one file's contents (see code-browser.mjs).
+      if (req.method === 'GET' && segs[0] === 'code' && segs[1]) {
+        const env = decodeURIComponent(segs[1]);
+        try {
+          if (segs.length === 2) return send(await environmentSnapshot(env));
+          if (segs.length === 3 && segs[2] === 'file') {
+            const u = new URL(req.url, 'http://localhost');
+            return send(await environmentFile(env, u.searchParams.get('path')));
+          }
+          return send({ error: 'unknown code endpoint' }, 404);
+        } catch (error) {
+          if (error instanceof CodeBrowserError) return send({ error: error.message }, error.status);
+          throw error;
+        }
       }
       if (req.method === 'GET' && segs[0] === 'state') return send(await memoAsync('state', 60000, topLevelState));
       // Reorder: body { ids: [...] } → each change's rank = its index, written

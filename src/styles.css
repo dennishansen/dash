@@ -3202,3 +3202,443 @@ img.zoomable {
   border-radius: 6px; padding: 3px 8px; font-size: 13px; cursor: pointer; flex: none;
 }
 .signout-btn:hover { color: var(--text); border-color: var(--text-mute); }
+
+/* ── Ported from the app: workspace panel, code browser, Codex agent
+   badges, and the theme picker. ─────────────────────────────────── */
+
+/* Theme picker */
+/* Theme picker sits right of the brand, left of the collapse button; the auto
+   margin on its wrap pushes both icons to the brand row's right edge. */
+.theme-menu-wrap { position: relative; margin-left: auto; display: inline-flex; }
+.theme-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 40;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--bg-term);
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+.theme-pick {
+  text-align: left;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--text-mute);
+  font: inherit;
+  font-size: 13px;
+  padding: 4px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.theme-pick:hover { background: var(--bg-2); border-color: var(--line-2); color: var(--text); }
+.theme-pick.is-current { color: var(--text); outline: 1px solid var(--accent); }
+
+/* Workspace panel + code browser */
+.workspace-switch {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  padding: 2px;
+  margin-right: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-2); /* grey track — the active chip is the raised light box */
+}
+.workspace-switch > button {
+  appearance: none;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-mute);
+  font: inherit;
+  font-size: 11px;
+  line-height: 20px;
+  padding: 0 8px;
+  cursor: pointer;
+}
+.workspace-switch > button:hover { color: var(--text); }
+.workspace-switch > button.is-selected {
+  color: var(--text);
+  background: var(--bg-deep); /* raised light chip (white in light mode) on the grey track */
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
+}
+.workspace-restart { margin-left: auto; }
+.app-bar-host {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-mute);
+  white-space: nowrap;
+}
+.app-bar-host.dim { color: var(--text-faint); }
+.app-bar-reload {
+  margin-left: 6px; /* sit just right of the host label */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-mute);
+  cursor: pointer;
+  padding: 5px;
+  border-radius: 5px;
+}
+.app-bar-reload:hover { color: var(--text); background: var(--bg-1); border-color: var(--line); }
+.app-bar-reload > svg { display: block; }
+/* The actions cluster floats at the far right: split refresh, then the ↗
+   new-tab link. The split's two halves read as one control — shared rounded
+   ends, flat where they meet. */
+.app-bar-actions { margin-left: auto; position: relative; display: flex; align-items: center; gap: 2px; }
+.app-bar-split { display: inline-flex; align-items: center; }
+.app-bar-split .app-bar-reload { margin-left: 0; }
+.app-bar-split-main { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.app-bar-split-caret { border-top-left-radius: 0; border-bottom-left-radius: 0; padding: 6px 2px; }
+.app-bar-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 40;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--bg-term);
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+.app-bar-menu > button {
+  text-align: left;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--text-mute);
+  font: inherit;
+  font-size: 13px;
+  padding: 4px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.app-bar-menu > button:hover:not(:disabled) { background: var(--bg-2); border-color: var(--line-2); color: var(--text); }
+.app-bar-menu > button:disabled { cursor: default; opacity: 0.6; }
+/* In-flight restart: spin the ↻ and dim the button while the issue's dev server
+   is being killed + relaunched (~1-2s), so the click reads as "working". */
+.app-bar-reload--busy { cursor: default; color: var(--text-mute); opacity: 0.6; }
+.app-bar-reload--busy > svg { animation: app-bar-spin 0.8s linear infinite; }
+@keyframes app-bar-spin { to { transform: rotate(360deg); } }
+
+/* ============================================================
+ * RIGHT-DOCKED PANELS — the chat (track 3) and the app panel (track 4) share
+ * one geometry (see dock.jsx): a full-height docked column with a left-edge
+ * drag handle and a floating close, or a full-screen overlay on thin viewports.
+ * Rules common to both are grouped; each panel's skin/placement follows.
+ * ============================================================ */
+.chat-sidebar,
+.app-sidebar {
+  position: relative; /* anchor the floating close + resize handle to the panel */
+  border-left: 1px solid var(--line);
+  background: var(--bg-deep);
+  height: 100%;
+  overflow: hidden;
+  min-width: 0;
+  display: flex;
+}
+.chat-sidebar { grid-column: 3; }
+.app-sidebar  { grid-column: 4; }
+/* The app panel stacks its navbar over the iframe (the chat lays its terminal
+   out itself, so only the app needs the column direction). */
+.app-sidebar { flex-direction: column; }
+.chat-sidebar .issue-terminal { border: none; border-radius: 0; }
+
+/* Each inspector mode fills the panel below the shared mode switch. Hidden
+   modes stay mounted so switching never resets the iframe or code selection. */
+.workspace-view {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+.workspace-view[hidden] { display: none; }
+
+/* The embedded app fills its mode below the navbar, edge to edge. */
+.app-frame {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  border: none;
+  display: block;
+  background: var(--bg-deep);
+}
+/* Empty state when the active env has no app to embed (an issue with no reserved
+   worktree port — the same gate the topbar "view app" toggle hides on). */
+.app-empty {
+  flex: 1;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 6px;
+  padding: 24px;
+  text-align: center;
+}
+.app-empty-title { font-size: 15px; font-weight: 600; color: var(--text); margin: 0; }
+.app-empty-sub { font-size: 13px; color: var(--text-mute); margin: 0; max-width: 240px; }
+
+/* Code review ------------------------------------------------------------ */
+.code-browser {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(170px, 31%) minmax(0, 1fr);
+  background: var(--bg-deep);
+}
+.code-nav {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--line);
+  background: var(--bg-topbar);
+  overflow: hidden;
+}
+.code-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  margin: 8px;
+  padding: 0 7px;
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--text-faint);
+  background: var(--bg-deep);
+}
+.code-search:focus-within { border-color: var(--sel-line); color: var(--text-mute); }
+.code-search input {
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  outline: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+.code-search input::placeholder { color: var(--text-faint); }
+.code-nav-section {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--line);
+}
+/* Default split when the user hasn't dragged; a persisted px height overrides
+   flex-basis inline (see CodeBrowser). Files takes whatever's left (basis 0 so
+   its content can't shrink Changes below the chosen px) down to a floor that
+   matches the drag clamp's NAV_SECTION_MIN, and hosts the handle on its top edge. */
+.code-nav-section:not(.code-nav-files) { flex: 0 1 42%; }
+.code-nav-files { flex: 1 1 0; min-height: 96px; position: relative; }
+/* Row-resize grab strip straddling the Changes/Files border — the vertical twin
+   of the docked-column handle; transparent until hovered or dragging. */
+.code-nav-resize {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 7px;
+  cursor: row-resize;
+  z-index: 5;
+}
+.code-nav-resize:hover,
+.code-nav-resizing .code-nav-resize {
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+/* While dragging: no text selection, a row-resize cursor everywhere, and shield
+   the Monaco surface so it can't swallow the drag's pointer moves. */
+.code-nav-resizing { user-select: none; cursor: row-resize; }
+.code-nav-resizing .code-content { pointer-events: none; }
+.code-nav-heading {
+  height: 29px;
+  flex: 0 0 29px;
+  padding: 0 9px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--text-mute);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.code-nav-heading > span:last-child {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.code-nav-list { min-height: 0; overflow: auto; padding: 0 5px 6px; }
+.code-nav-empty { color: var(--text-faint); font-size: 11px; padding: 7px 8px; }
+.code-file,
+.code-folder {
+  appearance: none;
+  width: 100%;
+  height: 25px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-mute);
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+.code-file { padding: 0 6px; }
+.code-file:hover,
+.code-folder:hover { color: var(--text); background: var(--bg-1); }
+.code-file.is-selected { color: var(--text); background: var(--sel-bg); }
+.code-file > svg,
+.code-folder > svg { flex: 0 0 auto; color: var(--text-faint); }
+.code-file-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.code-status {
+  flex: 0 0 auto;
+  width: 13px;
+  text-align: center;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  font-weight: 700;
+}
+.code-status--added,
+.code-kind--added { color: var(--ok-2); }
+.code-status--modified,
+.code-kind--modified { color: var(--accent-2); }
+.code-status--deleted,
+.code-kind--deleted { color: var(--bad-2); }
+.code-status--renamed,
+.code-kind--renamed { color: var(--warn); }
+.code-folder { padding: 0 6px 0 calc(5px + var(--tree-depth, 0) * 12px); }
+.code-tree-file { padding-left: calc(var(--tree-depth, 0) * 12px); }
+.code-content {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-term);
+}
+.code-file-bar {
+  height: 35px;
+  flex: 0 0 35px;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-topbar);
+  font-size: 11px;
+}
+.code-file-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.code-kind {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 600;
+}
+.code-base { flex: 0 0 auto; color: var(--text-faint); white-space: nowrap; }
+.code-editor-wrap { flex: 1; min-height: 0; min-width: 0; position: relative; }
+.code-editor { position: absolute; inset: 0; }
+.code-editor-empty,
+.code-empty {
+  height: 100%;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 5px;
+  padding: 22px;
+  box-sizing: border-box;
+  text-align: center;
+  color: var(--text-mute);
+  font-size: 12px;
+}
+.code-empty p { margin: 0; max-width: 280px; }
+.code-empty-title { color: var(--text); font-size: 15px; font-weight: 600; }
+
+/* Drag handle on a docked column's left edge. A slim grab strip overlapping the
+   border; highlights under the cursor and while dragging. */
+
+/* Codex agent badges + menu */
+.agent-badge {
+  flex: 0 0 auto;
+  display: inline-flex; align-items: center;
+  font-size: 10px; font-weight: 600; letter-spacing: 0.02em;
+  line-height: 1; text-transform: lowercase;
+  padding: 2px 5px; border-radius: 4px;
+  border: 1px solid transparent;
+  font-family: var(--font-ui);
+}
+.agent-badge-claude {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.agent-badge-codex {
+  color: #5ecf9a; /* dark is the default root */
+  background: color-mix(in srgb, #5ecf9a 15%, transparent);
+  border-color: color-mix(in srgb, #5ecf9a 32%, transparent);
+}
+:root[data-theme='light'] .agent-badge-codex {
+  color: #2f9e6e;
+  background: color-mix(in srgb, #2f9e6e 13%, transparent);
+  border-color: color-mix(in srgb, #2f9e6e 30%, transparent);
+}
+
+.issue-chat-pick-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* The "+" agent-choice popover (and the shared AgentMenu). */
+.issue-chat-new-wrap { position: relative; flex: 0 0 auto; margin-left: auto; }
+.issue-chat-new-wrap .issue-chat-new { margin-left: 0; }
+.agent-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 40;
+  margin: 0; padding: 4px;
+  min-width: 172px;
+  list-style: none;
+  background: var(--bg-term);
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+.agent-menu-item {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%;
+  background: none; border: none;
+  color: var(--text-dim);
+  font-size: 13px; font-family: var(--font-ui);
+  padding: 6px 8px; border-radius: 4px;
+  cursor: pointer;
+}
+.agent-menu-item:hover { color: var(--text); background: var(--bg-1); }
+.agent-menu-label { flex: 1; text-align: left; white-space: nowrap; }

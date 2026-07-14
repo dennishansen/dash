@@ -11,18 +11,18 @@ import { IssueTerminal, MainTerminal } from './views/Terminal.jsx';
 import { SignIn } from './views/SignIn.jsx';
 import { SelectionProvider } from './selection.jsx';
 import { ChatControlContext } from './chat-control.jsx';
-import { AppPanel } from './AppPanel.jsx';
+import { WorkspacePanel } from './WorkspacePanel.jsx';
 import {
   DockPanel, startDockResize, loadW,
   CHAT_DEFAULT_W, APP_DEFAULT_W, DOCK_MIN_W, MAIN_MIN_W, LEFT_W,
 } from './dock.jsx';
 import { useLocalBackend } from './capabilities.js';
 import { appPortForEnv } from './app-env.js';
-import { ArrowUpRight, AppPanelIcon } from './icons.jsx';
+import { ArrowUpRight, WorkspacePanelIcon } from './icons.jsx';
 import { useFetch, useAsync } from './api.js';
 import { stateCounts, listChanges } from './board-store.js';
 import { onAuth, ensureFreshToken, ensureDevSession, signOut, userEmail } from './auth.js';
-import { getTheme, toggleTheme, onThemeChange } from './theme.js';
+import { getTheme, getMode, setMode, onThemeChange } from './theme.js';
 
 // Sun / moon glyphs for the theme toggle, matched to the nav icon weight.
 function SunIcon() {
@@ -41,19 +41,44 @@ function MoonIcon() {
   );
 }
 
-function ThemeToggle() {
+// Theme picker — an icon whose dropdown offers the three modes; 'auto' (the
+// default) follows the OS.
+const THEME_MODES = [
+  { mode: 'light', label: 'light' },
+  { mode: 'dark', label: 'dark' },
+  { mode: 'auto', label: 'automatic' },
+];
+
+function ThemeMenu() {
   const [theme, setThemeState] = React.useState(getTheme);
+  const [mode, setModeState] = React.useState(getMode);
+  const [open, setOpen] = React.useState(false);
+  const wrapRef = React.useRef(null);
   React.useEffect(() => onThemeChange(setThemeState), []);
-  const light = theme === 'light';
+  React.useEffect(() => {
+    if (!open) return;
+    const close = (e) => { if (!wrapRef.current?.contains(e.target)) setOpen(false); };
+    window.addEventListener('pointerdown', close);
+    return () => window.removeEventListener('pointerdown', close);
+  }, [open]);
+  const pick = (m) => { setMode(m); setModeState(m); setOpen(false); };
   return (
-    <button
-      className="theme-toggle"
-      title={light ? 'Switch to dark theme' : 'Switch to light theme'}
-      onClick={toggleTheme}
-    >
-      {light ? <MoonIcon /> : <SunIcon />}
-      <span>{light ? 'dark theme' : 'light theme'}</span>
-    </button>
+    <div className="theme-menu-wrap" ref={wrapRef}>
+      <button className="topbar-btn theme-toggle" title="Theme" aria-label="Theme"
+        onClick={() => setOpen((o) => !o)}>
+        {theme === 'light' ? <SunIcon /> : <MoonIcon />}
+      </button>
+      {open && (
+        <div className="theme-menu">
+          {THEME_MODES.map(({ mode: m, label }) => (
+            <button key={m} className={`theme-pick${m === mode ? ' is-current' : ''}`}
+              onClick={() => pick(m)}>
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -84,7 +109,7 @@ function Sidebar({ onCollapse }) {
 
       <div className="sidebar-footer">
         <a className="ext-link" href="/"><ArrowUpRight size={14} /><span>open canvas</span></a>
-        <ThemeToggle />
+        <ThemeMenu />
         <div className="signed-in-as">
           <span className="dim" title={userEmail() || ''}>{userEmail()}</span>
           <button className="signout-btn" onClick={signOut} title="Sign out">sign out</button>
@@ -164,7 +189,7 @@ function AppToggle({ env, port, onToggle }) {
   return (
     <button type="button" className="topbar-btn app-toggle"
       title="View the running app" onClick={onToggle}>
-      <AppPanelIcon />
+      <WorkspacePanelIcon />
     </button>
   );
 }
@@ -547,7 +572,7 @@ function Shell() {
           — and closing tears the iframe down so we never lazy-start a worktree's
           dev server the user didn't ask to see. */}
       {appOpen && (
-        <AppPanel
+        <WorkspacePanel
           env={activeEnv}
           port={activePort}
           reloadKey={appReloadKey}

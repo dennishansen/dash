@@ -1,18 +1,10 @@
 // Isomorphic row→kanban-item shaping. ONE mapping of the `issues` row schema to
-// the shape the board UI consumes, shared by:
-//   - dash-issues.js (node): passes git-derived liveness as the second arg
-//   - board-store.js (browser, model-A remote): omits it — no git on Vercel,
-//     so cards simply render without the live-worktree dot. That absence IS the
-//     correct remote behavior, not a bug.
-// Keep this free of node imports (fs/child_process) so the browser bundle can
-// import it.
-
-const NO_LIVE = { live: false, live_pid: null, worktree_path: null };
-
-// Shape a raw store row into the kanban item. `live` is the branch-liveness join
-// (live/live_pid/worktree_path); it defaults to "not live" for callers with no
-// git access. `body` is attached by detail callers, never here.
-export function shapeRow(row, live = NO_LIVE) {
+// the shape the board UI consumes, shared by dash-issues.js (node) and
+// board-store.js (browser). Pure: cards render purely from stored fields — the
+// board no longer joins any git-derived branch liveness (that scan was the dash
+// terminal-freeze cause). Keep this free of node imports so the browser bundle
+// can import it. `body` is attached by detail callers, never here.
+export function shapeRow(row) {
   const branches = Array.isArray(row.branches) ? row.branches : [];
   return {
     id: row.id,
@@ -29,9 +21,6 @@ export function shapeRow(row, live = NO_LIVE) {
     updated: row.updated_at || null,
     closed: row.closed_at || null,   // when it entered done/rejected (sorts the archive cols)
     order: row.rank != null ? Number(row.rank) : null,
-    live: live.live,
-    live_pid: live.live_pid,
-    worktree_path: live.worktree_path,
     branch: branches[0] || null,
     kind: 'issue',
   };
