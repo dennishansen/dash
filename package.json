@@ -12,6 +12,8 @@
     "dist",
     "server",
     "bin",
+    "scripts",
+    "docs",
     "supabase",
     "index.html",
     "vite.config.js",

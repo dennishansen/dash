@@ -120,6 +120,56 @@ features light up only when the local backend is running (probed once at boot vi
 On a remote or static deploy with no local backend, these render a "not on this
 machine" guard and the board keeps working.
 
+## Driving Dash with an agent
+
+The board isn't just for humans dragging cards. Dash ships a small CLI layer so a
+coding agent (Claude Code, Codex) can operate the board and run itself against it
+— log work, pick up a card in its own git worktree, and report back — which is how
+the author actually uses it. Everything here talks to the same Supabase board, so
+a human and an agent see one truth.
+
+Three pieces, all under `scripts/` (full reference in
+[`docs/dashboard.md`](docs/dashboard.md)):
+
+- **`board.mjs`** — read and write the board from the command line, no running
+  server needed. `list`, `get`, `new`, `status`, `start`, `done`, and friends.
+  This is the board's API for scripts and agents.
+
+  ```bash
+  node scripts/board.mjs new fix-login --title "login button dead on Safari" --tags bug
+  node scripts/board.mjs list --status next
+  node scripts/board.mjs start fix-login      # → in-progress, links this session
+  ```
+
+- **`spawn-issue.mjs`** — file a card and **launch an agent on it**. The dash
+  server gives the issue its own git worktree and dev-server port, spawns the
+  agent server-side, and moves the card to in-progress. You open the card later
+  only to watch or unblock — the agent's session reattaches to the same live
+  process.
+
+  ```bash
+  node scripts/spawn-issue.mjs fix-login       # runs the change flow
+  node scripts/spawn-issue.mjs fix-login --bug  # reproduce-first flow
+  ```
+
+- **`agent-chat.mjs`** — read a launched agent's transcript and message it, so you
+  can monitor, steer, or let two agents hold a dialog you watch live on the card.
+
+  ```bash
+  node scripts/agent-chat.mjs read <session> --wait          # block until it says something new
+  node scripts/agent-chat.mjs send fix-login <session> "also cover Firefox"
+  ```
+
+`spawn-issue` and `agent-chat` need the dash dev server running (`npm run dev`) and
+the terminal backend (`node-pty`) installed; `board.mjs` needs only
+`DASH_SUPABASE_SERVICE_KEY` set. The agent chat API is served in both dev
+(`npm run dev`) and production (`npx dash`).
+
+If you use Claude Code, `.claude/skills/` ships starter skills — `/issue`,
+`/change`, `/bug`, `/kick-off-issue`, `/agent-chat`, `/merge` — that wire these
+CLIs into a log → work → merge loop. They're a starting point; edit them for how
+your project actually works.
+
 ## Security
 
 The card terminal spawns a **real shell/PTY on the host** for any signed-in user.

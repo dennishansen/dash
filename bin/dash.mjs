@@ -11,9 +11,12 @@
 //      HashRouter client routes).
 //   2. Mounts the dash API middleware (dashApi) at /api/dash — the same
 //      middleware the dev server uses.
-//   3. Upgrades /api/dash/terminal WebSocket connections to a real PTY, IF the
-//      optional native dep node-pty is installed (terminal.js). Without it, the
-//      board still works; only the browser terminal is off.
+//   3. Upgrades /api/dash/terminal WebSocket connections to a real PTY, and
+//      serves the /api/dash/terminal/* HTTP API (chat / chats / transcript /
+//      message) that the agent-driving CLIs (scripts/spawn-issue.mjs,
+//      scripts/agent-chat.mjs) use — IF the optional native dep node-pty is
+//      installed (terminal.js). Without it, the board still works; only the
+//      browser terminal and the agent chat API are off.
 //
 // Dependency-light on purpose: Node's own http + the `ws` server, plus the
 // existing server modules. No Express, no Vite at runtime.
@@ -79,6 +82,19 @@ const MIME = {
 
 const api = dashApi();
 
+// Terminal backend — optional (needs node-pty). Loaded up front so both the
+// HTTP API (chat/chats/transcript/message) and the WS upgrade below can use it.
+// If node-pty isn't installed, both are simply off and the board still works.
+let attachChat = null;
+let handleTerminalHttp = null;
+try {
+  const term = await import('../server/terminal.js');
+  attachChat = term.attachChat;
+  handleTerminalHttp = term.handleTerminalHttp;
+} catch (e) {
+  console.log('[dash] terminal disabled (node-pty not installed):', e.message);
+}
+
 // Static file serve out of dist/, with SPA fallback to index.html. Path is
 // contained to DIST (no traversal).
 function serveStatic(req, res) {
@@ -114,21 +130,24 @@ const server = http.createServer((req, res) => {
       res.end('Forbidden');
       return;
     }
+    // Terminal HTTP API (agent chat: chat/chats/transcript/message) wins over
+    // the generic /api/dash matcher. Same gate as above; the WS upgrade path
+    // (exactly /api/dash/terminal) is handled separately in the upgrade hook.
+    const [pathname] = url.split('?');
+    if (handleTerminalHttp && pathname.startsWith('/api/dash/terminal/')) {
+      const segs = pathname.replace(/^\/api\/dash\/terminal\/?/, '').split('/').filter(Boolean);
+      return handleTerminalHttp(req, res, segs).catch((e) => {
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      });
+    }
     return api(req, res, () => serveStatic(req, res));
   }
   return serveStatic(req, res);
 });
 
-// Terminal WebSocket upgrade — optional (needs node-pty). If it isn't installed,
-// terminal connections are simply refused and the rest of the app is unaffected.
-let attachChat = null;
-try {
-  const term = await import('../server/terminal.js');
-  attachChat = term.attachChat;
-} catch (e) {
-  console.log('[dash] terminal disabled (node-pty not installed):', e.message);
-}
-
+// Terminal WebSocket upgrade — optional (needs node-pty, loaded above). If it
+// isn't installed, terminal connections are refused and the rest is unaffected.
 if (attachChat) {
   // handleProtocols echoes the token subprotocol back so the browser handshake
   // completes when a token is presented that way (see ws-guard).
