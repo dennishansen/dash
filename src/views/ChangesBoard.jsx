@@ -7,6 +7,7 @@ import { insertionIndex } from './dragOrder.js';
 import { useSelection } from '../selection.jsx';
 import { columnCompare, archiveCompare, ARCHIVE_COLS } from '../board-sort.js';
 import { searchIssues } from '../issue-search.js';
+import { useHotkey } from '../hotkeys.js';
 
 function SearchIcon() {
   return (
@@ -47,6 +48,26 @@ export const BUCKETS = [
   { key: 'rejected',    title: 'Rejected',    tone: 'warn' },
 ];
 
+// The board owns its cursor/selection keys only when focus rests on a PASSIVE
+// surface — the body or a scroll container, never a focusable control (a card
+// adder, a sidebar link, the App·Code tab), which was the gap that let
+// Enter/arrows leak onto them. (Inputs and the terminal are excluded by the
+// primitive's own focus rules.) Stable module-level refs for useHotkey's `when`.
+const passiveSurface = (e) => {
+  const t = e.target;
+  return !(t instanceof Element) || !t.closest('a[href], button, [role="button"], [role="tab"]');
+};
+// The board is the OSS home route (`/` — empty hash path). This event-time check
+// (not the React `visible` prop) lets a chord fired in the frame after
+// navigating off the board decline here instead of acting on a board the user
+// has already left. The ⌘↑/↓ reorder chords gate on `passiveSurface` alone and
+// re-check the route inside their handler, so they still CONSUME the key during
+// the board↔detail hand-off frame while only ACTING on the board.
+const onBoardRoute = () => {
+  const p = (window.location.hash || '').replace(/^#/, '').split('?')[0];
+  return p === '' || p === '/';
+};
+const boardOwnsKeyboard = (e) => passiveSurface(e) && onBoardRoute();
 
 export function ChangesBoard({ visible = true }) {
   // The board reads Supabase directly (board-store), so it works remotely on
@@ -58,7 +79,7 @@ export function ChangesBoard({ visible = true }) {
   const { data, err, loading, refresh } = useAsync('changes', listChanges, { pollMs: 60000 });
   useIssuesRealtime(refresh);
   const navigate = useNavigate();
-  const { selectedId, setSelectedId, chatFocused } = useSelection();
+  const { selectedId, anchorId, setSelection, chatFocused, setOrder } = useSelection();
   const [search, setSearch] = useState('');
   const [showFilters, setShowFilters] = useState(false);
   const [activeTags, setActiveTags] = useState(() => new Set());
@@ -252,45 +273,149 @@ export function ChangesBoard({ visible = true }) {
     ? (cols[drag.col] || []).find(x => x.id === drag.id)
     : null;
 
-  // Keyboard cursor. The grid is the visible (non-collapsed, non-empty) columns
-  // in board order, each carrying its displayed id list — the exact same order
-  // the user sees. ↑/↓ walk a column, ←/→ jump columns (clamping the row to the
-  // new column's length), Enter opens the selected card. Collapsed and empty
-  // columns are skipped so an arrow always lands on a real card.
-  const moveSelection = (dir) => {
-    const grid = BUCKETS
-      .filter(b => !hidden.has(b.key))
-      .map(b => displayItems(b.key).map(x => x.id))
-      .filter(ids => ids.length);
-    if (!grid.length) return;
-    let ci = grid.findIndex(ids => ids.includes(selectedId));
-    if (ci < 0) { setSelectedId(grid[0][0]); return; }
-    let ri = grid[ci].indexOf(selectedId);
-    if (dir === 'up') ri = Math.max(0, ri - 1);
-    else if (dir === 'down') ri = Math.min(grid[ci].length - 1, ri + 1);
-    else if (dir === 'left') ci = Math.max(0, ci - 1);
-    else if (dir === 'right') ci = Math.min(grid.length - 1, ci + 1);
-    ri = Math.min(ri, grid[ci].length - 1);
-    setSelectedId(grid[ci][ri]);
+  // The keyboard nav grid: the visible (non-collapsed, non-empty) columns in
+  // board order, each carrying its displayed card ids — the exact order the user
+  // sees, including any optimistic drag/reorder override (displayItems). This is
+  // the single source for cursor nav, the selection range, and the detail rail.
+  const navCols = useMemo(() =>
+    BUCKETS.filter(b => !hidden.has(b.key))
+      .map(b => ({ key: b.key, ids: displayItems(b.key).map(x => x.id) }))
+      .filter(c => c.ids.length),
+    [cols, override, hidden]);
+  // Publish the flat board order so the detail view's ⌘↑/↓ rail and its
+  // after-delete cursor-park (useIssueNav) read the same order shown here.
+  useEffect(() => { setOrder(navCols.flatMap(c => c.ids)); }, [navCols, setOrder]);
+
+  // Locate an id in the grid: its column index and row within it.
+  const locate = (id) => {
+    for (let ci = 0; ci < navCols.length; ci++) {
+      const ri = navCols[ci].ids.indexOf(id);
+      if (ri >= 0) return { ci, ri };
+    }
+    return null;
   };
 
-  useEffect(() => {
-    // The board stays mounted while you're on other routes (hidden via CSS), so
-    // only the visible board owns the arrow/Enter keys — otherwise it would
-    // hijack them on a change-detail page.
-    if (!visible) return undefined;
-    const onKey = (e) => {
-      const t = e.target;
-      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
-      if (drag) return; // don't fight an in-flight pointer drag
-      if (e.metaKey || e.ctrlKey) return; // ⌘←/⌘→ are the Shell's chat-focus toggle, not card nav
-      const dir = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right' }[e.key];
-      if (dir) { e.preventDefault(); moveSelection(dir); }
-      else if (e.key === 'Enter' && selectedId) { e.preventDefault(); navigate(`/changes/${encodeURIComponent(selectedId)}`); }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  });
+  // The highlighted set — the contiguous card run between the anchor and the
+  // focus WITHIN one column (file-list style). A single selection (anchor ===
+  // focus) or an anchor that has drifted to another column collapses to just the
+  // focus.
+  const selectedIds = useMemo(() => {
+    if (!selectedId) return new Set();
+    const f = locate(selectedId);
+    if (!f) return new Set();
+    if (!anchorId || anchorId === selectedId) return new Set([selectedId]);
+    const a = locate(anchorId);
+    if (!a || a.ci !== f.ci) return new Set([selectedId]);
+    return new Set(navCols[f.ci].ids.slice(Math.min(a.ri, f.ri), Math.max(a.ri, f.ri) + 1));
+  }, [navCols, anchorId, selectedId]);
+
+  // Each column's REORDERABLE (issue-only) ids as last rendered AND advanced
+  // synchronously by a nudge — so a second ⌘↓ fired before React re-renders
+  // derives its move from the first move's result, not the same stale order.
+  const liveOrderRef = useRef({});
+  liveOrderRef.current = Object.fromEntries(
+    BUCKETS.filter(b => !hidden.has(b.key))
+      .map(b => [b.key, displayItems(b.key).filter(x => x.kind === 'issue').map(x => x.id)]));
+
+  // ↑/↓ walk a column, ←/→ jump columns (clamping the row), ⌥↑/⌥↓ snap to a
+  // column's top/bottom. Lands the cursor as a fresh single selection.
+  const moveSelection = (dir) => {
+    if (!navCols.length) return;
+    let ci = navCols.findIndex(c => c.ids.includes(selectedId));
+    if (ci < 0) { setSelection(navCols[0].ids[0]); return; }
+    let ri = navCols[ci].ids.indexOf(selectedId);
+    if (dir === 'up') ri = Math.max(0, ri - 1);
+    else if (dir === 'down') ri = Math.min(navCols[ci].ids.length - 1, ri + 1);
+    else if (dir === 'top') ri = 0;
+    else if (dir === 'bottom') ri = navCols[ci].ids.length - 1;
+    else if (dir === 'left') ci = Math.max(0, ci - 1);
+    else if (dir === 'right') ci = Math.min(navCols.length - 1, ci + 1);
+    ri = Math.min(ri, navCols[ci].ids.length - 1);
+    setSelection(navCols[ci].ids[ri]);
+  };
+
+  // Shift+↑/↓ grows or shrinks a CONSECUTIVE card run within the focus's column
+  // (never across columns). The anchor stays put while the focus steps one card;
+  // the run between them is the selection.
+  const extendSelection = (dir) => {
+    if (dir !== 'up' && dir !== 'down') return;
+    const f = locate(selectedId);
+    if (!f) return;
+    const col = navCols[f.ci].ids;
+    const ri = dir === 'up' ? Math.max(0, f.ri - 1) : Math.min(col.length - 1, f.ri + 1);
+    // Keep the anchor if it's still in THIS column; otherwise the current focus
+    // becomes the anchor (the first extend out of a single selection).
+    const a = locate(anchorId);
+    const anchor = (a && a.ci === f.ci) ? anchorId : selectedId;
+    setSelection(col[ri], anchor);
+  };
+
+  // ⌘↑/⌘↓ nudge the selected card(s) one slot within their column, rewriting
+  // ranks through the same board-store reorder the drag path uses — so order
+  // syncs live across worktrees/machines. While the board owns the keyboard,
+  // ⌘↑/↓ always CONSUMES the key: it moves the run when it can and is otherwise
+  // inert — never releasing to the browser's native ⌘↑/↓ page-scroll. A no-op on
+  // an archive column (done/rejected ignore rank), under an active filter (the
+  // column shows a subset — renumbering it would collide with hidden cards), or
+  // when the run is already clamped at a column end.
+  const reorderSelection = (dir) => {
+    if (dir !== 'up' && dir !== 'down') return false;
+    // Off the board (the hand-off frame before this hidden board's chord detaches):
+    // consume the key so it can't native-scroll, but don't act — the detail owns
+    // ⌘↑/↓ there.
+    if (!onBoardRoute()) return;
+    if (!selectedId) return false;                 // no cursor — leave the key alone
+    const f = locate(selectedId);
+    if (!f) return;                                // not on a card — inert (consume)
+    const bucketKey = navCols[f.ci].key;
+    if (ARCHIVE_COLS.has(bucketKey) || filterActive) return; // not reorderable — inert
+    const ids = liveOrderRef.current[bucketKey] || [];
+    const run = ids.filter(id => selectedIds.has(id));
+    if (!run.length) return;                       // inert (e.g. focus on a live branch card)
+    const first = ids.indexOf(run[0]);
+    const last = ids.indexOf(run[run.length - 1]);
+    if (dir === 'up' && first === 0) return;                // clamped at the top — inert
+    if (dir === 'down' && last === ids.length - 1) return;  // clamped at the bottom — inert
+    const next = [...ids];
+    if (dir === 'up') {
+      const [above] = next.splice(first - 1, 1);
+      next.splice(last, 0, above);                          // the card above slides below the run
+    } else {
+      const [below] = next.splice(last + 1, 1);
+      next.splice(first, 0, below);                         // the card below slides above the run
+    }
+    liveOrderRef.current[bucketKey] = next;                 // advance for a same-tick repeat
+    setOverride(o => ({ ...o, [bucketKey]: next }));        // optimistic paint (like the drag)
+    commit(write(reorderChange(next)), bucketKey);
+    // Selection ids don't change on a reorder, so the scroll effect won't fire —
+    // keep the moved run in view ourselves.
+    requestAnimationFrame(() =>
+      document.querySelector(`[data-card-id="${CSS.escape(selectedId)}"]`)?.scrollIntoView({ block: 'nearest' }));
+  };
+
+  // Board cursor keys. Meaningful only while the BOARD owns the keyboard, so they
+  // YIELD to the terminal (the primitive's default): a bare ↑/↓/←/→/Enter is real
+  // terminal input, and ⌥↑/↓ leave the chat alone too. `when: boardOwnsKeyboard`
+  // fires them only on a passive surface AND the board route; `enabled` also
+  // pauses them mid pointer-drag. Bubble phase (capture:false).
+  const navEnabled = visible && !drag;
+  const boardOpts = { enabled: navEnabled, capture: false, when: boardOwnsKeyboard };
+  useHotkey('ArrowUp', () => moveSelection('up'), boardOpts);
+  useHotkey('ArrowDown', () => moveSelection('down'), boardOpts);
+  useHotkey('ArrowLeft', () => moveSelection('left'), boardOpts);
+  useHotkey('ArrowRight', () => moveSelection('right'), boardOpts);
+  useHotkey('Alt+ArrowUp', () => moveSelection('top'), boardOpts);
+  useHotkey('Alt+ArrowDown', () => moveSelection('bottom'), boardOpts);
+  useHotkey('Shift+ArrowUp', () => extendSelection('up'), boardOpts);
+  useHotkey('Shift+ArrowDown', () => extendSelection('down'), boardOpts);
+  useHotkey('Enter', () => { if (!selectedId) return false; navigate(`/changes/${encodeURIComponent(selectedId)}`); }, boardOpts);
+  // ⌘↑/⌘↓ nudge the run (rank write). Gated on a passive surface (not the route)
+  // so the hidden board still CONSUMES ⌘↑/↓ in the hand-off frame after navigating
+  // to a detail — no native page-scroll leaks — while reorderSelection only ACTS
+  // when onBoardRoute. Yields to the terminal like the cursor keys.
+  const reorderOpts = { enabled: navEnabled, capture: false, when: passiveSurface };
+  useHotkey('Mod+ArrowUp', () => reorderSelection('up'), reorderOpts);
+  useHotkey('Mod+ArrowDown', () => reorderSelection('down'), reorderOpts);
 
   // On board load, park the keyboard cursor on the top of In Progress (where
   // active work is) so arrows move from there immediately. Only when nothing is
@@ -301,7 +426,7 @@ export function ChangesBoard({ visible = true }) {
     const top = (key) => displayItems(key)[0]?.id;
     const pick = top('in-progress')
       ?? BUCKETS.filter(b => !hidden.has(b.key)).map(b => top(b.key)).find(Boolean);
-    if (pick) setSelectedId(pick);
+    if (pick) setSelection(pick);
   }, [data]);
 
   // Keep the selected card in view as the cursor moves (and on return from detail).
@@ -381,6 +506,7 @@ export function ChangesBoard({ visible = true }) {
               bodyRef={el => { bodyRefs.current[b.key] = el; }}
               onCardPointerDown={onCardPointerDown} didDragRef={didDragRef}
               dragDisabled={filterActive} selectedId={chatFocused ? null : selectedId}
+              rangeIds={chatFocused || selectedIds.size < 2 ? null : selectedIds}
               onAdd={() => addIssue(b.key)} />
           ))}
         </div>
@@ -396,7 +522,7 @@ export function ChangesBoard({ visible = true }) {
   );
 }
 
-function IssueColumn({ title, tone, items, emptyMsg, collapsed, onToggle, colKey, dragId, placeAt, placeH, isDropTarget, bodyRef, onCardPointerDown, didDragRef, dragDisabled, selectedId, onAdd }) {
+function IssueColumn({ title, tone, items, emptyMsg, collapsed, onToggle, colKey, dragId, placeAt, placeH, isDropTarget, bodyRef, onCardPointerDown, didDragRef, dragDisabled, selectedId, rangeIds, onAdd }) {
   if (collapsed) {
     return (
       <div className={`kcol kcol-${tone} kcol-collapsed`} onClick={onToggle} title="Show column">
@@ -421,7 +547,7 @@ function IssueColumn({ title, tone, items, emptyMsg, collapsed, onToggle, colKey
     if (placeAt >= 0 && !placed && issueIdx === placeAt) { rows.push(ph); placed = true; }
     rows.push(<IssueCard key={i.id} i={i} colKey={colKey}
       onPointerDown={onCardPointerDown} didDragRef={didDragRef} dragDisabled={dragDisabled}
-      selected={i.id === selectedId} />);
+      selected={i.id === selectedId} range={rangeIds ? rangeIds.has(i.id) : false} />);
     if (i.kind === 'issue') issueIdx++;
   }
   if (placeAt >= 0 && !placed) rows.push(ph);
@@ -443,7 +569,7 @@ function IssueColumn({ title, tone, items, emptyMsg, collapsed, onToggle, colKey
   );
 }
 
-function IssueCard({ i, colKey, onPointerDown, didDragRef, dragDisabled, selected }) {
+function IssueCard({ i, colKey, onPointerDown, didDragRef, dragDisabled, selected, range }) {
   // Only real issue cards carry a board row, so only they are draggable. Live
   // branch pseudo-cards (kind 'branch') stay click-through links. Drag is also
   // off while a filter is active (a column shows only a subset — can't renumber).
@@ -462,7 +588,7 @@ function IssueCard({ i, colKey, onPointerDown, didDragRef, dragDisabled, selecte
   } : {};
   return (
     <Link to={`/changes/${encodeURIComponent(i.id)}`} data-card-id={i.id} data-card-kind={i.kind}
-      className={`kcard issue-card status-${i.status}${i.live ? ' is-live' : ''}${draggable ? ' draggable' : ''}${selected ? ' is-selected' : ''}`}
+      className={`kcard issue-card status-${i.status}${i.live ? ' is-live' : ''}${draggable ? ' draggable' : ''}${selected ? ' is-selected' : ''}${range ? ' is-range' : ''}`}
       {...dragProps}>
       {i.live ? <div className="kcard-head"><span className="pill live-tag" title={`branch live (pid ${i.live_pid})`}>● live</span></div> : null}
       <div className="kcard-title-row">

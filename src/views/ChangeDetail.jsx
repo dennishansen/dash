@@ -4,7 +4,7 @@ import { useAsync, useIssuesRealtime, fmtDate } from '../api.js';
 import { changeDetail, renameChange, updateChangeField, setChangeStatus, deleteChange } from '../board-store.js';
 import { BUCKETS } from './ChangesBoard.jsx';
 import { useLocalBackend } from '../capabilities.js';
-import { useSelection } from '../selection.jsx';
+import { useSelection, useIssueNav } from '../selection.jsx';
 import { useActivity } from '../activity-store.js';
 import { Markdown } from './Markdown.jsx';
 import { CopyButton } from './CopyButton.jsx';
@@ -322,7 +322,7 @@ export function ChangeDetail() {
   const location = useLocation();
   const focusTitle = location.state?.focusTitle === true;
   const local = useLocalBackend();
-  const { setSelectedId } = useSelection();
+  const { setSelection } = useSelection();
   const requestChat = useChatControl();
   const activity = useActivity();
   // Read the issue straight from Supabase (board-store) so detail works remotely.
@@ -333,7 +333,10 @@ export function ChangeDetail() {
   useIssuesRealtime(refresh);
 
   // Record which card we came in on, so ⌘← / Esc returns the board cursor here.
-  useEffect(() => { setSelectedId(id); }, [id, setSelectedId]);
+  useEffect(() => { setSelection(id); }, [id, setSelection]);
+  // Neighbors on the board's published order — used to park the cursor after a
+  // delete (the card that slides into the deleted slot).
+  const { prevId, nextId } = useIssueNav(id);
   useEffect(() => {
     const onKey = (e) => {
       const t = e.target;
@@ -379,7 +382,12 @@ export function ChangeDetail() {
             {data.created ? <span className="dim" style={{ marginLeft: 8 }}>created {fmtDate(data.created)}</span> : null}
           </div>
         </div>
-        {isIssue ? <DeleteIssue id={data.id} onDeleted={() => navigate('/')} /> : null}
+        {/* On delete, park the board cursor where the deleted card WAS: the card
+            below it slides up into that slot (nextId), or if it was last, the one
+            above (prevId). Set before navigating so the board's auto-park keeps it
+            instead of jumping to the top of In Progress. */}
+        {isIssue ? <DeleteIssue id={data.id}
+          onDeleted={() => { setSelection(nextId ?? prevId ?? null); navigate('/'); }} /> : null}
       </div>
 
       <div className="issue-fields">

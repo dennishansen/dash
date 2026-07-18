@@ -2460,6 +2460,14 @@ textarea.body-edit {
   outline-offset: 1px;
 }
 
+/* Multi-card range (Shift+Arrow) — every card in the contiguous run wears a soft
+   fill in the issue's stage colour so the run reads as one band; the focus end
+   additionally wears the .is-selected ring above. Only a genuine run (2+ cards)
+   gets the fill, so a single selection keeps its ring-only look. */
+.kcard.is-range {
+  background: color-mix(in srgb, var(--stage, var(--accent)) 15%, var(--bg-card));
+}
+
 .kcard-head {
   display: flex;
   align-items: center;
