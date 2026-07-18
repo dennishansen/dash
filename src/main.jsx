@@ -24,6 +24,7 @@ import { useFetch, useAsync } from './api.js';
 import { stateCounts, listChanges } from './board-store.js';
 import { onAuth, ensureFreshToken, ensureDevSession, signOut, userEmail } from './auth.js';
 import { getTheme, getMode, setMode, onThemeChange } from './theme.js';
+import { useHotkey } from './hotkeys.js';
 
 // Sun / moon glyphs for the theme toggle, matched to the nav icon weight.
 function SunIcon() {
@@ -132,7 +133,7 @@ function useCrumbs() {
   const section = SECTION[parts[0]];
   if (section) {
     crumbs.push({ label: section, to: '/' });
-    if (parts[1]) crumbs.push({ label: decodeURIComponent(parts[1]), copy: true });
+    if (parts[1]) crumbs.push({ id: decodeURIComponent(parts[1]), copy: true, section: parts[0] });
   } else {
     crumbs.push({ label: decodeURIComponent(parts[0]) });
   }
@@ -160,21 +161,30 @@ function PanelIcon() {
   );
 }
 
-// The leaf crumb on a detail route is the issue/test id — click it to copy.
-// Flashes "copied" for ~1s; falls back silently if the clipboard is blocked.
-function CrumbCopy({ text }) {
+// The leaf crumb on a detail route SHOWS the issue title but COPIES the id — the
+// title reads better in the bar, the id is what you paste. Falls back to the id
+// as the label until the issue list resolves. Long titles ellipse at a max width
+// (CSS). Flashes "copied" for ~1s; clipboard blocked → silent no-op.
+function CrumbCopy({ id, section }) {
   const [copied, setCopied] = React.useState(false);
   const timer = React.useRef(null);
+  const { data } = useAsync('changes', listChanges, { pollMs: 0 });
+  const title = section === 'changes' ? (data?.find(i => i.id === id)?.title || null) : null;
+  const label = title || id;
   const onCopy = async () => {
-    try { await navigator.clipboard.writeText(text); } catch { /* blocked */ }
+    try { await navigator.clipboard.writeText(id); } catch { /* blocked */ }
     setCopied(true);
     clearTimeout(timer.current);
     timer.current = setTimeout(() => setCopied(false), 1000);
   };
+  // ⌘S copies the open id — same action + "copied ✓" flash as clicking the crumb.
+  // CrumbCopy only mounts on a detail route, so this never fires on the board
+  // (where ⌘S copies the selected card). terminal:'handle' so it works over chat.
+  useHotkey('Mod+KeyS', () => { onCopy(); }, { terminal: 'handle', repeat: false });
   return (
     <button type="button" className={`crumb-cur crumb-copy${copied ? ' copied' : ''}`}
-      onClick={onCopy} title={copied ? 'Copied!' : 'Copy id'}>
-      {copied ? 'copied ✓' : text}
+      onClick={onCopy} title={copied ? 'Copied!' : `${label} — click to copy id (${id})`}>
+      {copied ? 'copied ✓' : label}
     </button>
   );
 }
@@ -212,7 +222,7 @@ function TopBar({ leftCollapsed, onToggleLeft, chatOpen, onToggleChat, appOpen, 
         {crumbs.map((c, i) => (
           <span key={i} className="crumb">
             {c.to ? <Link to={c.to}>{c.label}</Link>
-              : c.copy ? <CrumbCopy text={c.label} />
+              : c.copy ? <CrumbCopy id={c.id} section={c.section} />
               : <span className="crumb-cur">{c.label}</span>}
             {i < crumbs.length - 1 ? <span className="crumb-sep">/</span> : null}
           </span>

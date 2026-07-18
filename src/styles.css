@@ -474,6 +474,12 @@ select:focus {
   border: none;
   padding: 0;
   cursor: pointer;
+  /* Titles can be long — cap the width and ellipse the tail so the bar never
+     blows out. The full title is in the button's tooltip. */
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .topbar-crumbs .crumb-copy:hover { color: var(--accent); }
 .topbar-crumbs .crumb-copy.copied { color: var(--ok, var(--accent)); }
