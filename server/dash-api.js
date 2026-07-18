@@ -10,6 +10,8 @@ import { fileURLToPath } from 'url';
 import { startArchiveWatcher } from './archive-watcher.js';
 import { listChanges, issueDetail, reorderChanges, moveChange, renameChange, createChange } from './dash-issues.js';
 import { CodeBrowserError, environmentSnapshot, environmentFile } from './code-browser.mjs';
+import { searchIssues } from '../src/issue-search.js';
+import { parseHandle, chatStatusAny } from './agents.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -137,6 +139,28 @@ export function dashApi() {
         }
       }
       if (req.method === 'GET' && segs[0] === 'state') return send(await memoAsync('state', 60000, topLevelState));
+      // Issue text-search — the same matcher the board box and ⌘K palette use
+      // (issue-search.js: id + title + tags, case-insensitive substring), exposed
+      // so an agent can find issues headlessly instead of only through the UI.
+      // Empty q returns every issue. GET /api/dash/search?q=…
+      if (req.method === 'GET' && segs[0] === 'search') {
+        const q = new URL(req.url, 'http://localhost').searchParams.get('q') || '';
+        const hits = searchIssues(await listChanges(), q)
+          .map(i => ({ id: i.id, title: i.title, status: i.status, tags: i.tags || [] }));
+        return send({ query: q, count: hits.length, results: hits });
+      }
+      // Live context-window fill + LOC for one agent chat — powers the context
+      // ring beside a chat. The `session` param may be a bare uuid or a prefixed
+      // handle (`codex:<uuid>`); parseHandle strips the prefix to the on-disk
+      // uuid. Empty {} = no live data yet (or an unknown id). The regex guards
+      // against path traversal into the on-disk session file.
+      if (req.method === 'GET' && segs[0] === 'chat-status') {
+        const url = new URL(req.url, 'http://localhost');
+        const session = url.searchParams.get('session') || '';
+        if (!/^[A-Za-z0-9:_-]+$/.test(session)) return send({});
+        const { sessionId } = parseHandle(session);
+        return send(await chatStatusAny(sessionId) || {});
+      }
       // Reorder: body { ids: [...] } → each change's rank = its index, written
       // to the issues table in Supabase (issues-store, set_ranks). Status is
       // untouched, so dragging a card within a column never changes its column

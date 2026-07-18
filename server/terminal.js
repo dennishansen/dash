@@ -58,15 +58,22 @@ import { createRequire } from 'module';
 import {
   MAIN_ENV, MAIN_REPO, resolveWorktreeDir, worktreeDir,
 } from './workspace-env.mjs';
+import {
+  mainChatsList, linkMainChat, unlinkMainChat,
+} from './main-chats-store.mjs';
+import { normalizeAppPath } from '../src/app-env.mjs';
 
 const require = createRequire(import.meta.url);
 const pty = require('node-pty');
 
-// The universal "main chat" is a single persistent claude thread that runs in
-// the LIVE repo root (never a worktree). Its env id is this sentinel — distinct
-// from any issue id (those are `i-…`). Unlike an issue chat it has no worktree,
-// no Supabase row, and no multi-chat switcher: there is exactly one main PTY,
-// keyed by this sentinel, kept alive for the life of the dev server.
+// The MAIN chat is a dev environment exactly like an issue — a switcher over
+// multiple chats — differing only in WHERE it runs and WHERE its list lives: its
+// chats run in the LIVE repo root (never a worktree) and are tracked in a
+// machine-local store (main-chats-store.mjs) instead of a shared Supabase row,
+// because main-root sessions are per-machine. `MAIN_ENV` is its env id (the
+// value passed as `issue=main`), distinct from any issue id (`i-…`); a main
+// chat's PTY is keyed by its session uuid like any other, so main carries no
+// special singleton path.
 export { MAIN_ENV };
 
 // Run git from the MAIN repo. ASYNC: even "deliberate one-click" actions like
@@ -85,26 +92,6 @@ async function git(args) {
 // resolving a chat reads transcripts off disk, and board-load resolves many at
 // once, so awaiting fs.promises lets those interleave with live requests instead
 // of freezing the single dev-server event loop.
-
-// The session uuid `claude --continue` will resume in the main repo: the
-// newest transcript in its project dir. Forward-encoding the cwd is exact
-// (every '/' and '.' becomes '-'); only decoding back is lossy. This is the
-// same newest-session selection --continue itself makes, resolved here so the
-// main chat's ready message can carry a real, addressable session id.
-async function latestRootSessionId() {
-  const dir = path.join(os.homedir(), '.claude', 'projects', MAIN_REPO.replace(/[/.]/g, '-'));
-  let files;
-  try { files = await fs.promises.readdir(dir); } catch { return null; }
-  let best = null, bestM = 0;
-  for (const f of files) {
-    if (!f.endsWith('.jsonl')) continue;
-    try {
-      const m = (await fs.promises.stat(path.join(dir, f))).mtimeMs;
-      if (m > bestM) { bestM = m; best = f.slice(0, -('.jsonl'.length)); }
-    } catch {}
-  }
-  return best;
-}
 
 // The cwd a transcript ran in, read from the first transcript line that records
 // Resolve a chat session to its on-disk reality:
@@ -247,13 +234,24 @@ function gitMain(args) {
   return run('git', ['-C', MAIN_REPO, ...args]);
 }
 
+// The most-recently-spawned live main-chat PTY, or null. Main chats are uuid-
+// keyed like any other now (no single MAIN_ENV key), so find the newest live
+// session whose env is main — that's the one the human is most likely looking at.
+function liveMainSession() {
+  let found = null;
+  for (const s of chats.values()) {
+    if (liveSession(s) && s.issueId === MAIN_ENV) found = s; // last wins = newest
+  }
+  return found;
+}
+
 // Paste a message into the live main chat PTY, exactly like typed input (the
-// same bracketed-paste + Enter deliverMessage uses). No-op if the main chat has
-// no live process — the board still surfaces the conflict, so a dormant main
-// chat never blocks a sync. Returns whether it landed.
+// same bracketed-paste + Enter deliverMessage uses). No-op if no main chat has a
+// live process — the board still surfaces the conflict, so a dormant main chat
+// never blocks a sync. Returns whether it landed.
 async function deliverToMainChat(text) {
-  const session = chats.get(MAIN_ENV);
-  if (!liveSession(session)) return false;
+  const session = liveMainSession();
+  if (!session) return false;
   session.pty.write(`\x1b[200~${text}\x1b[201~`);
   await new Promise(r => setTimeout(r, PASTE_SETTLE_MS));
   if (!session.exited) session.pty.write('\r');
@@ -335,13 +333,26 @@ export async function sessionProcessAlive(sessionId) {
   return r.status === 0;
 }
 
-// Append a chat to the issue's conversations[] in Supabase, encoding its agent
-// in the entry (bare uuid = claude, `codex:<uuid>` = codex — see formatHandle).
-// ONE entry per call (the array-append path de-dupes), avoiding the board.mjs
-// space-join quirk.
-async function linkChat(issueId, sessionId, agent = DEFAULT_AGENT) {
+// The tracked chat handles for an environment. An issue reads its shared
+// Supabase conversations[]; MAIN reads the machine-local main-chats store. Both
+// return the same agent-prefixed handle format (formatHandle), so every caller
+// downstream treats an issue and main identically.
+async function chatHandlesFor(env) {
+  if (env === MAIN_ENV) return mainChatsList();
+  const { get } = await import('./issues-store.mjs');
+  const row = await get(env).catch(() => null);
+  return Array.isArray(row?.conversations) ? row.conversations : [];
+}
+
+// Link a chat to an environment, encoding its agent in the handle (bare uuid =
+// claude, `codex:<uuid>` = codex — see formatHandle). Issue chats append to the
+// shared Supabase conversations[]; MAIN appends to the machine-local store. ONE
+// entry per call (both append paths de-dupe).
+async function linkChat(env, sessionId, agent = DEFAULT_AGENT) {
+  const handle = formatHandle(agent, sessionId);
+  if (env === MAIN_ENV) return linkMainChat(handle);
   const { appendToArray } = await import('./issues-store.mjs');
-  return appendToArray(issueId, 'conversations', [formatHandle(agent, sessionId)]);
+  return appendToArray(env, 'conversations', [handle]);
 }
 
 // Reserve a stable dev-server port for the issue (idempotent — re-opening an
@@ -588,11 +599,12 @@ async function waitForPort(port, timeoutMs = 12000) {
   return false;
 }
 
-// Report an issue's worktree + chats for the client, reflecting the issue's REAL
-// recorded state rather than a name-guessed path. The worktree is resolved from
-// the `<issueId>` dir OR any recorded branch's worktree; each chat is resolved
-// by finding its transcript anywhere under ~/.claude/projects and reading the
-// cwd it actually ran in. A chat is resumable iff EITHER a live PTY for it is
+// Report an environment's workspace + chats for the client, reflecting its REAL
+// recorded state rather than a name-guessed path. For an issue the workspace is
+// its worktree (the `<issueId>` dir or a recorded branch's worktree); for MAIN it
+// is the repo root, always present. Each chat is resolved by finding its
+// transcript anywhere under ~/.claude/projects and reading the cwd it actually
+// ran in. A chat is resumable iff EITHER a live PTY for it is
 // already running in this process OR its transcript exists and the cwd it ran in
 // still exists on disk — independent of which worktree the issue "should" have.
 // The live-PTY case matters for a freshly-spawned autonomous chat: its session
@@ -600,17 +612,16 @@ async function waitForPort(port, timeoutMs = 12000) {
 // line, so a transcript-only check would (briefly) call it unresumable and the
 // board's auto-attach would skip it and never retry. attachChat reattaches to a
 // live PTY without touching the transcript, so reporting it resumable is honest.
-export async function issueChats(issueId) {
-  let row = null;
-  try {
-    const { get } = await import('./issues-store.mjs');
-    row = await get(issueId);
-  } catch {}
-  // Each conversations[] entry carries its agent as a prefix (formatHandle); the
-  // bare session uuid is what the PTY map, registry and transcript stores key on,
-  // and `agent` rides through to the client for the per-chat type badge.
-  const conversations = (Array.isArray(row?.conversations) ? row.conversations : []).map(parseHandle);
-  const dir = resolveWorktreeDir(issueId);
+export async function issueChats(env) {
+  // Each handle carries its agent as a prefix (formatHandle); the bare session
+  // uuid is what the PTY map, registry and transcript stores key on, and `agent`
+  // rides through to the client for the per-chat type badge. Handles come from
+  // the shared issue row for an issue, or the machine-local store for MAIN.
+  const conversations = (await chatHandlesFor(env)).map(parseHandle);
+  // MAIN's workspace is the repo root — always present; an issue's is its
+  // worktree dir (null until created).
+  const isMain = env === MAIN_ENV;
+  const dir = isMain ? MAIN_REPO : resolveWorktreeDir(env);
   // Resolve conversations SEQUENTIALLY, not via Promise.all: board-load already
   // mounts in-progress issues a couple at a time, and each unresolved transcript
   // is a full transcript-store scan. Resolving an issue's convos one-by-one
@@ -686,10 +697,15 @@ const chats = globalThis.__labChats;
 // contracts this version no longer honors. That is how the dash died twice on
 // 2026-07-09 (issue i-chat-attach-crash): post-multi-attach code called .add
 // on a pre-multi-attach survivor's `attached: null`. Every session therefore
-// carries this shape stamp — bump it whenever the session object's contract
-// changes — and module evaluation retires survivors whose stamp differs (see
-// the retirement sweep by the shutdown path below). Exported for tests.
-export const CHAT_SHAPE = 2; // 1: single-socket `attached: ws|null` (unstamped); 2: multi-attach Set + geomOwner
+// carries this shape stamp — bump it whenever the session object's contract OR
+// its KEYING changes — and module evaluation retires survivors whose stamp
+// differs (see the retirement sweep by the shutdown path below). Exported for
+// tests. Bumped to 3 for the main-chat unification: main used to be keyed by the
+// MAIN_ENV sentinel and this version keys it by session uuid, so a live pre-
+// unification main singleton (a shape-2 survivor the new code can no longer
+// address) must be RETIRED on the HMR eval — leaving it would strand a --continue
+// process the uuid path can't see, double-resuming main.
+export const CHAT_SHAPE = 3; // 1: single-socket (unstamped); 2: multi-attach Set + geomOwner; 3: main uuid-keyed (retires the MAIN_ENV singleton)
 
 // A map entry this module version may reuse: live AND stamped by this version.
 // A foreign-shape survivor is never touched by live paths — it gets retired
@@ -729,16 +745,12 @@ function registryDir() {
 // The registry FILENAME for a chat map-key. A chat map-key is untrusted — the
 // session id rides in on a WebSocket query param — so it MUST be validated
 // before it can name a file, or `session=../foo` escapes the registry dir and
-// unlinks arbitrary `.json` files (path traversal). Two shapes are legal:
-//   • a uuid (issue chat), used verbatim;
-//   • the `main` sentinel, namespaced per repo root (main-<hash>) so two clones
-//     on one machine don't both claim the single `main` key and redirect at
-//     each other — the main chats are genuinely different processes/cwds.
-// Any other shape returns null → every fs helper below no-ops for it.
+// unlinks arbitrary `.json` files (path traversal). The only legal shape is a
+// uuid: every chat — issue AND main — is keyed by its session uuid, so there is
+// no sentinel key anymore. Any other shape returns null → every fs helper below
+// no-ops for it.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const mainRegKey = () => `main-${crypto.createHash('sha1').update(MAIN_REPO).digest('hex').slice(0, 12)}`;
 function regPath(key) {
-  if (key === MAIN_ENV) return path.join(registryDir(), `${mainRegKey()}.json`);
   if (typeof key === 'string' && UUID_RE.test(key)) return path.join(registryDir(), `${key}.json`);
   return null; // unsafe / unknown key — never touch the filesystem
 }
@@ -756,7 +768,27 @@ function atomicWrite(p, data) {
 function pidAlive(pid) {
   // EPERM means the process EXISTS but isn't ours to signal — alive. Only
   // ESRCH (and bad input) mean gone.
-  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+  try { process.kill(pid, 0); } catch (e) { return e.code === 'EPERM'; }
+  // The pid exists — but a DEFUNCT (zombie) process is a dead process awaiting
+  // reaping by its parent: it holds no port and owns no chat. process.kill(0)
+  // can't see the difference (the pid lingers in the table), and `ps -o lstart`
+  // still reports its start time, so the recycled-pid guard passes too — which
+  // is exactly how a CRASHED dash server that was never reaped gets mistaken
+  // for a live owner, redirecting every chat it held to its since-rebound port
+  // forever. A zombie reads as GONE (deterministic OS signal: ps state 'Z').
+  return !pidIsZombie(pid);
+}
+
+// Is `pid` a DEFUNCT (zombie) process? Only meaningful for a pid that already
+// exists (callers gate on process.kill first). Fail-safe: a ps hiccup can't
+// disprove liveness, so an unreadable/failed probe is treated as NOT-zombie —
+// mis-reading a live owner as gone would authorize a duplicate agent.
+function pidIsZombie(pid) {
+  try {
+    const r = spawnSync('ps', ['-o', 'state=', '-p', String(pid)], { encoding: 'utf8' });
+    if (r.status !== 0) return false;
+    return (r.stdout || '').trim().toUpperCase().startsWith('Z');
+  } catch { return false; }
 }
 
 // A process's OS start time (`ps -o lstart`), the deterministic half of process
@@ -874,18 +906,19 @@ function processMatches(pid, startTime) {
 //     on its way down (a graceful stop whose claude hadn't finished dying);
 //   • the claude CHILD the record stamped (ptyPid) — the process that actually
 //     holds the session. This is what keeps a dead dash's still-running claude
-//     from being double-resumed, and it covers the main chat, whose `--continue`
-//     argv gives pgrep nothing to match on.
+//     from being double-resumed.
 // A record with a gone owner but a LIVE child is an orphan: not stale, never
 // reclaimed — the attach surfaces the child pid instead.
 //
-// A record with NO child stamped (the owner died in the sync microseconds
-// between the pre-spawn claim and the post-spawn re-stamp) splits by key kind:
-// a uuid session is safe to reclaim because every cold spawn of a uuid is
-// additionally gated on sessionProcessAlive (pgrep by argv), which sees any
-// child that survived; the main chat has no such argv identity, so a no-child
-// main record FAILS CLOSED — the one sliver where manual recovery remains,
-// traded against ever double-running --continue.
+// A record with NO child stamped (owner died in the microseconds between the
+// pre-spawn claim and the post-spawn re-stamp) is reclaimable for an ISSUE
+// session — its cold RESUME is additionally pgrep-gated (sessionProcessAlive),
+// which catches any surviving child. Main records FAIL CLOSED (not reclaimed):
+// a main chat's identity is still the raw session uuid, which `/clear` can
+// mutate, and the `new`-spawn path is not pgrep-gated — so we keep the pre-
+// existing conservative margin (a rare manual-recovery sliver) rather than risk
+// reclaiming a still-live main thread. The durable fix is a stable chat id
+// decoupled from the mutable session uuid (a follow-up redesign).
 function claimIsStale(entry) {
   const ownerGone = entry.released === true || !processMatches(entry.pid, entry.startTime);
   if (!ownerGone) return false;
@@ -1052,7 +1085,7 @@ function claimChat(key, issueId, sessionId) {
   // Stamp the claude child's identity when the PTY already exists (a post-spawn
   // re-stamp, or setDashPort's port re-stamp): ptyPid + its start time are what
   // let a LATER server verify the session's actual process is gone before it
-  // reclaims — pgrep can't do this for the main chat's `--continue` argv.
+  // reclaims — a belt-and-suspenders check alongside the pgrep-by-argv gate.
   const live = chats.get(key);
   const ptyPid = liveSession(live) && Number.isInteger(live.pty?.pid) ? live.pty.pid : null;
   const data = JSON.stringify({
@@ -1292,6 +1325,17 @@ export function autonomousChatIntro(issueId, title, flow = 'change', agent = DEF
   return `This chat is scoped to issue ${named}${st}, and you were launched autonomously to implement it end-to-end. Run \`node scripts/board.mjs get ${issueId}\` to load the full issue, then invoke the \`${skill}\` skill and carry it through to completion — ${tail}`;
 }
 
+// Intro for a NEW main chat — the main-root analog of issueChatIntro. Claude
+// gets `/main` (the trunk-mode skill: work directly on the primary checkout, no
+// worktree); codex, which has no Claude-Code skills, gets the same orientation
+// in plain language. A RESUMED main chat gets no intro — its history is on disk.
+export function mainChatIntro(agent = DEFAULT_AGENT) {
+  if (agent === 'codex') {
+    return "You're working directly in the primary checkout (main / trunk) — no worktree; commit straight to main. What should we work on?";
+  }
+  return '/main';
+}
+
 // Build the claude argv for a chat spawn — re-exported from the claude adapter
 // so the standalone arg tests keep a stable import. Live spawns build argv via
 // the chat's own agent adapter (see spawnChat). RESUME reopens an existing uuid;
@@ -1302,8 +1346,9 @@ export function buildChatArgs(opts) {
 }
 
 function spawnChat({ issueId, sessionId, mode, cwd, cols, rows, initialPrompt, key, model, effort, agent = DEFAULT_AGENT }) {
-  // PTYs are keyed by session id for issue chats, but by the MAIN_ENV sentinel
-  // for the main chat (which has no stable client-side id — it rides --continue).
+  // Every chat's PTY is keyed by its session uuid — issue and main alike (`key`
+  // defaults to sessionId). `issueId` is the env the chat belongs to ('main' or
+  // an issue id) and rides into the session object + registry record.
   const mapKey = key || sessionId;
   // In-process idempotence: the attach/deliver paths await I/O between their
   // "no live session" check and this call, so two concurrent requests can both
@@ -1449,10 +1494,10 @@ export async function attachChat(ws, opts) {
 
 async function attachChatInner(ws, { issueId, sessionId, mode, agent }) {
   const isMain = issueId === MAIN_ENV;
-  // The main chat is ONE persistent PTY keyed by the sentinel; issue chats are
-  // keyed by session id. Reattaching to a live PTY makes a browser reload (and a
-  // mid-session /clear) invisible — you stay on the same terminal.
-  const key = isMain ? MAIN_ENV : sessionId;
+  // Every chat's PTY is keyed by its session uuid — main included. Reattaching to
+  // a live PTY makes a browser reload (and a mid-session /clear) invisible: you
+  // stay on the same terminal.
+  const key = sessionId;
   let session = chats.get(key);
   const reattached = liveSession(session);
 
@@ -1467,68 +1512,57 @@ async function attachChatInner(ws, { issueId, sessionId, mode, agent }) {
       redirectToOwner(ws, owner);
       return;
     }
-    let cwd, spawnMode, spawnSessionId, initialPrompt, chatAgent = DEFAULT_AGENT;
-    if (isMain) {
-      // The main chat always runs in the live repo root, never a worktree, and
-      // is always claude. First-ever open (client mode 'main-init') mints a
-      // session and sends /main; every later cold start resumes the latest root.
-      cwd = MAIN_REPO;
-      if (mode === 'main-init') {
-        spawnMode = 'main-init';
-        spawnSessionId = crypto.randomUUID();
-        initialPrompt = '/main';
-      } else {
-        spawnMode = 'main';
-        // --continue takes no id — resolve the uuid it will pick (newest root
-        // transcript) so the session record and ready message carry a real,
-        // addressable id instead of the literal 'main'.
-        spawnSessionId = (await latestRootSessionId()) ?? MAIN_ENV;
-      }
+    const clientAgent = agent || DEFAULT_AGENT;
+    // Codex mints its OWN id, so a codex chat is spawned eagerly at create time
+    // (POST /chat) — by the time a browser attaches, its id + transcript exist.
+    // A 'new' that reaches here for codex therefore means the eager PTY already
+    // died; reopen it as a RESUME (a fresh 'new' would mint a second, unlinked
+    // id). Claude 'new' spawns with the dash-minted id as usual.
+    const asResume = mode === 'new' && !agentById(clientAgent).dashMintsId;
+    const effMode = asResume ? 'resume' : mode;
+    // Resolve where the chat runs. A NEW chat runs in the main repo (main) or the
+    // issue's worktree. A RESUME runs in the directory its transcript recorded —
+    // for a main chat that IS the repo root; for an issue chat its worktree or
+    // wherever it was recorded. Bail if there's no live directory to run in.
+    let cwd, chatAgent = DEFAULT_AGENT;
+    if (effMode === 'new') {
+      cwd = isMain ? MAIN_REPO : (hasWorktree(issueId) ? worktreeDir(issueId) : null);
+      chatAgent = clientAgent;
     } else {
-      const clientAgent = agent || DEFAULT_AGENT;
-      // Codex mints its OWN id, so a codex chat is spawned eagerly at create time
-      // (POST /chat) — by the time a browser attaches, its id + transcript exist.
-      // A 'new' that reaches here for codex therefore means the eager PTY already
-      // died; reopen it as a RESUME (a fresh 'new' would mint a second, unlinked
-      // id). Claude 'new' spawns with the dash-minted id as usual.
-      const asResume = mode === 'new' && !agentById(clientAgent).dashMintsId;
-      const effMode = asResume ? 'resume' : mode;
-      // Resolve where an issue chat must run: a RESUME runs in the directory its
-      // transcript recorded (so the CLI finds its history, even if that's a
-      // differently-named worktree or another checkout); a NEW chat runs in the
-      // issue's own worktree. Bail if there's no live directory to run in.
-      if (effMode === 'new') {
-        cwd = hasWorktree(issueId) ? worktreeDir(issueId) : null;
-        chatAgent = clientAgent;
-      } else {
-        const r = await resolveChat(sessionId);
-        cwd = r.resumable ? r.cwd : null;
-        chatAgent = r.resumable ? r.agent : clientAgent;
-        // Same belt deliverMessage wears: an agent carrying this session id in
-        // its argv is the session RUNNING, registry record or not — a manual
-        // `claude --resume` / `codex resume`, an orphan whose dash died, or a
-        // just-released chat whose process is still winding down after a
-        // graceful stop. Cold-resuming over it would fork the transcript.
-        if (cwd && await sessionProcessAlive(sessionId)) {
-          const err = 'an agent process for this session is alive outside any dash server — close it (or wait for it to exit) before reopening the chat here';
-          send(ws, { type: 'exit', code: null, error: err });
-          try { ws.close(1011, 'session process alive elsewhere') } catch {}
-          return;
-        }
-      }
-      if (!cwd) {
-        const err = effMode === 'new' ? 'no worktree for issue' : 'chat not resumable on this machine';
+      const r = await resolveChat(sessionId);
+      cwd = r.resumable ? r.cwd : null;
+      chatAgent = r.resumable ? r.agent : clientAgent;
+      // Same belt deliverMessage wears: an agent carrying this session id in
+      // its argv is the session RUNNING, registry record or not — a manual
+      // `claude --resume` / `codex resume`, an orphan whose dash died, or a
+      // just-released chat whose process is still winding down after a
+      // graceful stop. Cold-resuming over it would fork the transcript.
+      if (cwd && await sessionProcessAlive(sessionId)) {
+        const err = 'an agent process for this session is alive outside any dash server — close it (or wait for it to exit) before reopening the chat here';
         send(ws, { type: 'exit', code: null, error: err });
-        try { ws.close(1011, err); } catch {}
+        try { ws.close(1011, 'session process alive elsewhere') } catch {}
         return;
       }
-      // A fresh chat opens with an auto-sent issue-reference message — this both
-      // orients the agent and guarantees a transcript gets written (the
-      // resumability contract). Title is best-effort; a Supabase blip drops it.
-      spawnMode = effMode || 'resume';
-      spawnSessionId = sessionId;
-      const meta = effMode === 'new' ? await issueMeta(issueId) : null;
-      initialPrompt = effMode === 'new' ? issueChatIntro(issueId, meta.title, meta.status) : undefined;
+    }
+    if (!cwd) {
+      const err = effMode === 'new'
+        ? (isMain ? 'main repo unavailable' : 'no worktree for issue')
+        : 'chat not resumable on this machine';
+      send(ws, { type: 'exit', code: null, error: err });
+      try { ws.close(1011, err); } catch {}
+      return;
+    }
+    // A fresh chat opens with an auto-sent intro — this both orients the agent
+    // AND guarantees a transcript is written (the resumability contract; an empty
+    // session leaves no .jsonl and can never be reopened). Main gets the trunk-
+    // mode intro (/main); an issue chat gets its issue-reference message (title
+    // best-effort — a Supabase blip drops it). A resume sends no intro.
+    const spawnMode = effMode || 'resume';
+    const spawnSessionId = sessionId;
+    let initialPrompt;
+    if (effMode === 'new') {
+      if (isMain) initialPrompt = mainChatIntro(chatAgent);
+      else { const meta = await issueMeta(issueId); initialPrompt = issueChatIntro(issueId, meta.title, meta.status); }
     }
     session = spawnChat({ issueId, sessionId: spawnSessionId, mode: spawnMode, cwd, cols: 100, rows: 30, initialPrompt, key, agent: chatAgent });
     if (!session) {
@@ -1649,12 +1683,14 @@ export async function handleTerminalHttp(req, res, segs) {
     req.on('end', () => { try { resolve(b ? JSON.parse(b) : {}); } catch { resolve({}); } });
   });
 
-  // /api/dash/terminal/chats
+  // /api/dash/terminal/chats — the env's tracked chats (issue row or main store).
   if (req.method === 'GET' && segs[0] === 'chats') {
     const issueId = new URL(req.url, 'http://x').searchParams.get('issue');
     if (!issueId) return json({ error: 'issue required' }, 400);
     const data = await issueChats(issueId);
-    data.port = await issuePort(issueId);
+    // Main has no reserved dev-server port (its app preview rides the origin);
+    // only an issue reserves one — skip the Supabase read for main.
+    data.port = issueId === MAIN_ENV ? null : await issuePort(issueId);
     return json(data);
   }
 
@@ -1704,19 +1740,39 @@ export async function handleTerminalHttp(req, res, segs) {
 
   // /api/dash/terminal/<id>/open — ensure the dev server is up, then redirect.
   // The clickable link on the issue points here: one hop that lazy-starts vite
-  // bound to the worktree (reusing a live one) and 302s to the running app.
+  // bound to the worktree (reusing a live one) and 302s to the running app AT
+  // the issue's stored app-view path (default `/` = the canvas; `/dash/` etc.
+  // point the iframe at another route — the single source of truth for where an
+  // env's app view lands).
   if (req.method === 'GET' && segs.length === 2 && segs[1] === 'open') {
     const issueId = decodeURIComponent(segs[0]);
     if (!hasWorktree(issueId)) return json({ error: 'no worktree for issue' }, 404);
-    const port = await issuePort(issueId);
+    // ONE row read for BOTH the port and the app-view path: a Supabase blip then
+    // fails the redirect cleanly (no port → 409) instead of the split-read hazard
+    // where the port resolves but the path lookup silently drops to the canvas.
+    let row;
+    try { const { get } = await import('./issues-store.mjs'); row = await get(issueId); }
+    catch (e) { return json({ error: `issue lookup failed: ${e.message}` }, 502); }
+    const port = row && row.port != null ? Number(row.port) : null;
     if (port == null) return json({ error: 'no port reserved for issue' }, 409);
     const r = await ensureDevServer(issueId, port);
     if (!r.ok) return json(r, 500);
     await waitForPort(port);
-    // Forward the query string so the app panel's hard-refresh `?cb=` cache-bust
-    // lands on the app document URL itself, not just this (no-store) redirect.
-    const search = new URL(req.url, 'http://x').search;
-    res.writeHead(302, { Location: `http://localhost:${port}/${search}`, 'Cache-Control': 'no-store' });
+    // Build the redirect through the URL API, not string concat: the stored path
+    // may carry its own query/hash (`/dash/#/tests`, `/foo?x=1`), and the app
+    // panel's hard-refresh adds a `?cb=` bust — concatenation produced `?x=1?cb=`
+    // and buried the bust inside a `#fragment`. Merging `cb` as a real search
+    // param composes correctly, and .href percent-encodes any residual char so it
+    // can't split the Location header. The normalized path keeps a single leading
+    // slash, so the origin never moves — the same-origin check is belt-and-braces.
+    const origin = `http://localhost:${port}`;
+    const target = new URL(normalizeAppPath(row.app_path), origin);
+    const cb = new URL(req.url, 'http://x').searchParams.get('cb');
+    if (cb != null) target.searchParams.set('cb', cb);
+    res.writeHead(302, {
+      Location: target.origin === origin ? target.href : `${origin}/`,
+      'Cache-Control': 'no-store',
+    });
     res.end();
     return;
   }
@@ -1744,7 +1800,7 @@ export async function handleTerminalHttp(req, res, segs) {
     return json({ ...r, port: alloc.port ?? null });
   }
 
-  // /api/dash/terminal/chat — new chat in the issue's worktree, linked.
+  // /api/dash/terminal/chat — new chat in the env, linked.
   //   { issue }                              → mint + link a chat; PTY spawns lazily
   //                                            when the browser attaches (human-launched).
   //   { issue, autonomous:true, flow?, prompt? }
@@ -1752,30 +1808,45 @@ export async function handleTerminalHttp(req, res, segs) {
   //                                            the chats map (no sockets attached), running the
   //                                            given flow (/change or /bug) end-to-end.
   //                                            Opening the card later reattaches to it.
+  // `issue` is 'main' for a MAIN chat (repo root, tracked in the main store, no
+  // worktree/port, never an autonomous kick-off) or an issue id (its worktree).
   if (req.method === 'POST' && segs[0] === 'chat') {
     const body = await readBody();
-    const { issue, autonomous, flow, prompt, model, effort } = body;
+    const { issue, flow, prompt, model, effort } = body;
     const agent = agentById(body.agent).id; // normalize unknown → claude
     if (!issue) return json({ error: 'issue required' }, 400);
-    // Gate on issue existence BEFORE touching git, so a bad id never leaves an
-    // orphaned worktree behind a failed link.
-    if (!(await issueExists(issue))) return json({ error: `no such issue "${issue}"` }, 404);
-    const wt = await ensureWorktree(issue);
-    if (!wt.ok) return json(wt, 500);
-    // Reserve the stable dev-server port at worktree-create time (idempotent).
-    const alloc = await reservePort(issue);
+    const isMain = issue === MAIN_ENV;
+    const autonomous = body.autonomous && !isMain; // main is never an autonomous kick-off
+    // Main runs in the repo root with no worktree and no reserved port; an issue
+    // must exist as a row and gets a worktree + port (idempotent).
+    let dir, port = null;
+    if (isMain) {
+      dir = MAIN_REPO;
+    } else {
+      // Gate on issue existence BEFORE touching git, so a bad id never leaves an
+      // orphaned worktree behind a failed link.
+      if (!(await issueExists(issue))) return json({ error: `no such issue "${issue}"` }, 404);
+      const wt = await ensureWorktree(issue);
+      if (!wt.ok) return json(wt, 500);
+      const alloc = await reservePort(issue);
+      dir = wt.dir; port = alloc.port ?? null;
+    }
     const flowVal = flow === 'bug' ? 'bug' : 'change';
 
     if (!agentById(agent).dashMintsId) {
       // CODEX: it mints its own id, so we spawn eagerly (human AND autonomous),
       // discover the id from its rollout, THEN link it. The browser attaches to
-      // the returned id and REATTACHES to this already-live PTY. The intro is
-      // the autonomous brief when kicked off, else the human summarize-and-wait.
-      const meta = await issueMeta(issue);
-      const intro = autonomous
-        ? (prompt || autonomousChatIntro(issue, meta.title, flow, agent, meta.status))
-        : issueChatIntro(issue, meta.title, meta.status);
-      const r = await spawnCodexNewChat({ issueId: issue, cwd: wt.dir, cols: 100, rows: 30, initialPrompt: intro, model });
+      // the returned id and REATTACHES to this already-live PTY. Intro: main →
+      // trunk-mode; issue → autonomous brief when kicked off, else summarize-and-wait.
+      let intro;
+      if (isMain) intro = mainChatIntro(agent);
+      else {
+        const meta = await issueMeta(issue);
+        intro = autonomous
+          ? (prompt || autonomousChatIntro(issue, meta.title, flow, agent, meta.status))
+          : issueChatIntro(issue, meta.title, meta.status);
+      }
+      const r = await spawnCodexNewChat({ issueId: issue, cwd: dir, cols: 100, rows: 30, initialPrompt: intro, model });
       if (r.error) return json({ error: r.error }, 500);
       const link = await linkChat(issue, r.sessionId, agent);
       if (link?.error) {
@@ -1789,11 +1860,12 @@ export async function handleTerminalHttp(req, res, segs) {
         return json({ error: `link failed: ${link.error}` }, 500);
       }
       return json({ ok: true, sessionId: r.sessionId, agent, mode: 'new',
-        ...(autonomous ? { autonomous: true, flow: flowVal } : {}), dir: wt.dir, port: alloc.port ?? null });
+        ...(autonomous ? { autonomous: true, flow: flowVal } : {}), dir, port });
     }
 
     // CLAUDE: the dash mints the uuid up front and links it; the PTY spawns
-    // lazily when the browser attaches (human) or eagerly now (autonomous).
+    // lazily when the browser attaches (human, with mainChatIntro/issueChatIntro
+    // chosen there) or eagerly now (autonomous — issue only).
     const sessionId = crypto.randomUUID();
     const link = await linkChat(issue, sessionId, agent);
     if (link?.error) return json({ error: `link failed: ${link.error}` }, 500);
@@ -1804,28 +1876,28 @@ export async function handleTerminalHttp(req, res, segs) {
       // tells it to run the flow to completion instead of waiting for direction.
       const meta = await issueMeta(issue);
       const intro = prompt || autonomousChatIntro(issue, meta.title, flow, agent, meta.status);
-      const spawned = spawnChat({ issueId: issue, sessionId, mode: 'new', cwd: wt.dir, cols: 100, rows: 30, initialPrompt: intro, key: sessionId, model, effort, agent });
+      const spawned = spawnChat({ issueId: issue, sessionId, mode: 'new', cwd: dir, cols: 100, rows: 30, initialPrompt: intro, key: sessionId, model, effort, agent });
       // A freshly-minted uuid losing its claim means another server claimed it
       // in the same instant — vanishingly rare, but never fork: report it.
       if (!spawned) return json({ error: 'chat is live in another dash server' }, 409);
-      return json({ ok: true, sessionId, agent, mode: 'new', autonomous: true, flow: flowVal, dir: wt.dir, port: alloc.port ?? null });
+      return json({ ok: true, sessionId, agent, mode: 'new', autonomous: true, flow: flowVal, dir, port });
     }
-    return json({ ok: true, sessionId, agent, mode: 'new', dir: wt.dir, port: alloc.port ?? null });
+    return json({ ok: true, sessionId, agent, mode: 'new', dir, port });
   }
 
-  // DELETE /api/dash/terminal/chat { issue, session } — unlink a chat from the
-  // issue's conversations[]. The transcript on disk is untouched; this only drops
-  // the association. A live PTY (if any) is left running and will be reaped on
-  // exit — unlinking is a bookkeeping action, not a kill.
+  // DELETE /api/dash/terminal/chat { issue, session } — unlink a chat from its
+  // env (an issue's conversations[], or the main store). The transcript on disk
+  // is untouched; this only drops the association. A live PTY (if any) is left
+  // running and will be reaped on exit — unlinking is bookkeeping, not a kill.
   if (req.method === 'DELETE' && segs[0] === 'chat') {
     const { issue, session } = await readBody();
     if (!issue || !session) return json({ error: 'issue and session required' }, 400);
-    const { get, removeFromArray } = await import('./issues-store.mjs');
-    // conversations[] entries are agent-prefixed handles; the client sends the
-    // bare session id, so resolve the exact stored entry (bare uuid for claude,
-    // `codex:<uuid>` for codex) to remove.
-    const row = await get(issue).catch(() => null);
-    const handle = (row?.conversations || []).find(h => parseHandle(h).sessionId === session) || session;
+    // Handles are agent-prefixed; the client sends the bare session id, so resolve
+    // the exact stored handle (bare uuid = claude, `codex:<uuid>` = codex) to drop.
+    const handles = await chatHandlesFor(issue);
+    const handle = handles.find(h => parseHandle(h).sessionId === session) || session;
+    if (issue === MAIN_ENV) { unlinkMainChat(handle); return json({ ok: true }); }
+    const { removeFromArray } = await import('./issues-store.mjs');
     const r = await removeFromArray(issue, 'conversations', [handle]);
     if (r?.error) return json({ error: `unlink failed: ${r.error}` }, 500);
     return json({ ok: true });

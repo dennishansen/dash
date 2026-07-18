@@ -65,6 +65,7 @@ must be set (see `.env.example`).
 
 ```bash
 node scripts/board.mjs list [--status next] [--tag <tag>]
+node scripts/board.mjs search <query>                            # find issues by id/title/tag (same matcher as ⌘K)
 node scripts/board.mjs get <id>                                  # full row incl. body
 node scripts/board.mjs new <id> --title "..." [--tags a,b] [--sessions h1] \
      [--created YYYY-MM-DD] [--status next] [--body-file path]

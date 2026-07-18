@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
+import { useHotkey } from '../hotkeys.js';
 
 // A gif/image that opens at full scale in a lightbox on click. Drop-in
 // replacement for any <img> we want zoomable — the inline thumbnail keeps
@@ -10,20 +11,10 @@ import { createPortal } from 'react-dom';
 export function ZoomImg({ src, alt, className, ...rest }) {
   const [open, setOpen] = useState(false);
 
-  useEffect(() => {
-    if (!open) return;
-    // Capture-phase + stopImmediatePropagation so the open lightbox owns Escape:
-    // the detail views also listen on window for Escape (to navigate back to the
-    // list), and we must close the overlay without also triggering that nav.
-    const onKey = (e) => {
-      if (e.key !== 'Escape') return;
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      setOpen(false);
-    };
-    window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
-  }, [open]);
+  // The open lightbox owns Escape: capture phase wins over the detail view's
+  // Escape-to-board, and it closes from wherever focus sits — over the terminal
+  // (terminal:'handle') or an input (allowInInput) — not just the backdrop.
+  useHotkey('Escape', () => setOpen(false), { enabled: open, terminal: 'handle', allowInInput: true });
 
   return (
     <>

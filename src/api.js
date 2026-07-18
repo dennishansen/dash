@@ -126,6 +126,38 @@ export function useAsync(key, fn, { pollMs = 15000 } = {}) {
   return { data, err, loading, refresh };
 }
 
+// Alias: some components (e.g. the ⌘K palette) name this hook useIssues — the
+// same key+fetcher cache as useAsync. Kept as an alias so those files import
+// cleanly without a curated rename.
+export const useIssues = useAsync;
+
+// Live context-window usage for one agent chat, polled from the local Dash
+// backend (/api/dash/chat-status). Powers the context ring + LOC badge next to
+// a chat. Returns null when there's no local backend (e.g. the static deploy,
+// where the fetch comes back non-JSON) or before the first sample.
+export function useChatStatus(sessionId, { pollMs = 4000 } = {}) {
+  const [data, setData] = useState(null);
+  useEffect(() => {
+    if (!sessionId) { setData(null); return undefined; }
+    let live = true;
+    const load = async () => {
+      try {
+        const r = await fetch(`/api/dash/chat-status?session=${encodeURIComponent(sessionId)}&_=${Date.now()}`);
+        const ct = r.headers.get('content-type') || '';
+        if (!ct.includes('json')) return; // no local Dash backend (static deploy)
+        const j = await r.json();
+        if (live) setData(j && typeof j.used === 'number' ? j : null);
+      } catch { /* transient — keep the last value */ }
+    };
+    load();
+    const interval = setInterval(() => {
+      if (document.visibilityState === 'visible') load();
+    }, pollMs);
+    return () => { live = false; clearInterval(interval); };
+  }, [sessionId, pollMs]);
+  return data;
+}
+
 // Subscribe to live issues changes and run `onEvent` once per burst. The board
 // uses this for instant cross-worktree / cross-machine refresh — Supabase
 // Realtime pushes a postgres change whenever the issues table mutates, far

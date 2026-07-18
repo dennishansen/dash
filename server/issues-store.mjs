@@ -92,6 +92,14 @@ export async function listAll() {
   return (await rest(REST, 'GET', `?select=${LIST_COLS}&order=updated_at.desc`)) || [];
 }
 
+// id + body for every issue — just enough for the ⌘K palette to search
+// description text. Kept separate from listAll (whose LIST_COLS omits body to
+// keep the board's Realtime-refetched cache lean); the palette fetches this
+// lazily, only once it's actually opened.
+export async function listBodies() {
+  return (await rest(REST, 'GET', `?select=id,body&order=updated_at.desc`)) || [];
+}
+
 // One issue with its full body. Returns null if it doesn't exist.
 export async function get(id) {
   const rows = await rest(REST, 'GET', `?id=eq.${enc(id)}&select=*&limit=1`);

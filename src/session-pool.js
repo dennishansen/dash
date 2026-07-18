@@ -5,7 +5,7 @@
 // per-session rule (the visible terminal keeps losing its attachment) and whose
 // two detectors clobber each other's activity reports (the flashing dot).
 //
-// This registry makes the SESSION the unit of mounting: every IssueTerminal that
+// This registry makes the SESSION the unit of mounting: every ChatEnvironment that
 // wants to show a session registers interest, and exactly one — the OWNER —
 // actually mounts the ChatPane (socket + detector). Ownership rules:
 //   1. the ACTIVE (visible) pane always wins — opening a card takes the session
@@ -26,7 +26,7 @@
 import { useEffect, useSyncExternalStore } from 'react';
 
 // sessionId → Map(paneId → { active, seq }). paneId is the issue id — the pool
-// mounts at most one IssueTerminal per issue, so it's unique per registrant.
+// mounts at most one ChatEnvironment per env, so it's unique per registrant.
 const regs = new Map();
 const listeners = new Set();
 let seq = 0;

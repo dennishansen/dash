@@ -12,6 +12,7 @@ import { SignIn } from './views/SignIn.jsx';
 import { SelectionProvider } from './selection.jsx';
 import { ChatControlContext } from './chat-control.jsx';
 import { WorkspacePanel } from './WorkspacePanel.jsx';
+import { CommandPalette } from './CommandPalette.jsx';
 import {
   DockPanel, startDockResize, loadW,
   CHAT_DEFAULT_W, APP_DEFAULT_W, DOCK_MIN_W, MAIN_MIN_W, LEFT_W,
@@ -584,6 +585,9 @@ function Shell() {
           onResizeStart={onAppResizeStart}
         />
       )}
+      {/* ⌘K command palette — a route-agnostic modal (portals to body), so it
+          works over the board, a detail view, or the chat terminal alike. */}
+      <CommandPalette />
     </div>
     </ChatControlContext.Provider>
   );

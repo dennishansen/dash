@@ -23,6 +23,24 @@ import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import { spawnSync } from 'child_process';
+import { repositoryLoc } from './code-browser.mjs';
+
+// --- chat-status: live context-window fill + LOC for one chat ---
+// Both agents publish the SAME shape — { used, added, removed, compactAt?,
+// compactExact? } — so the Dash ring/LOC badge read one contract regardless of
+// which CLI is behind a chat. `used` is % of the context window filled;
+// `compactAt` is the % at which that CLI auto-compacts (the ring's red line),
+// carried in the payload so the client needn't hardcode a per-agent threshold;
+// `compactExact` marks it as a read-back trigger rather than an estimate. claude
+// forwards whatever its statusline published (the ring falls back to ~83.5% if a
+// field is absent); codex derives its own from the rollout (see each adapter).
+//
+// Codex auto-compacts at model_auto_compact_token_limit = context_window*9/10
+// (codex-rs protocol.rs). Fed through codex's own display formula, that token
+// point lands at exactly 90% used for every real window size — so the codex ring
+// goes red at 90. Left as ~ (not exact) since a per-session config override isn't
+// read back.
+const CODEX_COMPACT_AT = 90;
 
 // --- binary resolution (cached; sh -c, never a login shell — see terminal.js) ---
 
@@ -72,17 +90,11 @@ const claude = {
     return resolveBin('claude', '/Applications/cmux.app/Contents/Resources/bin/claude');
   },
 
-  // Build claude's argv. The MAIN chat (main / main-init) is claude-only and
-  // stays here. Issue chats: NEW mints a --session-id; RESUME reopens --resume;
-  // both carry an initial prompt as a positional arg when given (stays
-  // interactive AND submits that first turn).
+  // Build claude's argv. NEW mints a --session-id; RESUME reopens --resume; both
+  // carry an initial prompt as a positional arg when given (stays interactive AND
+  // submits that first turn). Main chats build the same way — a new main chat is
+  // a NEW spawn carrying the `/main` intro; resuming one is a plain --resume.
   buildArgs({ mode, sessionId, initialPrompt, model, effort }) {
-    if (mode === 'main') return ['--continue', '--dangerously-skip-permissions'];
-    if (mode === 'main-init') {
-      const args = ['--session-id', sessionId, '--dangerously-skip-permissions'];
-      if (initialPrompt) args.push(initialPrompt);
-      return args;
-    }
     const args = mode === 'resume'
       ? ['--resume', sessionId, '--dangerously-skip-permissions']
       : ['--session-id', sessionId, '--dangerously-skip-permissions'];
@@ -137,6 +149,23 @@ const claude = {
       return { role: o.type, text };
     });
   },
+
+  // Live context + LOC, published by the Claude Code statusline to
+  // /tmp/claude-ctx-<uuid>.json every render ({ used, added, removed } plus the
+  // live compaction threshold — used% and lines this chat changed, reset on
+  // /clear). We forward the statusline's compactAt/compactExact verbatim (the ring
+  // falls back to ~83.5% if they're absent), so the statusline stays the single
+  // source of truth for claude's real trigger. Missing/partial file → null (the
+  // statusline hasn't run yet, or /tmp was cleared, or this uuid isn't claude's).
+  chatStatus(sessionId) {
+    let j;
+    try { j = JSON.parse(fs.readFileSync(`/tmp/claude-ctx-${sessionId}.json`, 'utf8')); }
+    catch { return null; }
+    if (!j || typeof j.used !== 'number') return null;
+    const s = { used: j.used, added: j.added | 0, removed: j.removed | 0 };
+    if (typeof j.compactAt === 'number') { s.compactAt = j.compactAt; s.compactExact = !!j.compactExact; }
+    return s;
+  },
 };
 
 // ==================== codex ====================
@@ -169,6 +198,96 @@ async function walkRollouts(onFile) {
     return null;
   };
   return descend(base);
+}
+
+// --- codex context-window math (verbatim from codex-rs protocol.rs) ---
+// Codex writes a `token_count` event per turn into its rollout, carrying
+// last_token_usage.total_tokens + model_context_window. Its TUI shows "% context
+// left" = percent_of_context_window_remaining(last_token_usage, window), which
+// subtracts a fixed BASELINE (system prompt + tool defs, always present) from both
+// numerator and denominator so a fresh chat reads 100% left. The ring wants % USED,
+// so chatStatus returns 100 − this.
+const CODEX_BASELINE_TOKENS = 12000;
+const _rolloutPathCache = new Map(); // uuid → rollout path (immutable once written)
+const _statusCache = new Map(); // rollout path → { mtimeMs, size, status }
+function codexPercentRemaining(totalTokens, window) {
+  if (!(window > CODEX_BASELINE_TOKENS)) return 0;
+  const effective = window - CODEX_BASELINE_TOKENS;
+  const used = Math.max(0, totalTokens - CODEX_BASELINE_TOKENS);
+  const remaining = Math.max(0, effective - used);
+  return Math.round(Math.min(100, Math.max(0, (remaining / effective) * 100)));
+}
+
+// Read the last `maxBytes` of a file (whole file if smaller). `atBOF` marks that
+// the read reached byte 0, so a caller widening the window knows when to stop.
+async function readTail(fpath, maxBytes) {
+  const fd = await fs.promises.open(fpath, 'r');
+  try {
+    const { size } = await fd.stat();
+    const start = Math.max(0, size - maxBytes);
+    const buf = Buffer.alloc(size - start);
+    if (buf.length) await fd.read(buf, 0, buf.length, start);
+    return { text: buf.toString('utf8'), atBOF: start === 0 };
+  } finally { await fd.close(); }
+}
+
+// The most-recent COMPLETE token_count event in a chunk of rollout text. Jump
+// straight to the last occurrence of the marker (no full split of a multi-MB
+// chunk) and walk back over any that don't parse. A tail read can slice the first
+// line mid-object — that fragment fails JSON.parse, and if it sits at the chunk
+// start we return null so the caller widens the window. Returns { tokens, window }.
+function lastTokenCountIn(text) {
+  const MARK = '"type":"token_count"';
+  let at = text.length;
+  for (;;) {
+    const hit = text.lastIndexOf(MARK, at - 1);
+    if (hit < 0) return null;
+    at = hit;
+    const start = text.lastIndexOf('\n', hit) + 1; // 0 → the (possibly partial) first line
+    const end = text.indexOf('\n', hit);
+    // A line counts only if terminated by '\n' — same "complete lines only"
+    // discipline as parseLines. An unterminated final fragment (end < 0, codex
+    // mid-write) is skipped; the next poll sees it whole. A tail-sliced partial
+    // first line fails JSON.parse below, and start === 0 then ends the scan.
+    if (end >= 0) {
+      try {
+        const info = JSON.parse(text.slice(start, end))?.payload?.info;
+        const last = info?.last_token_usage;
+        if (last && typeof last.total_tokens === 'number' && typeof info.model_context_window === 'number') {
+          return { tokens: last.total_tokens, window: info.model_context_window };
+        }
+      } catch { /* fragment or a non-event line that merely contains the marker */ }
+    }
+    if (start === 0) return null; // reached the chunk start without a clean parse
+  }
+}
+
+// The last token_count in a rollout. Escalate the tail window until one turns up
+// or we've read the whole file. token_count events fire every turn and are tiny,
+// so the first (small) read almost always hits; escalation is a deterministic
+// fallback, never a guess at "enough tail".
+async function readLastTokenCount(fpath) {
+  for (const cap of [512 * 1024, 8 * 1024 * 1024, Infinity]) {
+    const { text, atBOF } = await readTail(fpath, cap);
+    const tok = lastTokenCountIn(text);
+    if (tok || atBOF) return tok;
+  }
+  return null;
+}
+
+// The cwd a codex chat runs in, from session_meta on line 1 — a head read, not the
+// whole (possibly huge) rollout. This is the worktree its LOC diff is taken in.
+async function codexHeadCwd(fpath) {
+  const fd = await fs.promises.open(fpath, 'r');
+  try {
+    const buf = Buffer.alloc(64 * 1024);
+    const { bytesRead } = await fd.read(buf, 0, buf.length, 0);
+    const text = buf.toString('utf8', 0, bytesRead);
+    const nl = text.indexOf('\n');
+    const o = JSON.parse(nl >= 0 ? text.slice(0, nl) : text);
+    return o?.payload?.cwd || o?.cwd || null;
+  } catch { return null; }
+  finally { await fd.close(); }
 }
 
 const codex = {
@@ -272,6 +391,45 @@ const codex = {
     }
     return null;
   },
+
+  // Live context + LOC for a codex chat, read straight from codex's rollout —
+  // codex has no claude-style statusline. `used` inverts codex's own
+  // context-remaining formula on the latest token_count; LOC is the worktree's git
+  // diff, because codex (unlike claude) keeps no self-reported line count. null
+  // until the first turn writes a token_count, or if no rollout matches this id.
+  //
+  // A rollout only grows when the chat takes a turn, and both the token count and
+  // the file edits land within that turn — so the whole result is cached against
+  // the file's mtime+size and only recomputed when the rollout advances. A poll
+  // between turns is one stat(); the token scan and the git diff run once per turn.
+  async chatStatus(sessionId) {
+    // The rollout path for a uuid is immutable once written, so cache it — the
+    // date-tree walk would otherwise repeat on every poll. A cached path that has
+    // since vanished falls back to a fresh walk.
+    let rollout = _rolloutPathCache.get(sessionId);
+    if (!rollout || !fs.existsSync(rollout)) {
+      rollout = await codex.findTranscript(sessionId);
+      if (!rollout) return null;
+      _rolloutPathCache.set(sessionId, rollout);
+    }
+    let st;
+    try { st = await fs.promises.stat(rollout); } catch { return null; }
+    const cached = _statusCache.get(rollout);
+    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) return cached.status;
+
+    const tok = await readLastTokenCount(rollout);
+    if (!tok) return null;
+    const used = 100 - codexPercentRemaining(tok.tokens, tok.window);
+    let added = 0;
+    let removed = 0;
+    const cwd = await codexHeadCwd(rollout);
+    if (cwd) {
+      try { ({ added, removed } = await repositoryLoc(cwd)); } catch { /* cwd not a git worktree */ }
+    }
+    const status = { used, added, removed, compactAt: CODEX_COMPACT_AT };
+    _statusCache.set(rollout, { mtimeMs: st.mtimeMs, size: st.size, status });
+    return status;
+  },
 };
 
 // ==================== registry + handle codec ====================
@@ -316,6 +474,19 @@ export async function findTranscriptAny(sessionId) {
   for (const a of Object.values(AGENTS)) {
     const p = await a.findTranscript(sessionId);
     if (p) return { agent: a.id, transcriptPath: p };
+  }
+  return null;
+}
+
+// Live context + LOC for a chat, dispatched by BARE uuid exactly like
+// findTranscriptAny — a uuid lives in exactly ONE agent's on-disk store, so trying
+// each adapter in turn is deterministic, not a guess. claude's cheap /tmp read
+// short-circuits before codex's rollout walk in the common (claude) case. Returns
+// { used, added, removed, compactAt } or null.
+export async function chatStatusAny(sessionId) {
+  for (const a of Object.values(AGENTS)) {
+    const s = await a.chatStatus(sessionId);
+    if (s) return s;
   }
   return null;
 }

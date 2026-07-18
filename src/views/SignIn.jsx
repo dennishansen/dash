@@ -49,6 +49,10 @@ export function SignIn() {
             <button type="submit" disabled={busy || !email.trim()}>
               {busy ? 'Sending…' : 'Email me a code'}
             </button>
+            <button type="button" className="signin-link" disabled={busy || !email.trim()}
+              onClick={() => { setStep('code'); setErr(null); }}>
+              I already have a code
+            </button>
           </form>
         ) : (
           <form onSubmit={submitCode}>

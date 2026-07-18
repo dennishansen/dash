@@ -170,7 +170,29 @@ function unsupported(buffers, maxBytes) {
   return null;
 }
 
+// A full snapshot runs 4 whole-repo git calls (ls-files ×2, diff, rev-parse), so
+// recomputing it on EVERY file open — plus the client's 3s poll — was the reason
+// opening a file felt slow: each click re-scanned the entire tree just to look up
+// one entry's status + baseSha. Coalesce with a short TTL keyed by root+baseRef:
+// the poll refreshes it every few seconds and file opens reuse that snapshot,
+// paying only for the one file's own git-show. The cached value is the PROMISE,
+// so a poll and an open firing together share a single computation.
+const SNAPSHOT_TTL_MS = 2000;
+const snapshotCache = new Map(); // `${root}\0${baseRef}` → { at, promise }
+
 export async function repositorySnapshot(root, { baseRef = null } = {}) {
+  const key = `${root}\0${baseRef ?? ''}`;
+  const hit = snapshotCache.get(key);
+  const now = Date.now();
+  if (hit && now - hit.at < SNAPSHOT_TTL_MS) return hit.promise;
+  const promise = computeSnapshot(root, baseRef);
+  snapshotCache.set(key, { at: now, promise });
+  // Don't cache a rejection — drop it so the next call retries.
+  promise.catch(() => { if (snapshotCache.get(key)?.promise === promise) snapshotCache.delete(key); });
+  return promise;
+}
+
+async function computeSnapshot(root, baseRef) {
   const base = await repositoryBase(root, baseRef);
   const [branch, head, trackedRaw, untrackedRaw, changedRaw] = await Promise.all([
     git(root, ['branch', '--show-current']),
@@ -204,16 +226,73 @@ export async function repositorySnapshot(root, { baseRef = null } = {}) {
   };
 }
 
-export async function repositoryFile(root, file, { baseRef = null, maxBytes = DEFAULT_MAX_BYTES } = {}) {
+// A new file the chat created is an untracked add that `git diff` omits, so we
+// count its lines the way git would — every '\n', plus one for a final line with
+// no trailing newline. Binary (a NUL byte) or unreadable files score zero, the
+// same guard `unsupported` uses.
+async function countAddedLines(full) {
+  let buf;
+  try { buf = await fs.promises.readFile(full); } catch { return 0; }
+  if (buf.length === 0 || buf.includes(0)) return 0;
+  let n = 0;
+  for (let i = 0; i < buf.length; i++) if (buf[i] === 10) n++;
+  if (buf[buf.length - 1] !== 10) n++;
+  return n;
+}
+
+// Total +/- lines the worktree carries vs its base — the SAME merge-base-main the
+// snapshot diffs against, so the code-pane LOC badge agrees with the file list it
+// sits above. `git diff --numstat` covers tracked changes (committed + working
+// tree); untracked adds are counted separately since git leaves them out. Binary
+// blobs (numstat '-') are skipped. This is the deterministic per-worktree LOC the
+// codex chat-status reads — codex, unlike claude, keeps no self-reported count.
+export async function repositoryLoc(root) {
+  const base = await repositoryBase(root);
+  const [numstat, untrackedRaw] = await Promise.all([
+    git(root, ['diff', '--numstat', '-M', base.sha, '--']),
+    git(root, ['ls-files', '--others', '--exclude-standard', '-z']),
+  ]);
+  let added = 0;
+  let removed = 0;
+  for (const line of numstat.split('\n')) {
+    if (!line) continue;
+    const [a, r] = line.split('\t');
+    if (a === '-' || r === '-') continue; // binary: numstat marks it '-'
+    added += Number(a) || 0;
+    removed += Number(r) || 0;
+  }
+  for (const rel of untrackedRaw.split('\0')) {
+    if (rel) added += await countAddedLines(path.join(root, rel));
+  }
+  return { added, removed };
+}
+
+export async function repositoryFile(root, file, { baseRef = null, maxBytes = DEFAULT_MAX_BYTES, hint = null } = {}) {
   const safe = safeRelative(root, file);
-  const snapshot = await repositorySnapshot(root, { baseRef });
-  const entry = snapshot.files.find((candidate) => candidate.path === safe.relative);
-  if (!entry) throw new CodeBrowserError('file not found', 404);
+  let entry;
+  let baseSha;
+  let baseLabel;
+  // Fast path: the client already knows each file's status + the base sha from
+  // the tree snapshot it polls, so trust those and read just this one file — the
+  // whole-repo snapshot (4 git calls over the entire tree) is what made opening a
+  // file slow. `safeRelative` still confines the path, and a bad sha/status only
+  // yields a stale diff that the next poll corrects. No hint ⇒ snapshot fallback.
+  if (hint && hint.baseSha) {
+    entry = { path: safe.relative, status: hint.status || null, oldPath: hint.oldPath || null };
+    baseSha = hint.baseSha;
+    baseLabel = hint.base || hint.baseSha;
+  } else {
+    const snapshot = await repositorySnapshot(root, { baseRef });
+    entry = snapshot.files.find((candidate) => candidate.path === safe.relative);
+    if (!entry) throw new CodeBrowserError('file not found', 404);
+    baseSha = snapshot.baseSha;
+    baseLabel = snapshot.base;
+  }
 
   const current = await currentBuffer(root, entry.path, entry.status);
   const originalPath = entry.oldPath || entry.path;
   const original = entry.status
-    ? await originalBuffer(root, snapshot.baseSha, originalPath, entry.status)
+    ? await originalBuffer(root, baseSha, originalPath, entry.status)
     : Buffer.alloc(0);
   const reason = unsupported(entry.status ? [original, current] : [current], maxBytes);
   const common = {
@@ -221,7 +300,7 @@ export async function repositoryFile(root, file, { baseRef = null, maxBytes = DE
     oldPath: entry.oldPath || null,
     status: entry.status,
     language: languageFor(entry.path),
-    base: snapshot.base,
+    base: baseLabel,
   };
   if (reason) return { ...common, kind: 'unsupported', reason };
   if (entry.status) {
@@ -245,6 +324,6 @@ export async function environmentSnapshot(env) {
   return { env, ...(await repositorySnapshot(environmentRoot(env), { baseRef: env === MAIN_ENV ? 'HEAD' : null })) };
 }
 
-export async function environmentFile(env, file) {
-  return repositoryFile(environmentRoot(env), file, { baseRef: env === MAIN_ENV ? 'HEAD' : null });
+export async function environmentFile(env, file, hint = null) {
+  return repositoryFile(environmentRoot(env), file, { baseRef: env === MAIN_ENV ? 'HEAD' : null, hint });
 }

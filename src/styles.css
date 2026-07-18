@@ -3642,3 +3642,98 @@ img.zoomable {
 }
 .agent-menu-item:hover { color: var(--text); background: var(--bg-1); }
 .agent-menu-label { flex: 1; text-align: left; white-space: nowrap; }
+
+/* ⌘K command palette — a centered modal search over any route. Same backdrop
+   tier as the lightbox (z 1000); the panel floats near the top third the way
+   command palettes do, so the result list grows downward into open space. */
+.cmdk-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 14vh 16px 16px;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(2px);
+}
+.cmdk-panel {
+  display: flex;
+  flex-direction: column;
+  width: min(640px, 100%);
+  max-height: 60vh;
+  background: var(--bg-1);
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  box-shadow: 0 16px 60px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+.cmdk-input-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-mute);
+  flex: 0 0 auto;
+}
+.cmdk-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--text);
+  font-size: 15px;
+}
+.cmdk-input:focus { outline: none; }
+.cmdk-input::placeholder { color: var(--text-mute); }
+.cmdk-results {
+  overflow-y: auto;
+  padding: 6px;
+}
+.cmdk-empty {
+  padding: 22px 12px;
+  text-align: center;
+  color: var(--text-mute);
+  font-size: 13px;
+}
+.cmdk-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+/* Highlight follows the keyboard cursor (↑/↓) AND the mouse (onMouseMove), so at
+   most one row is lit and it's always the Enter target. */
+.cmdk-item.is-active {
+  background: var(--sel-bg);
+}
+/* Title over an optional description snippet — a stacked column so the status
+   pill (right) flanks both lines. */
+.cmdk-item-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cmdk-item-title,
+.cmdk-item-sub {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.cmdk-item-title { color: var(--text); }
+.cmdk-item-sub { font-size: 12px; color: var(--text-dim); }
+.cmdk-item .pill { flex: 0 0 auto; }
+/* Matched text — bold + brightened so the hit reads in the title AND the dimmer
+   snippet; kill <mark>'s default yellow highlight. */
+.cmdk-hit {
+  background: none;
+  color: var(--text);
+  font-weight: 700;
+}

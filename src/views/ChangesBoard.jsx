@@ -6,6 +6,7 @@ import { listChanges, createChange, moveChange, reorderChange } from '../board-s
 import { insertionIndex } from './dragOrder.js';
 import { useSelection } from '../selection.jsx';
 import { columnCompare, archiveCompare, ARCHIVE_COLS } from '../board-sort.js';
+import { searchIssues } from '../issue-search.js';
 
 function SearchIcon() {
   return (
@@ -87,10 +88,8 @@ export function ChangesBoard({ visible = true }) {
   const filtered = useMemo(() => {
     let rows = data ?? [];
     if (activeTags.size) rows = rows.filter(i => (i.tags ?? []).some(t => activeTags.has(t)));
-    if (search) {
-      const q = search.toLowerCase();
-      rows = rows.filter(i => (i.id + ' ' + (i.title || '') + ' ' + (i.tags || []).join(' ')).toLowerCase().includes(q));
-    }
+    // Same matcher the ⌘K palette uses — one search, not two (issue-search.js).
+    rows = searchIssues(rows, search);
     return rows;
   }, [data, activeTags, search]);
 

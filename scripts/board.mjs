@@ -82,6 +82,17 @@ async function main() {
       console.log(`\n${rows.length} issue(s)`);
       break;
     }
+    case 'search': {
+      // The same matcher the board box + ⌘K palette use (issue-search.js), so a
+      // CLI query behaves identically to the UI: id + title + tags substring.
+      const q = rest.join(' ');
+      const { searchIssues } = await import('../src/issue-search.js');
+      const hits = searchIssues(await listAll(), q);
+      hits.sort((a, b) => a.status.localeCompare(b.status) || a.id.localeCompare(b.id));
+      for (const r of hits) console.log(`${r.status.padEnd(8)}  ${r.id}  —  ${r.title}`);
+      console.log(`\n${hits.length} match(es)${q ? ` for "${q}"` : ''}`);
+      break;
+    }
     case 'get': {
       const id = rest[0];
       if (!id) fail('usage: board.mjs get <id>');
@@ -233,7 +244,7 @@ async function main() {
     }
     default:
       fail(`unknown command "${cmd || ''}". Run with no args for usage:\n` +
-        'list | get | new | body | title | status | start | done | reject | free-port | owner | tag | session | convo | branch | commit | untag | unsession | unconvo | unbranch | uncommit | find-branch | rm');
+        'list | search | get | new | body | title | status | start | done | reject | free-port | owner | tag | session | convo | branch | commit | untag | unsession | unconvo | unbranch | uncommit | find-branch | rm');
   }
 }
 

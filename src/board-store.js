@@ -13,7 +13,7 @@
 // is likewise local-only (see capabilities.js).
 
 import {
-  listAll, get, create, update, setRanks, moveColumn, setStatus, remove, VALID_STATUS,
+  listAll, listBodies as listBodiesStore, get, create, update, setRanks, moveColumn, setStatus, remove, VALID_STATUS,
 } from '../server/issues-store.mjs';
 import { shapeRow } from '../server/issues-shape.mjs';
 
@@ -28,6 +28,12 @@ function byCreatedDesc(a, b) {
 export async function listChanges() {
   const rows = await listAll();
   return rows.map(r => shapeRow(r)).sort(byCreatedDesc);
+}
+
+// id → body for every issue, for the ⌘K palette's description search. Read-only
+// (no shaping, no mutation) — the palette builds an id→body map from it.
+export async function listBodies() {
+  return await listBodiesStore();
 }
 
 // One issue with its body. Null if it doesn't exist.

@@ -16,7 +16,12 @@ export function shapeRow(row) {
     sessions: Array.isArray(row.sessions) ? row.sessions : [],
     commits: Array.isArray(row.commits) ? row.commits : [],
     conversations: Array.isArray(row.conversations) ? row.conversations : [],
+    requires: Array.isArray(row.requires) ? row.requires : [],
+    unlocks: Array.isArray(row.unlocks) ? row.unlocks : [],
     port: row.port != null ? Number(row.port) : null,
+    // The App-pane target path (null = '/', the canvas). Stored beside `port`;
+    // the /open redirect lands the iframe on localhost:<port><app_path>.
+    app_path: row.app_path ?? null,
     created: row.created || null,
     updated: row.updated_at || null,
     closed: row.closed_at || null,   // when it entered done/rejected (sorts the archive cols)

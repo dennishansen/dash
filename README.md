@@ -38,6 +38,11 @@ running dev server in an iframe. *Code* walks the repository and opens changed
 files in a Monaco editor for review. Both stay mounted, so switching between them
 never resets your preview or your place in a file. Toggle with `Cmd+/`.
 
+**Jump to any card with `Cmd+K`.** A command palette that searches by id, title,
+tag, or description text and drops you on the match — from anywhere, even with a
+terminal focused. Agents get the same search headlessly: `board.mjs search <q>`
+or `GET /api/dash/search?q=…`.
+
 **Light, dark, or whatever your OS is doing.** One theme menu.
 
 ## Quickstart

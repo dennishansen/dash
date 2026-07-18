@@ -16,8 +16,21 @@ const STATUS = {
 // keeps its heading plus a few rows — the drag clamps both ends to this floor.
 const CHANGES_KEY = 'dash-code-changes-height';
 const NAV_SECTION_MIN = 96;
+// The file-browser pane is a fixed, drag-resizable width (persisted px). Unset
+// falls back to the CSS default column. Clamps to a readable floor on both ends.
+const NAV_WIDTH_KEY = 'dash-code-nav-width';
+const NAV_WIDTH_MIN = 170;
+const CONTENT_MIN = 280;
 
-function useRepositoryFile(env, file, active) {
+function useRepositoryFile(env, file, active, meta) {
+  // The tree poll already handed us this file's status + the base sha; pass them
+  // so the server reads just this file instead of re-snapshotting the whole repo
+  // (the reason opens felt slow). Primitives, not the object, so the effect only
+  // re-fires when they actually change.
+  const status = meta?.status || '';
+  const oldPath = meta?.oldPath || '';
+  const baseSha = meta?.baseSha || '';
+  const baseLabel = meta?.base || '';
   const [state, setState] = React.useState({ data: null, error: null, loading: false });
   React.useEffect(() => {
     if (!env || !file) {
@@ -29,7 +42,14 @@ function useRepositoryFile(env, file, active) {
     let timer;
     const load = async () => {
       try {
-        const response = await fetch(`/api/dash/code/${encodeURIComponent(env)}/file?path=${encodeURIComponent(file)}`);
+        const params = new URLSearchParams({ path: file });
+        if (baseSha) {
+          params.set('baseSha', baseSha);
+          if (status) params.set('status', status);
+          if (oldPath) params.set('oldPath', oldPath);
+          if (baseLabel) params.set('base', baseLabel);
+        }
+        const response = await fetch(`/api/dash/code/${encodeURIComponent(env)}/file?${params.toString()}`);
         const data = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
         if (mounted) {
@@ -54,7 +74,7 @@ function useRepositoryFile(env, file, active) {
     load();
     timer = setInterval(load, 3000);
     return () => { mounted = false; clearInterval(timer); };
-  }, [env, file, active]);
+  }, [env, file, active, status, oldPath, baseSha, baseLabel]);
   return state;
 }
 
@@ -149,10 +169,38 @@ export function CodeBrowser({ env, active = true }) {
   const [selected, setSelected] = React.useState(null);
   const [query, setQuery] = React.useState('');
   const [changesH, setChangesH] = React.useState(() => loadW(CHANGES_KEY, null));
+  const [navW, setNavW] = React.useState(() => loadW(NAV_WIDTH_KEY, null));
   const [resizing, setResizing] = React.useState(false);
+  const [navResizing, setNavResizing] = React.useState(false);
+  const browserRef = React.useRef(null);
   const navRef = React.useRef(null);
   const changesRef = React.useRef(null);
   React.useEffect(() => { setSelected(null); setQuery(''); }, [env]);
+  // Horizontal drag on the nav/content divider. Tracks the nav width live and
+  // persists on release; clamps so neither the pane nor the editor gets too thin.
+  const startWidthResize = (e) => {
+    e.preventDefault();
+    const browser = browserRef.current;
+    if (!browser) return;
+    const rect = browser.getBoundingClientRect();
+    const max = rect.width - CONTENT_MIN;
+    setNavResizing(true);
+    let w = navRef.current.getBoundingClientRect().width;
+    let moved = false;
+    const move = (ev) => {
+      moved = true;
+      w = Math.min(Math.max(ev.clientX - rect.left, NAV_WIDTH_MIN), Math.max(max, NAV_WIDTH_MIN));
+      setNavW(w);
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      setNavResizing(false);
+      if (moved) localStorage.setItem(NAV_WIDTH_KEY, String(Math.round(w)));
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
   // Vertical drag on the Changes/Files divider. Tracks the Changes height live and
   // persists on release; clamps so neither section drops below its heading + rows.
   const startSplitResize = (e) => {
@@ -184,7 +232,9 @@ export function CodeBrowser({ env, active = true }) {
     if (selected && snapshot.files.some((file) => file.path === selected)) return;
     setSelected(snapshot.files.find((file) => file.status)?.path || snapshot.files[0].path);
   }, [snapshot, selected]);
-  const file = useRepositoryFile(env, selected, active);
+  const selMeta = snapshot?.files?.find((item) => item.path === selected) || null;
+  const file = useRepositoryFile(env, selected, active,
+    selMeta && snapshot ? { status: selMeta.status, oldPath: selMeta.oldPath, baseSha: snapshot.baseSha, base: snapshot.base } : null);
 
   if (loading && !snapshot) return <div className="code-empty"><p>Loading workspace…</p></div>;
   if (err && !snapshot) {
@@ -199,8 +249,13 @@ export function CodeBrowser({ env, active = true }) {
   const changed = files.filter((item) => item.status);
   const selectedMeta = files.find((item) => item.path === selected);
   return (
-    <div className={`code-browser${resizing ? ' code-nav-resizing' : ''}`}>
+    <div
+      className={`code-browser${resizing ? ' code-nav-resizing' : ''}${navResizing ? ' code-nav-wresizing' : ''}`}
+      ref={browserRef}
+      style={navW != null ? { gridTemplateColumns: `${navW}px minmax(0, 1fr)` } : undefined}
+    >
       <aside className="code-nav" aria-label="Repository files" ref={navRef}>
+        <div className="code-nav-wresize" title="Drag to resize" onPointerDown={startWidthResize} />
         <label className="code-search">
           <Search size={13} />
           <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Find file" aria-label="Find file" />
