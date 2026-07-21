@@ -8,6 +8,7 @@ import { useSelection } from '../selection.jsx';
 import { columnCompare, archiveCompare, ARCHIVE_COLS } from '../board-sort.js';
 import { searchIssues } from '../issue-search.js';
 import { useHotkey } from '../hotkeys.js';
+import { Avatar, useDismiss } from '../profiles.jsx';
 
 function SearchIcon() {
   return (
@@ -81,6 +82,12 @@ export function ChangesBoard({ visible = true }) {
   const navigate = useNavigate();
   const { selectedId, anchorId, setSelection, chatFocused, setOrder } = useSelection();
   const [search, setSearch] = useState('');
+  // The search box collapses to just its icon; clicking expands + focuses it,
+  // clicking out (or Escape) collapses it again. An active query is PRESERVED
+  // across collapse (the board stays filtered) and the collapsed icon shows an
+  // accent tint so a hidden filter is never silent.
+  const [searchOpen, setSearchOpen] = useState(false);
+  const searchWrapRef = useDismiss(searchOpen, () => setSearchOpen(false));
   const [showFilters, setShowFilters] = useState(false);
   const [activeTags, setActiveTags] = useState(() => new Set());
   const toggleTag = (t) => setActiveTags(prev => {
@@ -450,22 +457,32 @@ export function ChangesBoard({ visible = true }) {
           >
             <FilterIcon />
           </button>
-          <div className="search-field">
-            <SearchIcon />
-            <input
-              type="text"
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-              placeholder="title, id, tag…"
-              aria-label="Search issues"
-            />
-            {search ? (
-              <button className="search-clear" onClick={() => setSearch('')}
-                title="Clear search" aria-label="Clear search">
-                <ClearIcon />
-              </button>
-            ) : null}
-          </div>
+          {!searchOpen ? (
+            <button className={`filter-toggle search-toggle${search ? ' is-active' : ''}`}
+              onClick={() => setSearchOpen(true)}
+              title="Search issues" aria-label="Search issues" aria-expanded={false}>
+              <SearchIcon />
+            </button>
+          ) : (
+            <div className="search-field" ref={searchWrapRef}>
+              <SearchIcon />
+              <input
+                type="text"
+                autoFocus
+                value={search}
+                onChange={e => setSearch(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Escape') { e.preventDefault(); setSearchOpen(false); } }}
+                placeholder="title, id, tag…"
+                aria-label="Search issues"
+              />
+              {search ? (
+                <button className="search-clear" onClick={() => setSearch('')}
+                  title="Clear search" aria-label="Clear search">
+                  <ClearIcon />
+                </button>
+              ) : null}
+            </div>
+          )}
         </div>
       </div>
       {/* Tag filters sit directly above the board they filter; revealed by the
@@ -591,9 +608,15 @@ function IssueCard({ i, colKey, onPointerDown, didDragRef, dragDisabled, selecte
       className={`kcard issue-card status-${i.status}${i.live ? ' is-live' : ''}${draggable ? ' draggable' : ''}${selected ? ' is-selected' : ''}${range ? ' is-range' : ''}`}
       {...dragProps}>
       {i.live ? <div className="kcard-head"><span className="pill live-tag" title={`branch live (pid ${i.live_pid})`}>● live</span></div> : null}
+      {/* The owner's avatar trails the title, reading against the card's right
+          edge — a card is already dense, so who holds it is a glance, not a line.
+          An UNOWNED issue shows nothing: no placeholder person, no empty circle.
+          <Avatar> reads the roster every other surface reads (one fetch for the
+          whole board), so this costs no request per card. */}
       <div className="kcard-title-row">
         {idle ? <span className="kcard-idle-dot" title="chat idle — needs your input" /> : null}
         <div className="kcard-title">{i.title}</div>
+        <Avatar email={i.owner} size={17} className="card-avatar" />
       </div>
     </Link>
   );

@@ -4,6 +4,8 @@
 // board no longer joins any git-derived branch liveness (that scan was the dash
 // terminal-freeze cause). Keep this free of node imports so the browser bundle
 // can import it. `body` is attached by detail callers, never here.
+import { readChatNames } from './issues-store.mjs';
+
 export function shapeRow(row) {
   const branches = Array.isArray(row.branches) ? row.branches : [];
   return {
@@ -16,6 +18,9 @@ export function shapeRow(row) {
     sessions: Array.isArray(row.sessions) ? row.sessions : [],
     commits: Array.isArray(row.commits) ? row.commits : [],
     conversations: Array.isArray(row.conversations) ? row.conversations : [],
+    // Custom display names for this issue's chats, keyed by full session uuid.
+    // Rides beside conversations[]; {} = every chat shows its derived default.
+    chat_names: readChatNames(row),
     requires: Array.isArray(row.requires) ? row.requires : [],
     unlocks: Array.isArray(row.unlocks) ? row.unlocks : [],
     port: row.port != null ? Number(row.port) : null,

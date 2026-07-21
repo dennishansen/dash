@@ -4,14 +4,14 @@ import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import { getTheme, onThemeChange, XTERM_THEMES } from '../theme.js';
 import { useLocalBackend } from '../capabilities.js';
-import { Plus, X } from '../icons.jsx';
+import { Plus, X, Pencil } from '../icons.jsx';
 import { viewportText } from '../spinner.js';
 import { agentById, agentChoices, DEFAULT_AGENT } from '../agents.js';
 import { reportActivity, clearActivity } from '../activity-store.js';
 import { useSessionOwner } from '../session-pool.js';
 import { acquireWebgl, releaseWebgl } from './term-renderer.js';
 import { CopyButton } from './CopyButton.jsx';
-import { emitIssuesChange } from '../realtime.js';
+import { emitIssuesChange, subscribeIssues } from '../realtime.js';
 import { getTerminalToken } from '../terminal-token.js';
 
 const AGENTS = agentChoices();
@@ -519,8 +519,16 @@ function ShadowChatPane({ issueId, sessionId, agent }) {
   );
 }
 
+// What a chat is CALLED, in one place: the name the user gave it if there is
+// one, else the derived default. The default stays positional ("chat 2") — it
+// describes where the chat sits in this env's list, which is exactly what an
+// unnamed chat has to go on. "(unavailable)" is a suffix on both: it reports
+// liveness, not identity, so naming a chat never hides that it can't resume.
+function chatDefaultLabel(c, i) {
+  return `chat ${i + 1} · ${c.sessionId.slice(0, 8)}`;
+}
 function chatLabel(c, i) {
-  return `chat ${i + 1} · ${c.sessionId.slice(0, 8)}${c.resumable ? '' : ' (unavailable)'}`;
+  return `${c.name || chatDefaultLabel(c, i)}${c.resumable ? '' : ' (unavailable)'}`;
 }
 
 // Copy icon for the open chat's session id — the address other agents use to
@@ -536,10 +544,16 @@ function ChatCopy({ sessionId }) {
 // Trigger shows the open chat; the menu lists every chat with a select target
 // and an × to unlink it from the issue. Resumable chats are pickable; the rest
 // show disabled but are still unlinkable. Closes on outside-click / select.
-function ChatSwitcher({ chats, selected, onSelect, onNew, onUnlink, busy }) {
+function ChatSwitcher({ chats, selected, onSelect, onNew, onUnlink, onRename, busy }) {
   const [open, setOpen] = useState(false);
   const [newOpen, setNewOpen] = useState(false); // the "+" agent-choice popover
   const [confirmId, setConfirmId] = useState(null); // chat awaiting unlink confirm
+  const [editing, setEditing] = useState(false); // renaming the open chat inline
+  const [draft, setDraft] = useState('');
+  // Leaving the field settles the name exactly once. Enter and Escape both
+  // decide it themselves and then unmount the input, which fires a blur — this
+  // says "already handled", so a cancel can't come back as a save.
+  const settled = useRef(false);
   const ref = useRef(null);
   const newRef = useRef(null);
   useEffect(() => {
@@ -554,6 +568,9 @@ function ChatSwitcher({ chats, selected, onSelect, onNew, onUnlink, busy }) {
     document.addEventListener('mousedown', onDoc);
     return () => document.removeEventListener('mousedown', onDoc);
   }, [newOpen]);
+  // Switching chats abandons an open rename — the field was seeded from the chat
+  // that just left, so committing it would name the wrong one.
+  useEffect(() => { settled.current = true; setEditing(false); }, [selected]);
 
   const selIdx = chats.findIndex(c => c.sessionId === selected);
   const selChat = selIdx >= 0 ? chats[selIdx] : null;
@@ -563,17 +580,63 @@ function ChatSwitcher({ chats, selected, onSelect, onNew, onUnlink, busy }) {
 
   const pickNew = (agent) => { setNewOpen(false); rememberAgent(agent); onNew(agent); };
 
+  // Rename seeds from the CUSTOM name only — never the derived default, which
+  // would let a stray Enter freeze "chat 1 · 3f2a…" in as a real name. The
+  // default shows as placeholder instead, so clearing the field reads as
+  // "go back to that" and saves the empty string that means exactly it.
+  const startEdit = () => {
+    if (!selChat) return;
+    settled.current = false;
+    setDraft(selChat.name || '');
+    setEditing(true);
+    setOpen(false);
+  };
+  const finish = (save) => {
+    if (settled.current) return;
+    settled.current = true;
+    setEditing(false);
+    // selChat can vanish mid-edit (the chat was unlinked in another window), and
+    // there is nothing left to name — drop the draft rather than write it onto
+    // whichever chat happens to be selected next.
+    if (save && selChat && draft.trim() !== (selChat.name || '')) onRename(selChat.sessionId, draft.trim());
+  };
+
   return (
     <div className="issue-chat-switch" ref={ref}>
       <div className="issue-chat-menu-wrap">
-        <button className="issue-chat-trigger" onClick={() => setOpen(v => !v)}
-          disabled={!chats.length} aria-haspopup="listbox" aria-expanded={open}>
-          {selChat ? <AgentBadge agent={selChat.agent} /> : null}
-          <span className="issue-chat-trigger-label">{triggerLabel}</span>
-          <svg className="issue-chat-caret" width="10" height="6" viewBox="0 0 10 6" aria-hidden="true">
-            <path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-        </button>
+        {/* The trigger opens the list; a rename pencil sits beside it so the pill
+            reads label → edit it. Renaming swaps the label's slot for an input,
+            leaving the badge in place so nothing shifts under the cursor. */}
+        <div className="issue-chat-trigger">
+          {editing ? (
+            <>
+              {selChat ? <AgentBadge agent={selChat.agent} /> : null}
+              <input className="issue-chat-name-input" autoFocus value={draft}
+                placeholder={selChat ? chatDefaultLabel(selChat, selIdx) : ''}
+                aria-label="Chat name"
+                onChange={(e) => setDraft(e.target.value)}
+                onBlur={() => finish(true)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+                  else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+                }} />
+            </>
+          ) : (
+            <button className="issue-chat-trigger-main" onClick={() => setOpen(v => !v)}
+              disabled={!chats.length} aria-haspopup="listbox" aria-expanded={open}>
+              {selChat ? <AgentBadge agent={selChat.agent} /> : null}
+              <span className="issue-chat-trigger-label">{triggerLabel}</span>
+            </button>
+          )}
+          <button className="icon-btn issue-chat-rename" onClick={startEdit} disabled={!selChat || editing}
+            title="Rename this chat" aria-label="Rename chat"><Pencil size={13} /></button>
+          <button className="issue-chat-caret-btn" onClick={() => setOpen(v => !v)} disabled={!chats.length}
+            aria-hidden="true" tabIndex={-1}>
+            <svg className="issue-chat-caret" width="10" height="6" viewBox="0 0 10 6" aria-hidden="true">
+              <path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+        </div>
         {open && chats.length > 0 ? (
           <ul className="issue-chat-menu" role="listbox">
             {chats.map((c, i) => (
@@ -774,6 +837,40 @@ export function IssueTerminal({ issueId, requestSession, active }) {
     }
   };
 
+  // Name (or un-name) a chat. An empty name clears back to the derived default.
+  // The server answers with the issue's whole name map, so the switcher repaints
+  // from the write itself — no refetch, no window where the old label lingers.
+  const renameChat = async (sessionId, name) => {
+    setError(null);
+    try {
+      const r = await fetch('/api/dash/terminal/chat-name', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ issue: issueId, session: sessionId, name }),
+      });
+      const data = await r.json();
+      if (!r.ok || data.error) { setError(data.error || 'rename failed'); return; }
+      setState(s => ({ ...s, chats: (s.chats || []).map(c => ({ ...c, name: data.names[c.sessionId] || null })) }));
+      // An issue's names live on its board row — announce the write like any
+      // other so the rest of the app refetches.
+      emitIssuesChange('UPDATE', { id: issueId });
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  // An issue's chat list AND its chat names both live on the board row, so any
+  // issues-change signal is a reason to re-read them: that's how a rename (or a
+  // link) made in another window — or by an agent through the CLI — lands here
+  // without a refresh.
+  useEffect(() => {
+    if (local !== true || !issueId) return;
+    return subscribeIssues(({ record }) => {
+      if (record?.id && record.id !== issueId) return; // another card's write
+      refresh();
+    });
+  }, [local, issueId, refresh]);
+
   // Probing the backend, or no backend at all (remote on Vercel).
   if (local === null) {
     return (
@@ -845,6 +942,7 @@ export function IssueTerminal({ issueId, requestSession, active }) {
           onSelect={(sid) => { setSelected(sid); setMode('resume'); }}
           onNew={newChat}
           onUnlink={unlinkChat}
+          onRename={renameChat}
           busy={busy}
         />
       </div>

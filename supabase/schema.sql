@@ -43,6 +43,10 @@ create table if not exists public.issues (
   commits       text[] not null default '{}',     -- lab: linked commit shas
   conversations text[] not null default '{}',     -- linked chat/conversation ids
 
+  -- Per-chat display names, keyed by full session uuid (see setChatName in
+  -- issues-store.mjs). A blank name deletes the key, so {} means "no names".
+  chat_names    jsonb not null default '{}'::jsonb,
+
   port          integer,                          -- lab: reserved dev-server port [5200-5299]
 
   created       date,                             -- 'YYYY-MM-DD' the card was created
@@ -168,6 +172,131 @@ begin
 end $$;
 
 alter publication supabase_realtime add table public.issues;
+
+-- For an EXISTING install upgrading to the chat-rename feature, add the column
+-- the board list now selects (fresh installs already have it from the table
+-- definition above). Safe to run repeatedly.
+alter table public.issues add column if not exists chat_names jsonb not null default '{}'::jsonb;
+
+-- ===========================================================================
+-- People / profiles / avatars.
+-- ===========================================================================
+-- Who owns a card. `issues.owner` holds a person's EMAIL (the same key sign-in
+-- and the allow-list use). Three pieces, deliberately separate:
+--   dash_allowed_emails  the team — already the access gate, now also the roster
+--   dash_profiles        what a person LOOKS like (name, picture). Grants nothing.
+--   dash_people          the join the browser reads: ONE fetch per session,
+--                        shared by every card, so an avatar is never its own request.
+-- The card avatar joins owner→dash_people by email in the browser; an owner that
+-- isn't a teammate simply shows no avatar (there is deliberately NO hard FK on
+-- issues.owner, so a plain kanban can still use free-text owners).
+
+-- A person's look. `email` is the primary key and cascades from the allow-list,
+-- so removing someone from the team removes their profile. `avatar_scope` is a
+-- random per-person storage folder assigned ONCE on insert and frozen on update
+-- (see the trigger) — so nothing is derived from an address that can move, and a
+-- client can never claim a teammate's folder. `avatar_key` is content-addressed
+-- (`<scope>/<sha256>.<ext>`); the CHECK pins it to THIS row's scope in canonical
+-- shape, so a row can only ever point at its own folder.
+create table if not exists public.dash_profiles (
+  email        text primary key
+                 references public.dash_allowed_emails(email)
+                 on update cascade on delete cascade,
+  display_name text,
+  avatar_key   text,
+  avatar_scope text not null default gen_random_uuid()::text,
+  updated_at   timestamptz not null default now(),
+  constraint dash_profiles_avatar_key_shape check (
+    avatar_key is null
+    or avatar_key ~ ('^' || avatar_scope || '/[0-9a-f]{32}\.(png|jpg|webp|gif)$')
+  )
+);
+
+-- avatar_scope is assigned once and never changes; keep updated_at honest too.
+create or replace function public.dash_profiles_freeze_scope()
+returns trigger language plpgsql as $$
+begin
+  new.avatar_scope := old.avatar_scope;   -- ignore any client-supplied scope
+  new.updated_at   := now();
+  return new;
+end;
+$$;
+drop trigger if exists dash_profiles_freeze on public.dash_profiles;
+create trigger dash_profiles_freeze
+  before update on public.dash_profiles
+  for each row execute function public.dash_profiles_freeze_scope();
+
+-- The roster the browser reads (server/profiles-store.mjs listPeople). A LEFT
+-- join, so an allow-listed teammate who has never opened their profile still
+-- appears (with no picture). A SECURITY DEFINER view (default) so it can read
+-- the allow-list, gated by dash_email_allowed() so ONLY an allow-listed caller
+-- gets rows — a signed-out or non-member session sees an empty roster.
+create or replace view public.dash_people as
+  select a.email, p.display_name, p.avatar_key, p.avatar_scope, p.updated_at
+  from public.dash_allowed_emails a
+  left join public.dash_profiles p on p.email = a.email
+  where public.dash_email_allowed();
+grant select on public.dash_people to authenticated;
+
+-- Profiles RLS: an allow-listed member may READ every profile (decoration is
+-- shared and grants nothing) but WRITE only their own row.
+alter table public.dash_profiles enable row level security;
+drop policy if exists dash_profiles_read on public.dash_profiles;
+create policy dash_profiles_read on public.dash_profiles
+  for select to authenticated
+  using (public.dash_email_allowed());
+drop policy if exists dash_profiles_insert_self on public.dash_profiles;
+create policy dash_profiles_insert_self on public.dash_profiles
+  for insert to authenticated
+  with check (lower(email) = lower(coalesce(auth.jwt() ->> 'email', '')));
+drop policy if exists dash_profiles_update_self on public.dash_profiles;
+create policy dash_profiles_update_self on public.dash_profiles
+  for update to authenticated
+  using (lower(email) = lower(coalesce(auth.jwt() ->> 'email', '')))
+  with check (lower(email) = lower(coalesce(auth.jwt() ->> 'email', '')));
+-- No delete policy → only the service role can drop a profile row.
+
+-- ---------------------------------------------------------------------------
+-- Avatar storage — a public-read but UNLISTABLE bucket at
+-- `<avatar_scope>/<sha256>.<ext>`. Pictures are world-readable by URL (an avatar
+-- on a public board must load), but the bucket cannot be listed and a member can
+-- write only inside their OWN folder.
+-- ---------------------------------------------------------------------------
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('dash-avatars', 'dash-avatars', true, 2097152,
+        array['image/png','image/jpeg','image/webp','image/gif'])
+on conflict (id) do update
+  set public = excluded.public,
+      file_size_limit = excluded.file_size_limit,
+      allowed_mime_types = excluded.allowed_mime_types;
+
+-- The caller's own storage folder, read from their profile by JWT email. Used by
+-- the storage policies so "my folder" is looked up server-side, never trusted
+-- from the request path.
+create or replace function public.dash_avatar_scope()
+returns text language sql security definer stable as $$
+  select avatar_scope from public.dash_profiles
+  where lower(email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+$$;
+
+-- INSERT / DELETE only inside your own scope folder; no SELECT policy at all, so
+-- the bucket cannot be listed (public downloads go through the unauthenticated
+-- public path, which needs no select policy). Public read is the bucket flag above.
+drop policy if exists dash_avatars_insert_own on storage.objects;
+create policy dash_avatars_insert_own on storage.objects
+  for insert to authenticated
+  with check (
+    bucket_id = 'dash-avatars'
+    and public.dash_email_allowed()
+    and (storage.foldername(name))[1] = public.dash_avatar_scope()
+  );
+drop policy if exists dash_avatars_delete_own on storage.objects;
+create policy dash_avatars_delete_own on storage.objects
+  for delete to authenticated
+  using (
+    bucket_id = 'dash-avatars'
+    and (storage.foldername(name))[1] = public.dash_avatar_scope()
+  );
 
 -- ===========================================================================
 -- OPTIONAL — corpus / metrics features (lab-origin, safe to skip).

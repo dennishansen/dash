@@ -15,7 +15,7 @@
 import fs from 'fs';
 import path from 'path';
 
-const KEYS = ['DASH_SUPABASE_URL', 'DASH_SUPABASE_ANON_KEY', 'DASH_SUPABASE_SERVICE_KEY'];
+const KEYS = ['DASH_SUPABASE_URL', 'DASH_SUPABASE_ANON_KEY', 'DASH_SUPABASE_SERVICE_KEY', 'DASH_ALLOWED_HOSTS', 'DASH_ALLOWED_ORIGINS', 'DASH_TERMINAL_TOKEN'];
 
 // Candidate env files, highest precedence first: .env.local then .env, resolved
 // against the process cwd (where the user runs `dash` / `npm run dev`).

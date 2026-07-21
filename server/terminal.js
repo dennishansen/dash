@@ -59,7 +59,7 @@ import {
   MAIN_ENV, MAIN_REPO, resolveWorktreeDir, worktreeDir,
 } from './workspace-env.mjs';
 import {
-  mainChatsList, linkMainChat, unlinkMainChat,
+  mainChatsList, linkMainChat, unlinkMainChat, mainChatNames, setMainChatName,
 } from './main-chats-store.mjs';
 import { normalizeAppPath } from '../src/app-env.mjs';
 
@@ -355,6 +355,40 @@ async function linkChat(env, sessionId, agent = DEFAULT_AGENT) {
   return appendToArray(env, 'conversations', [handle]);
 }
 
+// The custom display names for an environment's chats, sessionId → name. Same
+// env split as chatHandlesFor: an issue's names live on the shared row
+// (chat_names), MAIN's in the machine-local store. {} = every chat falls back to
+// its derived default. Keyed by the FULL session uuid, never the 8-char display
+// prefix, so the key is an identity rather than a truncation.
+async function chatNamesFor(env) {
+  if (env === MAIN_ENV) return mainChatNames();
+  const { get, readChatNames } = await import('./issues-store.mjs');
+  const row = await get(env).catch(() => null);
+  return readChatNames(row);
+}
+
+// Name (or un-name) one chat within an environment — the twin of linkChat, and
+// the ONLY write path for a chat name (HTTP, CLI and UI all land here or on the
+// store function it calls). A blank name clears back to the derived default.
+// Resolves to { ok, names } with the whole updated map, so a caller repaints
+// without a second read.
+async function setChatName(env, sessionId, name) {
+  if (!sessionId) return { error: 'session required' };
+  if (env === MAIN_ENV) return setMainChatName(sessionId, name);
+  const { setChatName: setRowChatName } = await import('./issues-store.mjs');
+  const r = await setRowChatName(env, sessionId, name);
+  return r.error ? r : { ok: true, names: r.chat_names };
+}
+
+// Drop the dash API's memoized issue list after a chat write. Both `chat_names`
+// and `conversations` ride in the board's LIST_COLS, so a chat rename or unlink
+// makes that cached feed stale for the rest of its TTL. Lazy import: dash-api is
+// already loaded in this process (vite mounts both), so it's a cache hit, and
+// terminal.js keeps no static dependency on the API layer above it.
+async function invalidateIssuesCache() {
+  try { (await import('./dash-api.js')).invalidateCache(); } catch {}
+}
+
 // Reserve a stable dev-server port for the issue (idempotent — re-opening an
 // issue that already has one reuses it). Called whenever the worktree is
 // ensured, so the port exists by the time the issue-detail link is rendered.
@@ -618,6 +652,10 @@ export async function issueChats(env) {
   // rides through to the client for the per-chat type badge. Handles come from
   // the shared issue row for an issue, or the machine-local store for MAIN.
   const conversations = (await chatHandlesFor(env)).map(parseHandle);
+  // Custom names ride along with the list so the switcher renders its label from
+  // ONE response — no second fetch, and no window where the trigger shows the
+  // derived default before the name lands.
+  const names = await chatNamesFor(env);
   // MAIN's workspace is the repo root — always present; an issue's is its
   // worktree dir (null until created).
   const isMain = env === MAIN_ENV;
@@ -630,15 +668,16 @@ export async function issueChats(env) {
   const live = globalThis.__labChats;
   const chats = [];
   for (const { sessionId, agent } of conversations) {
+    const name = names[sessionId] || null; // null = show the derived default
     const session = live?.get(sessionId);
-    if (liveSession(session)) { chats.push({ sessionId, agent, resumable: true, live: true, cwd: null }); continue; }
+    if (liveSession(session)) { chats.push({ sessionId, agent, name, resumable: true, live: true, cwd: null }); continue; }
     // Live in ANOTHER dash server on this machine counts as live too — the
     // attach path redirects there, so reporting it resumable+live is honest,
     // and reporting it dormant would invite the duplicate cold resume.
     const owner = await liveChatOwner(sessionId);
-    if (owner && owner.pid !== process.pid) { chats.push({ sessionId, agent, resumable: true, live: true, cwd: null }); continue; }
+    if (owner && owner.pid !== process.pid) { chats.push({ sessionId, agent, name, resumable: true, live: true, cwd: null }); continue; }
     const { resumable, cwd } = await resolveChat(sessionId);
-    chats.push({ sessionId, agent, resumable, live: false, cwd });
+    chats.push({ sessionId, agent, name, resumable, live: false, cwd });
   }
   return { worktree: !!dir, dir, chats };
 }
@@ -1662,7 +1701,9 @@ async function attachChatInner(ws, { issueId, sessionId, mode, agent }) {
 
 // --- HTTP endpoints (mounted in vite.config.js) ---
 //
-// GET  /api/dash/terminal/chats?issue=<id>   → { worktree, dir, port, chats:[{sessionId,resumable}] }
+// GET  /api/dash/terminal/chats?issue=<id>   → { worktree, dir, port, chats:[{sessionId,agent,name,resumable}] }
+// POST /api/dash/terminal/chat-name { issue, session, name }
+//                                             → set/clear a chat's custom label → { ok, names }
 // POST /api/dash/terminal/worktree { issue }  → creates worktree (idempotent) + reserves port → { ok, dir, created, port }
 // POST /api/dash/terminal/chat     { issue }  → ensures worktree + reserves port + mints a new chat
 //                                              (uuid), links it → { ok, sessionId, mode:'new', port }
@@ -1896,11 +1937,34 @@ export async function handleTerminalHttp(req, res, segs) {
     // the exact stored handle (bare uuid = claude, `codex:<uuid>` = codex) to drop.
     const handles = await chatHandlesFor(issue);
     const handle = handles.find(h => parseHandle(h).sessionId === session) || session;
-    if (issue === MAIN_ENV) { unlinkMainChat(handle); return json({ ok: true }); }
+    if (issue === MAIN_ENV) {
+      unlinkMainChat(handle);
+      await setChatName(issue, session, '');
+      return json({ ok: true });
+    }
     const { removeFromArray } = await import('./issues-store.mjs');
     const r = await removeFromArray(issue, 'conversations', [handle]);
     if (r?.error) return json({ error: `unlink failed: ${r.error}` }, 500);
+    // A name belongs to the LINK, not to the transcript: drop it with the
+    // association so an unlinked-then-relinked chat starts from the default and
+    // the map can't accumulate keys for chats the env no longer has.
+    await setChatName(issue, session, '');
+    await invalidateIssuesCache();
     return json({ ok: true });
+  }
+
+  // POST /api/dash/terminal/chat-name { issue, session, name } — set or clear a
+  // chat's custom display name within its env (an issue's chat_names column, or
+  // the main store's names file). An empty/absent name clears back to the
+  // derived label. Returns the whole updated map so the client repaints from the
+  // response instead of re-resolving the chat list.
+  if (req.method === 'POST' && segs[0] === 'chat-name') {
+    const { issue, session, name } = await readBody();
+    if (!issue || !session) return json({ error: 'issue and session required' }, 400);
+    const r = await setChatName(issue, session, typeof name === 'string' ? name : '');
+    if (r?.error) return json({ error: r.error }, 500);
+    if (issue !== MAIN_ENV) await invalidateIssuesCache();
+    return json({ ok: true, names: r.names });
   }
 
   return json({ error: 'unknown terminal endpoint' }, 404);

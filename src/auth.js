@@ -21,8 +21,7 @@
 // token is within a minute of expiry. setAuthToken() pushes the live token into
 // the store so its PostgREST calls carry the user's JWT.
 
-import { URL as SUPA_URL, ANON } from '../server/issues-store.mjs';
-import { setAuthToken } from '../server/issues-store.mjs';
+import { URL as SUPA_URL, ANON, setAuthToken } from '../server/supabase.mjs';
 
 const AUTH = `${SUPA_URL}/auth/v1`;
 const LS_KEY = 'dash-auth-session';

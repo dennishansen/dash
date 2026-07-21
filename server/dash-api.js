@@ -51,7 +51,10 @@ function readBody(req) {
 // Stored on globalThis so vite HMR reloading the module doesn't drop it.
 if (!globalThis.__labCache) globalThis.__labCache = new Map();
 const cache = globalThis.__labCache;
-function invalidateCache() { cache.clear(); }
+// Exported so writes made OUTSIDE this module's routes — terminal.js' chat
+// rename/unlink, which touch columns the board list carries — can drop the memo
+// too, instead of leaving the feed stale for the rest of its TTL.
+export function invalidateCache() { cache.clear(); }
 // Async memo for handlers whose producer awaits I/O (e.g. the board-state fetch
 // behind listChanges). Rejections are not cached — a failed fetch shouldn't
 // poison the TTL window.

@@ -10,6 +10,7 @@ import { Markdown } from './Markdown.jsx';
 import { CopyButton } from './CopyButton.jsx';
 import { useChatControl } from '../chat-control.jsx';
 import { X, Plus, Pencil, Trash } from '../icons.jsx';
+import { Avatar, PersonLabel, usePeople, useDismiss, normalizeEmail } from '../profiles.jsx';
 
 // Inline-editable issue title. Looks like the static <h2> (CSS .title-edit),
 // gaining a box outline only on hover / focus. Enter or blur saves via
@@ -161,6 +162,80 @@ function ConvoPill({ id, convo, conversations, onChanged, onOpen }) {
         </button>
       )}
     </span>
+  );
+}
+
+// The owner property — ALWAYS present, owned or not. "Nobody holds this" is a
+// real answer an issue has to be able to give, and a row that appears only once
+// someone is assigned leaves nowhere to click to assign them.
+//
+// An owner is ONE person, so the value itself is the control: click the person
+// (or the "unassigned" placeholder) to open the picker, and the hover-X on the
+// pill releases it. `owner` holds an EMAIL — the same key profiles and the
+// allow-list use — so the person shown is an exact lookup, never a name match.
+function OwnerRow({ id, owner }) {
+  const [picking, setPicking] = useState(false);
+  const people = usePeople();
+  const wrapRef = useDismiss(picking, () => setPicking(false));
+  // Escape closes the picker without also reaching the detail view's bubble-
+  // phase "Escape → back to board" listener — capture phase + stopPropagation,
+  // the same pattern StatusPill uses.
+  useEffect(() => {
+    if (!picking) return;
+    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); setPicking(false); } };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [picking]);
+
+  const assign = (email) => {
+    setPicking(false);
+    if (email !== (owner || null)) updateChangeField(id, 'owner', email);
+  };
+  const key = normalizeEmail(owner);
+
+  return (
+    <div className="field-row">
+      <span className="k">owner</span>
+      <span className="v owner-v" ref={wrapRef}>
+        {key ? (
+          <span className="field-pill field-pill--reveal owner-pill">
+            <button type="button" className="owner-open" title="Change owner"
+              aria-haspopup="listbox" aria-expanded={picking} onClick={() => setPicking(p => !p)}>
+              <PersonLabel email={key} size={16} />
+            </button>
+            <button type="button" className="pill-reveal pill-reveal--remove"
+              title="Unassign" aria-label="Unassign owner" onClick={() => assign(null)}>
+              <X size={12} />
+            </button>
+          </span>
+        ) : (
+          <button type="button" className="owner-empty" title="Assign an owner"
+            aria-haspopup="listbox" aria-expanded={picking} onClick={() => setPicking(p => !p)}>
+            unassigned
+          </button>
+        )}
+        {picking ? (
+          <ul className="owner-menu" role="listbox">
+            {people.map(p => (
+              <li key={p.email}>
+                <button type="button" className={`owner-pick${p.email === key ? ' is-current' : ''}`}
+                  role="option" aria-selected={p.email === key} onClick={() => assign(p.email)}>
+                  <Avatar email={p.email} size={18} showTooltip={false} />
+                  <span className="person-name">{p.name}</span>
+                </button>
+              </li>
+            ))}
+            {key ? (
+              <li>
+                <button type="button" className="owner-pick owner-pick--clear"
+                  onClick={() => assign(null)}>unassign</button>
+              </li>
+            ) : null}
+            {people.length === 0 ? <li className="owner-menu-empty dim">nobody on this board yet</li> : null}
+          </ul>
+        ) : null}
+      </span>
+    </div>
   );
 }
 
@@ -391,12 +466,7 @@ export function ChangeDetail() {
       </div>
 
       <div className="issue-fields">
-        {data.owner ? (
-          <div className="field-row">
-            <span className="k">owner</span>
-            <span className="v"><span className="field-pill">@{data.owner}</span></span>
-          </div>
-        ) : null}
+        {isIssue ? <OwnerRow id={data.id} owner={data.owner} /> : null}
         {data.branch || data.branches?.length ? (
           <div className="field-row">
             <span className="k">branch</span>

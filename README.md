@@ -52,7 +52,14 @@ free tier is fine).
 
 **2. Run the schema.** In the project's SQL Editor, paste and run
 [`supabase/schema.sql`](supabase/schema.sql). It creates the `issues` table, the
-board RPCs, the email allow-list, RLS policies, and the Realtime publication.
+board RPCs, the email allow-list, RLS policies, the Realtime publication, and the
+people/profiles tables + avatar storage bucket.
+
+> **Updating an existing project:** `schema.sql` is idempotent — after you
+> `git pull`, paste and run it again to pick up new columns, tables, and policies
+> (e.g. chat names, profiles, avatars). It never drops your data. This is the one
+> step to repeat on every update; the app itself just needs `npm install &&
+> npm run build`.
 
 **3. Allow your email.** Still in the SQL Editor:
 
@@ -113,6 +120,13 @@ features light up only when the local backend is running (probed once at boot vi
   delete cards, edit card bodies.
 - Live realtime updates across tabs and users.
 - Email OTP sign-in and the allow-list gate.
+- **People & profiles.** Everyone on the `dash_allowed_emails` allow-list is a
+  teammate: they appear in the card owner picker, and a small avatar trails the
+  title on cards they own. Each person sets their own display name and picture
+  from the sidebar footer (pictures live in the `dash-avatars` storage bucket that
+  `schema.sql` creates — a member can only write inside their own folder). No
+  picture just shows a coloured initial, so nothing extra is required to use it.
+- **Named chats.** Rename a card's chat sessions; names are stored on the issue.
 
 **Needs the local backend (`npm start` / `npm run dev` on your machine):**
 

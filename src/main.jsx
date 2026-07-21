@@ -22,7 +22,11 @@ import { appPortForEnv } from './app-env.js';
 import { ArrowUpRight, WorkspacePanelIcon } from './icons.jsx';
 import { useFetch, useAsync } from './api.js';
 import { stateCounts, listChanges } from './board-store.js';
-import { onAuth, ensureFreshToken, ensureDevSession, signOut, userEmail } from './auth.js';
+import { onAuth, ensureFreshToken, ensureDevSession, signOut } from './auth.js';
+import {
+  Avatar, PersonLabel, useMyProfile, useDismiss, displayName,
+  saveDisplayName, saveAvatar, clearAvatar, AVATAR_TYPES,
+} from './profiles.jsx';
 import { getTheme, getMode, setMode, onThemeChange } from './theme.js';
 import { useHotkey } from './hotkeys.js';
 
@@ -84,6 +88,84 @@ function ThemeMenu() {
   );
 }
 
+// Who you are, in the sidebar's footer — the one place the Dash renders YOU, so
+// it's also where you say what to call yourself and what you look like. Resting
+// state is avatar · name; clicking opens the editor above it (a popover, not a
+// route: a profile is two fields, and a whole page for two fields is ceremony).
+// The picture and name are the same surfaces every card reads, so a change here
+// lands on every avatar on the board the moment it saves.
+function ProfileCard() {
+  const { email, profile } = useMyProfile();
+  const [open, setOpen] = React.useState(false);
+  const [name, setName] = React.useState('');
+  const [err, setErr] = React.useState(null);
+  const [busy, setBusy] = React.useState(false);
+  const fileRef = React.useRef(null);
+  const wrapRef = useDismiss(open, () => setOpen(false));
+  // Escape closes — capture phase, so it doesn't also fall through to a view's
+  // "Escape → back to the board".
+  useHotkey('Escape', () => setOpen(false), { enabled: open, terminal: 'handle', allowInInput: true });
+  // Reopening always starts from the saved name and a clean slate — never a
+  // stale draft, and never the error from a picture you already gave up on.
+  React.useEffect(() => { if (open) { setName(displayName(profile, email)); setErr(null); } }, [open]);
+
+  if (!email) return null;
+
+  const commitName = async () => {
+    if (name.trim() === displayName(profile, email)) return;
+    setErr(null);
+    const r = await saveDisplayName(email, name);
+    if (r?.error) setErr(r.error);
+  };
+  const pickFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';               // same file twice still fires a change
+    if (!file) return;
+    setErr(null); setBusy(true);
+    const r = await saveAvatar(email, file);
+    setBusy(false);
+    if (r?.error) setErr(r.error);
+  };
+
+  return (
+    <div className="profile-card" ref={wrapRef}>
+      {open ? (
+        <div className="profile-pop">
+          <button type="button" className="profile-pop-avatar" disabled={busy}
+            title="Upload a picture" onClick={() => fileRef.current?.click()}>
+            <Avatar email={email} size={56} showTooltip={false} />
+            <span className="profile-pop-avatar-hint">{busy ? 'uploading…' : 'change'}</span>
+          </button>
+          {/* The picker offers exactly what the bucket accepts — one list, so
+              the file dialog and the refusal message can never disagree. */}
+          <input ref={fileRef} type="file" className="profile-file"
+            accept={Object.keys(AVATAR_TYPES).join(',')}
+            aria-label="Profile picture" onChange={pickFile} />
+          <input className="profile-name-input" value={name} spellCheck={false}
+            aria-label="Display name" placeholder="your name"
+            onChange={e => setName(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { e.preventDefault(); commitName(); setOpen(false); }
+              else if (e.key === 'Escape') { e.preventDefault(); setOpen(false); }
+            }}
+            onBlur={commitName} />
+          <div className="profile-pop-email dim">{email}</div>
+          {profile?.avatar_key ? (
+            <button type="button" className="profile-pop-remove"
+              onClick={() => clearAvatar(email)}>remove picture</button>
+          ) : null}
+          {err ? <div className="profile-pop-err">{err}</div> : null}
+        </div>
+      ) : null}
+      <button type="button" className="profile-trigger" title="Your profile"
+        aria-expanded={open} onClick={() => setOpen(o => !o)}>
+        <PersonLabel email={email} size={22} />
+      </button>
+      <button className="signout-btn" onClick={signOut} title="Sign out">sign out</button>
+    </div>
+  );
+}
+
 function Sidebar({ onCollapse }) {
   // `state` is local-only (branch) — null remotely. The Issues count comes from
   // Supabase directly so it's correct everywhere.
@@ -112,10 +194,7 @@ function Sidebar({ onCollapse }) {
       <div className="sidebar-footer">
         <a className="ext-link" href="/"><ArrowUpRight size={14} /><span>open canvas</span></a>
         <ThemeMenu />
-        <div className="signed-in-as">
-          <span className="dim" title={userEmail() || ''}>{userEmail()}</span>
-          <button className="signout-btn" onClick={signOut} title="Sign out">sign out</button>
-        </div>
+        <ProfileCard />
       </div>
     </aside>
   );

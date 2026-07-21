@@ -30,7 +30,8 @@
 // likewise receives everything. Signed out ⇒ no token ⇒ no socket (the board
 // shows the sign-in gate anyway).
 
-import { URL as SUPA_URL, ANON, TABLE } from '../server/issues-store.mjs';
+import { URL as SUPA_URL, ANON } from '../server/supabase.mjs';
+import { TABLE } from '../server/issues-store.mjs';
 import { currentSession, onAuth } from './auth.js';
 
 const TOPIC = 'realtime:issues';

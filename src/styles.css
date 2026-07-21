@@ -702,6 +702,9 @@ select:focus {
   border-color: var(--sel-line);
   background: var(--sel-bg);
 }
+/* Collapsed search: a plain icon button (borrows .filter-toggle). When a query
+   is active but the field is collapsed, tint it so the hidden filter reads. */
+.search-toggle.is-active { color: var(--accent); border-color: var(--sel-line); }
 .search-field input[type="text"] {
   border: none;
   background: none;
@@ -3013,6 +3016,35 @@ img.zoomable {
 .issue-chat-trigger:disabled { opacity: 0.6; cursor: default; }
 .issue-chat-trigger-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
 .issue-chat-caret { flex: 0 0 auto; color: var(--text-mute); }
+/* The trigger is a pill (a div frame) rather than one button, so the rename
+   pencil and its input can live inside it without nesting a button in a button.
+   The main region (badge + label) keeps the click-to-open behaviour, borderless
+   because the pill is the frame. */
+.issue-chat-trigger-main {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 6px;
+  height: 100%; padding: 0; margin: 0;
+  background: none; border: 0; color: inherit;
+  font: inherit; font-size: 13px; text-align: left; cursor: pointer;
+}
+.issue-chat-trigger-main:disabled { cursor: default; }
+.issue-chat-caret-btn {
+  flex: 0 0 auto;
+  display: inline-flex; align-items: center;
+  padding: 0; background: none; border: 0; cursor: pointer;
+}
+.issue-chat-caret-btn:disabled { cursor: default; }
+/* Rename (pencil) sits between the label and the caret — the last thing before
+   the read-only indicators, so the pill reads label → edit it → what it is. */
+.issue-chat-rename { flex: 0 0 auto; margin-left: 6px; padding: 2px; }
+/* The name field takes the label's slot so the pill doesn't resize when
+   renaming starts — no border or background of its own; the pill is the frame. */
+.issue-chat-name-input {
+  flex: 1; min-width: 0; height: 100%;
+  background: none; border: none; outline: none; padding: 0;
+  color: var(--text); font: inherit; font-size: 13px;
+}
+.issue-chat-name-input::placeholder { color: var(--text-mute); }
 .issue-chat-menu {
   position: absolute;
   top: calc(100% + 4px);
@@ -3751,3 +3783,166 @@ img.zoomable {
   color: var(--text);
   font-weight: 700;
 }
+
+/* ── People ─────────────────────────────────────────────────────────────────
+   One avatar shape everywhere — cards, the owner property, the sidebar, the
+   picker — so a person reads the same size-for-size wherever they appear. With a
+   picture it's the photo; without, the display name's initial on a tone derived
+   from the email (deterministic: same person, same colour, every machine). The
+   size comes from the caller as an inline width/height, so this only owns the
+   shape and colour. */
+.avatar {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 99px;
+  overflow: hidden;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.01em;
+  user-select: none;
+  color: var(--avatar-ink, var(--text));
+  background: var(--avatar-fill, var(--bg-1));
+}
+.avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* Six muted tones. Low saturation on purpose: the board is dense and an avatar
+   is a glance, not a highlight. */
+.avatar[data-tone='0'] { --avatar-fill: color-mix(in srgb, var(--info) 26%, var(--bg-1)); --avatar-ink: color-mix(in srgb, var(--info) 78%, var(--text)); }
+.avatar[data-tone='1'] { --avatar-fill: color-mix(in srgb, var(--ok) 24%, var(--bg-1)); --avatar-ink: color-mix(in srgb, var(--ok) 72%, var(--text)); }
+.avatar[data-tone='2'] { --avatar-fill: color-mix(in srgb, var(--active) 26%, var(--bg-1)); --avatar-ink: color-mix(in srgb, var(--active) 78%, var(--text)); }
+.avatar[data-tone='3'] { --avatar-fill: color-mix(in srgb, var(--warn) 24%, var(--bg-1)); --avatar-ink: color-mix(in srgb, var(--warn) 72%, var(--text)); }
+.avatar[data-tone='4'] { --avatar-fill: color-mix(in srgb, var(--bad) 22%, var(--bg-1)); --avatar-ink: color-mix(in srgb, var(--bad) 74%, var(--text)); }
+.avatar[data-tone='5'] { --avatar-fill: color-mix(in srgb, var(--accent) 24%, var(--bg-1)); --avatar-ink: color-mix(in srgb, var(--accent) 78%, var(--text)); }
+
+.person-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* On a card the avatar trails the title, pinned to the right edge — the title
+   keeps the whole line and the avatar never pushes it. Absent when unowned, so
+   nothing reserves space for it either. */
+.kcard-title-row .card-avatar { margin-left: auto; align-self: center; }
+
+/* ── Owner property row ───────────────────────────────────────────────────── */
+.owner-v { position: relative; }
+.issue-fields .owner-pill { padding-left: 3px; gap: 5px; }
+.issue-fields .owner-pill .owner-open {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 0; border: 0; background: none; color: inherit;
+  font: inherit; cursor: pointer;
+}
+/* The unassigned placeholder is itself the assign control — dim at rest so an
+   ownerless card doesn't shout, but a real button with a real hover. */
+.owner-empty {
+  padding: 1px 7px; border: 1px dashed var(--line-2); border-radius: 7px;
+  background: none; color: var(--text-mute);
+  font: inherit; font-size: 13px; cursor: pointer;
+}
+.owner-empty:hover { color: var(--text-dim); border-color: var(--text-mute); }
+.owner-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  margin: 0;
+  padding: 4px;
+  min-width: 180px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--bg-term);
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+.owner-pick {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 7px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.owner-pick:hover { background: var(--bg-1); color: var(--text); }
+.owner-pick.is-current { color: var(--text); font-weight: 600; }
+.owner-pick--clear { color: var(--text-mute); border-top: 1px solid var(--line); border-radius: 0 0 6px 6px; margin-top: 2px; padding-top: 6px; }
+.owner-menu-empty { padding: 5px 7px; font-size: 13px; }
+
+/* ── Sidebar profile ──────────────────────────────────────────────────────── */
+.profile-card { position: relative; display: flex; align-items: center; gap: 6px; }
+.profile-trigger {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 6px 4px 4px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: none;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.profile-trigger:hover { background: var(--bg-1); color: var(--text); }
+.profile-pop {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  z-index: 40;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-term);
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+/* The picture IS the upload control — click your face to change it, with the
+   hint riding under it rather than a separate "choose file" button. */
+.profile-pop-avatar {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-mute);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.profile-pop-avatar:hover { color: var(--text); }
+.profile-pop-avatar:disabled { cursor: progress; }
+.profile-file { display: none; }
+.profile-name-input {
+  width: 100%;
+  padding: 4px 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  background: var(--bg-1);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: center;
+}
+.profile-name-input:focus { outline: none; border-color: var(--accent); }
+.profile-pop-email { font-size: 11px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.profile-pop-remove {
+  border: 0; background: none; color: var(--text-mute);
+  font: inherit; font-size: 11px; cursor: pointer; padding: 0;
+}
+.profile-pop-remove:hover { color: var(--bad); }
+.profile-pop-err { font-size: 11px; color: var(--bad); text-align: center; }

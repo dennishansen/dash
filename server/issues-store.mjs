@@ -23,65 +23,24 @@
 // key (DASH_SUPABASE_SERVICE_KEY) which bypasses RLS. A bare anon key
 // reads/writes nothing. This is what makes the board safe to serve publicly.
 
-// Exported so the browser realtime client (src/realtime.js) opens its websocket
-// against the SAME project + key — one source of truth for where `issues` lives.
-import { SUPABASE_URL, SUPABASE_ANON, SUPABASE_SERVICE } from './dash-config.mjs';
+// WHERE the project lives and WHO we are when we talk to it belong to
+// supabase.mjs — the shared PostgREST helpers (rest/restUrl/RPC) and the one
+// auth token that auth.js updates on sign-in, so a signed-in user's JWT reaches
+// EVERY store (issues, profiles, storage), not just this one. This module only
+// knows about issues.
+import { rest, restUrl, RPC } from './supabase.mjs';
 
-export const URL = SUPABASE_URL;
-export const ANON = SUPABASE_ANON;
 // The board's table. A single fixed table here (no test-isolation split) — the
 // browser's realtime subscription (realtime.js) and this store must name the same one.
 export const TABLE = 'issues';
 
-const REST = `${URL}/rest/v1/${TABLE}`;
-const RPC = `${URL}/rest/v1/rpc`;
-
-// PostgREST wants two things: `apikey` (the public project key, always ANON —
-// it only identifies the project) and `Authorization: Bearer <jwt>` (the
-// identity RLS evaluates). The bearer token varies by caller:
-//   - node tools (dev middleware, CLI): the service key when set — it bypasses
-//     RLS, so the kanban keeps working server-side under the tightened RLS.
-//     Falls back to ANON if no service key.
-//   - browser: ANON until a user signs in, then their access token (pushed via
-//     setAuthToken from auth.js). The anon key alone can't write once RLS is
-//     locked to authenticated + allow-listed emails — that's the whole point.
-const SERVICE = SUPABASE_SERVICE;
-let authToken = SERVICE || ANON;
-
-// Swap the bearer token (browser sign-in / sign-out). null restores the default.
-export function setAuthToken(token) {
-  authToken = token || SERVICE || ANON;
-}
-
-function headers(prefer) {
-  const h = {
-    apikey: ANON,
-    Authorization: `Bearer ${authToken}`,
-    'Content-Type': 'application/json',
-  };
-  if (prefer) h.Prefer = prefer;
-  return h;
-}
+const REST = restUrl(TABLE);
 
 export const VALID_STATUS = new Set(['maybe', 'future', 'next', 'in-progress', 'done', 'rejected']);
 
 // Columns the list endpoint needs — everything but `body` (kept off the list
 // path so it stays cheap as the corpus grows past hundreds). Detail fetches `*`.
-const LIST_COLS = 'id,title,tags,branches,sessions,commits,conversations,status,rank,owner,created,updated_at,closed_at,port';
-
-async function rest(url, method, query, body, prefer) {
-  const res = await fetch(`${url}${query}`, {
-    method,
-    headers: headers(prefer),
-    body: body == null ? undefined : JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    throw new Error(`issues-store ${method} ${query} → ${res.status} ${detail}`);
-  }
-  const text = await res.text();
-  return text ? JSON.parse(text) : null;
-}
+const LIST_COLS = 'id,title,tags,branches,sessions,commits,conversations,status,rank,owner,created,updated_at,closed_at,port,chat_names';
 
 const enc = encodeURIComponent;
 
@@ -169,6 +128,31 @@ export async function setStatus(id, status) {
 export async function setOwner(id, owner) {
   await update(id, { owner: owner || null });
   return { ok: true, id, owner: owner || null };
+}
+
+// Name (or un-name) one of the issue's chats. `chat_names` is a JSONB map that
+// rides beside `conversations[]`, keyed by the FULL session uuid — the 8-char
+// form the UI shows is a display truncation, not an identity, and two chats
+// could collide on it. A blank name DELETES the key rather than storing '', so
+// "cleared" and "never named" are the same state and the label falls back to the
+// derived default. Read-modify-write on one column.
+export async function setChatName(id, sessionId, name) {
+  if (!id || !sessionId) return { error: 'setChatName requires id and sessionId' };
+  const row = await get(id);
+  if (!row) return { error: `no issue "${id}"` };
+  const names = { ...readChatNames(row) };
+  const clean = typeof name === 'string' ? name.trim() : '';
+  if (clean) names[sessionId] = clean;
+  else delete names[sessionId];
+  await update(id, { chat_names: names });
+  return { ok: true, id, chat_names: names };
+}
+
+// The row's chat-name map, defended against a null/array/legacy value — every
+// reader (shape, store, terminal) goes through this so "no names" is always {}.
+export function readChatNames(row) {
+  const m = row && row.chat_names;
+  return m && typeof m === 'object' && !Array.isArray(m) ? m : {};
 }
 
 // Reorder one column: `ids` is the column's final ordering; rank becomes the
