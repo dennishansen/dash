@@ -31,6 +31,27 @@ function git(args) {
   } catch { return ''; }
 }
 
+// One git config value via the git() helper above (spawnSync, no shell — the key
+// is a fixed literal, so there's nothing to inject). Returns null when unset or
+// git is unavailable.
+function gitConfig(key) {
+  return git(['config', key]).trim() || null;
+}
+
+// Seed a person's display name from git, once. Only ever fills an EMPTY name —
+// never clobbers one the person set by hand — and the profile table's foreign
+// key to the allow-list means a non-teammate email simply can't get a row (the
+// upsert throws, caught here). So this is a no-op for anyone but an allow-listed
+// teammate who hasn't named themselves yet.
+async function seedProfileName(email, name) {
+  try {
+    const { get, upsert } = await import('./profiles-store.mjs');
+    const row = await get(email);
+    if (row?.display_name) return;
+    await upsert(email, { display_name: name.trim() });
+  } catch { /* not a teammate, or the roster is unreachable — the session still works */ }
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -119,9 +140,24 @@ export function dashApi() {
       if (req.method === 'GET' && segs[0] === 'dev-session') {
         const key = process.env.DASH_SUPABASE_SERVICE_KEY;
         if (!key) return send({ error: 'no service key in env' }, 404);
+        // WHO is at this machine? The local git identity — already set on every
+        // dev's box (you can't commit without it), so a teammate's own profile
+        // renders locally with zero config and no login prompt, on every worktree
+        // port. It is the SAME account as signing in with that email the normal
+        // way: both key on the lowercased email, so the profile, avatars, and
+        // owner assignments are identical — only the token differs (service key
+        // here, the user's JWT there). DASH_DEV_EMAIL overrides a git email that
+        // isn't the allow-listed one; dev@localhost is the last resort when git
+        // has no email configured at all.
+        const gitEmail = gitConfig('user.email');
+        const email = (process.env.DASH_DEV_EMAIL || gitEmail || 'dev@localhost').trim().toLowerCase();
+        // Populate the display name from git too, so names fill in without anyone
+        // opening their profile — same zero-config source as the email.
+        const name = gitConfig('user.name');
+        if (name) await seedProfileName(email, name);
         return send({
           access_token: key, refresh_token: 'dev', token_type: 'bearer',
-          expires_at: 4102444800, user: { email: process.env.DASH_DEV_EMAIL || 'dev@localhost' },
+          expires_at: 4102444800, user: { email },
         });
       }
       // Code browser: a read-only view of an issue worktree's files. `env` is the
