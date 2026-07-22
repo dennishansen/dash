@@ -43,6 +43,12 @@ create table if not exists public.issues (
   commits       text[] not null default '{}',     -- lab: linked commit shas
   conversations text[] not null default '{}',     -- linked chat/conversation ids
 
+  -- Dependency edges (issue-deps). Both are text[] lists of issue ids and are
+  -- INVERSES of each other: `A requires B` ⟺ `B unlocks A`. The invariant is
+  -- maintained server-side by set_dep (below), never written directly.
+  requires      text[] not null default '{}',     -- upstream: must land before this
+  unlocks       text[] not null default '{}',     -- downstream: this enables once it lands
+
   -- Per-chat display names, keyed by full session uuid (see setChatName in
   -- issues-store.mjs). A blank name deletes the key, so {} means "no names".
   chat_names    jsonb not null default '{}'::jsonb,
@@ -113,6 +119,61 @@ begin
    where i.id = idx.id;
 end;
 $$;
+
+-- ---------------------------------------------------------------------------
+-- set_dep(p_up, p_down, p_add) — add/remove ONE dependency edge, maintaining
+-- the inverse in the same transaction.
+-- ---------------------------------------------------------------------------
+-- Called from issues-store.setDep as rpc/set_dep. The edge is directed
+-- upstream→downstream: `p_up unlocks p_down` and equivalently `p_down requires
+-- p_up`. The caller maps its verb to a direction (requires <id> <dep> → edge
+-- dep→id; unlocks <id> <dep> → edge id→dep), so this function never branches on
+-- which list — it always appends p_down to the up-row's `unlocks` and p_up to
+-- the down-row's `requires`. Appends are de-duped; removal strips both sides. A
+-- dangling p_down (no such row) simply no-ops the requires-side update — the
+-- unlocks side still records it, so the id shows faintly rather than crashing.
+-- Self-reference is refused. `p_table` exists for forward-compat; only the
+-- board's `issues` table is served here.
+create or replace function public.set_dep(
+  p_up text, p_down text, p_add boolean, p_table text default 'issues'
+) returns void language plpgsql as $$
+begin
+  if p_up = p_down then
+    raise exception 'set_dep: self-reference (%)', p_up;
+  end if;
+  if p_table <> 'issues' then
+    raise exception 'set_dep: unknown table %', p_table;
+  end if;
+  if p_add then
+    update public.issues set unlocks  = (case when p_down = any(unlocks)  then unlocks  else array_append(unlocks,  p_down) end) where id = p_up;
+    update public.issues set requires = (case when p_up   = any(requires) then requires else array_append(requires, p_up)   end) where id = p_down;
+  else
+    update public.issues set unlocks  = array_remove(unlocks,  p_down) where id = p_up;
+    update public.issues set requires = array_remove(requires, p_up)   where id = p_down;
+  end if;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- prune_issue_deps — strip a deleted issue's id from every survivor's lists.
+-- ---------------------------------------------------------------------------
+-- Deleting an issue must remove its id from every other issue's requires/unlocks
+-- or the survivors point at a ghost. A BEFORE DELETE trigger guarantees this on
+-- EVERY delete path (UI double-opt-in, board.mjs rm, direct SQL), mirroring the
+-- issues_updated_at trigger already on the table.
+create or replace function public.prune_issue_deps() returns trigger language plpgsql as $$
+begin
+  update public.issues
+     set requires = array_remove(requires, old.id),
+         unlocks  = array_remove(unlocks,  old.id)
+   where old.id = any(requires) or old.id = any(unlocks);
+  return old;
+end;
+$$;
+
+drop trigger if exists trg_issue_prune_deps on public.issues;
+create trigger trg_issue_prune_deps before delete on public.issues
+  for each row execute function public.prune_issue_deps();
 
 -- ---------------------------------------------------------------------------
 -- dash_allowed_emails — the sign-in allow-list.

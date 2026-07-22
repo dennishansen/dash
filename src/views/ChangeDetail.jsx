@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { Link, useParams, useNavigate, useLocation } from 'react-router-dom';
 import { useAsync, useIssuesRealtime, fmtDate } from '../api.js';
-import { changeDetail, renameChange, updateChangeField, setChangeStatus, deleteChange, listChanges } from '../board-store.js';
+import { changeDetail, renameChange, updateChangeField, setChangeStatus, setChangeDep, deleteChange, listChanges } from '../board-store.js';
 import { BUCKETS } from './ChangesBoard.jsx';
 import { useLocalBackend } from '../capabilities.js';
 import { useSelection, useIssueNav } from '../selection.jsx';
@@ -195,6 +195,39 @@ function TagSelect({ id, tags, allTags, onChanged }) {
     <ChipMultiSelect selected={selected} options={options} onToggle={toggle} onCreate={toggle}
       triggerTitle="Edit tags" searchPlaceholder="Search or create…"
       emptyHint="no tags yet" />
+  );
+}
+
+// Requires/unlocks configured on the shared shell: chips read as issue TITLES
+// (from `known`, with the id as a dangling fallback), each with an external-link
+// out; the add-vocabulary is every other issue by title (no free-text create).
+// The mutation is setChangeDep, which maintains the INVERSE edge on the other
+// issue's row — dropping a `requires` drops the matching `unlocks` there — then
+// re-fetches so both chip rows repaint.
+function DepSelect({ id, field, list, known, onChanged }) {
+  const toggle = async (dep) => {
+    if (!dep || dep === id) return;
+    const has = list.includes(dep);
+    const r = await setChangeDep(id, field, dep, !has);
+    if (!(r && r.error)) onChanged?.();
+  };
+  const selected = list.map(dep => {
+    const meta = known.get(dep);
+    return {
+      key: dep,
+      label: meta ? (meta.title || dep) : dep,
+      className: meta ? 'deps-chip' : 'deps-chip deps-chip--dangling',
+      to: `/changes/${encodeURIComponent(dep)}`,
+    };
+  });
+  const options = [...known.values()]
+    .filter(r => r.id !== id)
+    .map(r => ({ key: r.id, label: r.title || r.id }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+  return (
+    <ChipMultiSelect selected={selected} options={options} onToggle={toggle}
+      triggerTitle={`Edit ${field}`} searchPlaceholder="Search issues…"
+      emptyHint="no other issues" />
   );
 }
 
@@ -558,6 +591,10 @@ export function ChangeDetail() {
   // Shares the board's 'changes' cache key, so it's already warm.
   const { data: allIssues } = useAsync('changes', listChanges);
   const allTags = useMemo(() => [...new Set((allIssues || []).flatMap(r => r.tags || []))].sort(), [allIssues]);
+  // Known issues for the deps panel: id→row, powering the requires/unlocks chip
+  // titles, typeahead options, and dangling detection. Shares the same 'changes'
+  // cache as allTags — one cheap list fetch (no bodies).
+  const known = useMemo(() => new Map((allIssues || []).map(r => [r.id, r])), [allIssues]);
   // Live updates everywhere: any issue row change arrives over the browser-side
   // Supabase Realtime subscription the board uses (realtime.js), so convos /
   // branches refresh without a poll wait — local and remote alike.
@@ -610,6 +647,15 @@ export function ChangeDetail() {
                 <PropCell label="status"><StatusPill id={data.id} status={status} onChanged={refresh} /></PropCell>
                 <PropCell label="owner"><OwnerAvatar id={data.id} owner={data.owner} /></PropCell>
                 <PropCell label="tags"><TagSelect id={data.id} tags={data.tags || []} allTags={allTags} onChanged={refresh} /></PropCell>
+                {/* Dependencies join the bar as title-chips — but only when
+                    populated. Empty requires/unlocks render nothing (no bare
+                    adder), so the bar stays quiet until an edge actually exists. */}
+                {(data.requires || []).length ? (
+                  <PropCell label="requires"><DepSelect id={data.id} field="requires" list={data.requires} known={known} onChanged={refresh} /></PropCell>
+                ) : null}
+                {(data.unlocks || []).length ? (
+                  <PropCell label="unlocks"><DepSelect id={data.id} field="unlocks" list={data.unlocks} known={known} onChanged={refresh} /></PropCell>
+                ) : null}
               </>
             ) : (
               <>

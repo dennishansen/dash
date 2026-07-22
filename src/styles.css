@@ -4213,3 +4213,9 @@ img.zoomable {
    is untouched. */
 .chip-menu { max-width: 260px; }
 .chip-menu .filter-opt-label { min-width: 0; }
+
+/* Dependency chips (requires / unlocks) share the field-pill shape with tags. A
+   dangling dep (an id with no matching issue row) reads faintly but stays
+   clickable — tolerate references to not-yet-created / deleted issues rather
+   than hiding or crashing. */
+.deps-chip.deps-chip--dangling { opacity: 0.5; font-style: italic; }

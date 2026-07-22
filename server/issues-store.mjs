@@ -40,7 +40,7 @@ export const VALID_STATUS = new Set(['maybe', 'future', 'next', 'in-progress', '
 
 // Columns the list endpoint needs — everything but `body` (kept off the list
 // path so it stays cheap as the corpus grows past hundreds). Detail fetches `*`.
-const LIST_COLS = 'id,title,tags,branches,sessions,commits,conversations,status,rank,owner,created,updated_at,closed_at,port,chat_names,selected_session';
+const LIST_COLS = 'id,title,tags,branches,sessions,commits,conversations,requires,unlocks,status,rank,owner,created,updated_at,closed_at,port,chat_names,selected_session';
 
 const enc = encodeURIComponent;
 
@@ -128,6 +128,25 @@ export async function setStatus(id, status) {
 export async function setOwner(id, owner) {
   await update(id, { owner: owner || null });
   return { ok: true, id, owner: owner || null };
+}
+
+// Add or remove dependency edges on an issue, maintaining the INVERSE on the
+// other issue's row. `field` is 'requires' | 'unlocks'; the set_dep RPC touches
+// both rows in one transaction (a client read-modify-write could half-apply and
+// leave the two sides disagreeing). The edge is directed upstream→downstream, so
+// `requires` maps to dep→id and `unlocks` to id→dep. `add` false removes.
+// Dangling deps are tolerated — the RPC no-ops the missing row's side, leaving
+// the id in `id`'s own list to render faintly. Self-reference is refused.
+export async function setDep(id, field, deps, add) {
+  if (!['requires', 'unlocks'].includes(field)) return { error: `setDep: bad field "${field}"` };
+  if (!(await exists(id))) return { error: `no issue "${id}"` };
+  const list = [...new Set([].concat(deps).filter(Boolean))];
+  if (list.includes(id)) return { error: `an issue can't depend on itself (${id})` };
+  for (const dep of list) {
+    const [up, down] = field === 'requires' ? [dep, id] : [id, dep];
+    await rest(RPC, 'POST', '/set_dep', { p_up: up, p_down: down, p_add: add, p_table: TABLE }, 'return=minimal');
+  }
+  return { ok: true, id };
 }
 
 // Name (or un-name) one of the issue's chats. `chat_names` is a JSONB map that

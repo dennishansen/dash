@@ -13,7 +13,7 @@
 // is likewise local-only (see capabilities.js).
 
 import {
-  listAll, listBodies as listBodiesStore, get, create, update, setRanks, moveColumn, setStatus, remove, VALID_STATUS,
+  listAll, listBodies as listBodiesStore, get, create, update, setRanks, moveColumn, setStatus, setDep, remove, VALID_STATUS,
 } from '../server/issues-store.mjs';
 import { shapeRow } from '../server/issues-shape.mjs';
 
@@ -83,6 +83,13 @@ export async function renameChange(id, title) {
 // view computes the next array value and writes it; we just forward to update.
 export async function updateChangeField(id, field, value) {
   return update(id, { [field]: value });
+}
+
+// Add or remove one dependency edge (requires/unlocks) on an issue. The store's
+// setDep maintains the inverse edge on the other issue's row in one RPC — the
+// detail view flips membership and re-fetches to repaint both chip rows.
+export async function setChangeDep(id, field, dep, add) {
+  return setDep(id, field, [dep], add);
 }
 
 // Permanently delete an issue (the detail view's double-opt-in delete). Drops
