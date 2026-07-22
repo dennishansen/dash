@@ -25,6 +25,7 @@ import os from 'node:os';
 import { listAll, reservedPorts } from './issues-store.mjs';
 import { parseHandle } from './agents.mjs';
 import { selectedChats } from './profiles-store.mjs';
+import { freePort } from './ports.mjs';
 
 const pExec = promisify(execFile);
 export const IDLE_MINUTES = 20;
@@ -226,6 +227,33 @@ async function report() {
   if (reapS.length) console.log(`would free ports: ${reapS.map((s) => s.port).join(' ')}`);
 }
 
+// --- execute: actually stop the reap candidates -----------------------------
+// Chats: SIGTERM the agent process — its transcript is on disk, so it cold-
+// resumes later, and the dash notices the pty exit and cleans its own registry.
+// Dev servers: freePort tears down the listener and clears the issue's port
+// reservation; an orphan with no issue is killed by pid. Idempotent — an
+// already-gone target just no-ops.
+export async function reap() {
+  const [chats, servers] = await Promise.all([pruneCandidates(), devServerCandidates()]);
+  const chatKills = chats.filter((c) => c.reap);
+  const serverKills = servers.filter((s) => s.reap);
+  for (const c of chatKills) {
+    try { process.kill(c.pid, 'SIGTERM'); console.log(`stopped chat ${c.sessionId.slice(0, 8)} (pid ${c.pid})`); }
+    catch (e) { console.log(`chat ${c.pid} — ${e.message}`); }
+  }
+  for (const s of serverKills) {
+    if (s.issue) {
+      const r = await freePort(s.issue);
+      console.log(r.error ? `server ${s.issue} — ${r.error}` : `freed port ${s.port} (${s.issue})`);
+    } else {
+      try { process.kill(s.pid, 'SIGTERM'); console.log(`killed orphan server on ${s.port} (pid ${s.pid})`); }
+      catch (e) { console.log(`orphan ${s.port} — ${e.message}`); }
+    }
+  }
+  console.log(`\nreaped ${chatKills.length} chat(s) + ${serverKills.length} dev server(s)`);
+}
+
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  report().catch((e) => { console.error(e); process.exit(1); });
+  const run = process.argv.includes('--reap') ? reap : report;
+  run().catch((e) => { console.error(e); process.exit(1); });
 }

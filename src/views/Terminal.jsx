@@ -520,7 +520,7 @@ function ChatPane({ issueId, sessionId, mode, active, onSession, agent }) {
 // unnamed chat has to go on. "(unavailable)" is a suffix on both: it reports
 // liveness, not identity, so naming a chat never hides that it can't resume.
 function chatDefaultLabel(c, i) {
-  return `chat ${i + 1} · ${c.sessionId.slice(0, 8)}`;
+  return `chat ${i + 1}`;
 }
 function chatLabel(c, i) {
   return `${c.name || chatDefaultLabel(c, i)}${c.resumable ? '' : ' (unavailable)'}`;

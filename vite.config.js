@@ -102,6 +102,16 @@ export default {
         // SPA fallback so /api/dash wins.
         server.middlewares.use(dashApi());
 
+        // House-keeping: in the MAIN checkout only (not worktree dashes), reap
+        // idle chats + stale dev servers on a slow interval so running this
+        // project needs no cron/setup. One sweeper per machine — and the main
+        // dash's port sits outside the reaped 5200-5299 range, so it can never
+        // kill its own server.
+        if (!process.cwd().includes('/.claude/worktrees/')) {
+          const { startReaperSweep } = await import('./server/reaper-sweep.mjs');
+          startReaperSweep();
+        }
+
         // Terminal sidecar WS: one socket per chat, carrying a real PTY. Upgrade
         // only /api/dash/terminal so it doesn't clobber Vite's HMR socket.
         if (attachChat && server.httpServer) {

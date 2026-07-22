@@ -9,8 +9,9 @@ import { useActivity } from '../activity-store.js';
 import { Markdown } from './Markdown.jsx';
 import { CopyButton } from './CopyButton.jsx';
 import { useChatControl } from '../chat-control.jsx';
-import { X, Pencil, Trash, User } from '../icons.jsx';
+import { X, Pencil, Trash, User, ArrowUpRight } from '../icons.jsx';
 import { Avatar, usePeople, useDismiss, normalizeEmail } from '../profiles.jsx';
+import { OptionMenu } from '../OptionMenu.jsx';
 
 // Inline-editable issue title. Looks like the static <h2> (CSS .title-edit),
 // gaining a box outline only on hover / focus. Enter or blur saves via
@@ -71,18 +72,37 @@ function EditableTitle({ id, title, onSaved, autoFocus }) {
   );
 }
 
-// A tag pill that reveals a remove-X on its right on hover (over a gradient
-// fade matching the pill fill). Clicking removes the tag immediately — tags are
-// a cheap, single-click-curated list, so no confirm.
-// Tags as a Notion-style multiselect. The value ITSELF is the trigger: the tag
-// pills (or an "Empty" placeholder when there are none) are clickable and open
-// the editor — no per-pill remove-X, no "+"/"+N" buttons. Inside, the dropdown
-// lists the CHECKED tags first, then every other tag below, each a checkbox row
-// you toggle in place — so you see the whole set and add/remove by clicking. A
-// search box filters and, since issue tags are free text, offers "Create <tag>"
-// for a query that matches nothing. Built on the owner-picker chrome (.owner-menu
-// / .owner-pick).
-function TagMultiSelect({ id, tags, allTags, onChanged }) {
+// One chip inside a ChipMultiSelect trigger. A plain display pill (the trigger
+// wrapper owns the click that opens the editor). When the chip carries a `to` it
+// also gets a hover/focus-reveal external-link glyph (the .field-pill--reveal
+// pattern) that navigates straight to that target; stopPropagation keeps that
+// click from also toggling the menu. Long labels truncate. (OSS uses this only
+// for tags today — tags carry no `to` — but it stays generic to match private.)
+function Chip({ label, className = '', to }) {
+  const body = <span className="chip-label">{label}</span>;
+  if (!to) return <span className={`field-pill ${className}`}>{body}</span>;
+  return (
+    <span className={`field-pill field-pill--reveal ${className}`}>
+      {body}
+      <Link className="pill-reveal" to={to} title={`Open ${label}`}
+        aria-label={`Open ${label}`} onClick={e => e.stopPropagation()}>
+        <ArrowUpRight size={12} />
+      </Link>
+    </span>
+  );
+}
+
+// The shared chip-multiselect shell. The value ITSELF is the trigger: the chips
+// (or an "Empty" placeholder) are clickable and open the editor. The dropdown IS
+// the shared OptionMenu (the same popover the board filters use): a search/create
+// header, then the whole vocabulary as a checklist with the SELECTED members
+// floated to the top. When `onCreate` is supplied (free-text tags) a "Create
+// <query>" row appears for a query that matches nothing.
+//
+//   selected: [{ key, label, className?, to? }]  the chips currently on
+//   options:  [{ key, label }]                   the add-vocabulary (selected filtered out)
+//   onToggle(key)   flip membership       onCreate(query)?  add a brand-new member
+function ChipMultiSelect({ selected, options, onToggle, onCreate, triggerTitle, emptyLabel = 'Empty', searchPlaceholder = 'Search…', emptyHint }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState('');
   const inputRef = useRef(null);
@@ -90,7 +110,7 @@ function TagMultiSelect({ id, tags, allTags, onChanged }) {
   const wrapRef = useDismiss(open, close);
   // Capture phase + stopPropagation so Escape closes the menu WITHOUT also
   // reaching the detail view's "Escape → back to board" listener — the same
-  // pattern StatusPill / OwnerAvatar use.
+  // pattern StatusPill / OwnerAvatar use (OSS ChangeDetail avoids useHotkey here).
   useEffect(() => {
     if (!open) return;
     const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
@@ -99,6 +119,69 @@ function TagMultiSelect({ id, tags, allTags, onChanged }) {
   }, [open]);
   useEffect(() => { if (open) inputRef.current?.focus(); }, [open]);
 
+  const VISIBLE = 2; // chips shown inline before collapsing the rest into "+N"
+  const query = q.trim();
+  const match = (label) => label.toLowerCase().includes(query.toLowerCase());
+  const selectedKeys = new Set(selected.map(s => s.key));
+  // Selected first, then the rest of the vocabulary, both filtered by the query —
+  // one flat OptionMenu list (checks distinguish the selected, which float to top).
+  const checked = query ? selected.filter(s => match(s.label)) : selected;
+  const rest = (options || []).filter(o => !selectedKeys.has(o.key) && (!query || match(o.label)));
+  const menuOptions = [...checked, ...rest].map(o => ({ value: o.key, label: o.label }));
+  const canCreate = !!onCreate && !!query
+    && ![...(options || []), ...selected].some(o => o.label.toLowerCase() === query.toLowerCase());
+  const commitFirst = () => {
+    if (rest[0]) { onToggle(rest[0].key); setQ(''); }
+    else if (canCreate) { onCreate(query); setQ(''); }
+  };
+
+  return (
+    <span className="chip-select" ref={wrapRef}>
+      {/* role=button (not <button>) so a chip can legally nest its reveal <Link>.
+          Enter/Space open; the whole value is one click target. */}
+      <div className="chip-trigger" role="button" tabIndex={0} title={triggerTitle}
+        aria-haspopup="listbox" aria-expanded={open}
+        onClick={() => setOpen(o => !o)}
+        onKeyDown={e => { if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) { e.preventDefault(); setOpen(o => !o); } }}>
+        {selected.length ? (
+          <>
+            {selected.slice(0, VISIBLE).map(s => <Chip key={s.key} {...s} />)}
+            {selected.length > VISIBLE ? <span className="chip-overflow">+{selected.length - VISIBLE}</span> : null}
+          </>
+        ) : <span className="chip-empty">{emptyLabel}</span>}
+      </div>
+      {open ? (
+        <OptionMenu
+          className="chip-menu"
+          options={menuOptions}
+          selected={selectedKeys}
+          onToggle={onToggle}
+          header={
+            <input ref={inputRef} className="chip-search" value={q} spellCheck={false}
+              placeholder={searchPlaceholder} aria-label={searchPlaceholder}
+              onChange={e => setQ(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') { e.preventDefault(); commitFirst(); }
+                else if (e.key === 'Escape') { e.preventDefault(); close(); }
+              }} />
+          }
+          footer={
+            canCreate ? (
+              <button type="button" className="owner-pick chip-create"
+                onClick={() => { onCreate(query); setQ(''); }}>
+                Create “{query}”
+              </button>
+            ) : (!menuOptions.length ? <div className="filter-menu-note dim">{emptyHint}</div> : null)
+          } />
+      ) : null}
+    </span>
+  );
+}
+
+// Tags configured on the shared shell: free-text labels over the board's tag
+// vocabulary, create-on-miss, no external link. The mutation is updateChangeField
+// (then onChanged refreshes the detail, matching OSS's other field writers).
+function TagSelect({ id, tags, allTags, onChanged }) {
   const toggle = async (t) => {
     const tag = t.trim();
     if (!tag) return;
@@ -106,65 +189,12 @@ function TagMultiSelect({ id, tags, allTags, onChanged }) {
     const r = await updateChangeField(id, 'tags', next);
     if (!(r && r.error)) onChanged?.();
   };
-  const VISIBLE = 2; // pills shown inline before collapsing the rest into "+N"
-  const query = q.trim();
-  const match = (t) => t.toLowerCase().includes(query.toLowerCase());
-  // Checked first, then the rest — the whole vocabulary, so you can see and flip any.
-  const checked = (query ? tags.filter(match) : tags);
-  const rest = (allTags || []).filter(t => !tags.includes(t) && (!query || match(t)));
-  const canCreate = !!query && ![...(allTags || []), ...tags].some(t => t.toLowerCase() === query.toLowerCase());
-  const commitFirst = () => {
-    if (checked[0] && !rest.length && !canCreate) return; // nothing new to do
-    if (rest[0]) { toggle(rest[0]); setQ(''); }
-    else if (canCreate) { toggle(query); setQ(''); }
-  };
-
-  const Option = (t) => (
-    <li key={t}>
-      <button type="button" className={`owner-pick${tags.includes(t) ? ' is-current' : ''}`}
-        role="option" aria-selected={tags.includes(t)} onClick={() => toggle(t)}>
-        <span className="tag-check">{tags.includes(t) ? '✓' : ''}</span>
-        <span className="tag-opt-label">{t}</span>
-      </button>
-    </li>
-  );
-
+  const selected = tags.map(t => ({ key: t, label: t, className: 'field-pill--tag' }));
+  const options = (allTags || []).map(t => ({ key: t, label: t }));
   return (
-    <span className="tag-select" ref={wrapRef}>
-      <button type="button" className="tag-trigger" title="Edit tags"
-        aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen(o => !o)}>
-        {tags.length ? (
-          <>
-            {tags.slice(0, VISIBLE).map(t => <span key={t} className="field-pill field-pill--tag">{t}</span>)}
-            {tags.length > VISIBLE ? <span className="tag-overflow">+{tags.length - VISIBLE}</span> : null}
-          </>
-        ) : <span className="tag-empty">Empty</span>}
-      </button>
-      {open ? (
-        <div className="owner-menu tag-menu" role="dialog" aria-label="Edit tags">
-          <input ref={inputRef} className="tag-menu-search" value={q} spellCheck={false}
-            placeholder="Search or create…" aria-label="Search or create a tag"
-            onChange={e => setQ(e.target.value)}
-            onKeyDown={e => {
-              if (e.key === 'Enter') { e.preventDefault(); commitFirst(); }
-              else if (e.key === 'Escape') { e.preventDefault(); close(); }
-            }} />
-          <ul role="listbox" aria-multiselectable="true">
-            {checked.map(Option)}
-            {checked.length && rest.length ? <li className="tag-menu-sep" aria-hidden="true" /> : null}
-            {rest.map(Option)}
-            {canCreate ? (
-              <li>
-                <button type="button" className="owner-pick tag-create" onClick={() => { toggle(query); setQ(''); }}>
-                  Create “{query}”
-                </button>
-              </li>
-            ) : null}
-            {!checked.length && !rest.length && !canCreate ? <li className="owner-menu-empty dim">no tags yet</li> : null}
-          </ul>
-        </div>
-      ) : null}
-    </span>
+    <ChipMultiSelect selected={selected} options={options} onToggle={toggle} onCreate={toggle}
+      triggerTitle="Edit tags" searchPlaceholder="Search or create…"
+      emptyHint="no tags yet" />
   );
 }
 
@@ -302,7 +332,7 @@ function MetaRow({ label, iso }) {
 }
 
 // The properties BELOW the top bar. Status, owner and tags live up in the bar
-// (StatusPill / OwnerAvatar / TagMultiSelect); the read-only worktree/chat
+// (StatusPill / OwnerAvatar / TagSelect); the read-only worktree/chat
 // metadata lands here as one ordered list where each row's `policy` decides where
 // it renders:
 //   whenSet — a labelled row, but only once it holds a value (branch, commits,
@@ -579,7 +609,7 @@ export function ChangeDetail() {
               <>
                 <PropCell label="status"><StatusPill id={data.id} status={status} onChanged={refresh} /></PropCell>
                 <PropCell label="owner"><OwnerAvatar id={data.id} owner={data.owner} /></PropCell>
-                <PropCell label="tags"><TagMultiSelect id={data.id} tags={data.tags || []} allTags={allTags} onChanged={refresh} /></PropCell>
+                <PropCell label="tags"><TagSelect id={data.id} tags={data.tags || []} allTags={allTags} onChanged={refresh} /></PropCell>
               </>
             ) : (
               <>

@@ -4173,3 +4173,43 @@ img.zoomable {
 .owner-avatar.is-empty:hover { color: var(--text-dim); border-color: var(--text-mute); }
 /* Assigned = the person's photo/initial; a hover ring signals it's re-clickable. */
 .owner-avatar.is-set:hover { box-shadow: 0 0 0 2px var(--line-2); }
+
+/* --- Chip-multiselect refactor (tags rebuilt on the shared OptionMenu) + pill
+   radius unification + keyboard reveal. Supersedes the earlier .tag-select /
+   .tag-trigger / .tag-menu rules (now dead — the JSX emits .chip-* instead). --- */
+/* Status/bucket pills share the chip radius (7px, not the default pill 10px) so
+   the detail property bar and the board columns read consistently with the chips. */
+.pill.bucket-next, .pill.bucket-in-progress, .pill.bucket-future,
+.pill.bucket-maybe, .pill.bucket-done, .pill.bucket-rejected { border-radius: 7px; }
+/* Tags no longer bold — they match the one consistent property-select chip look;
+   the class stays as a semantic/test hook. Overrides the earlier bold rule. */
+.field-pill--tag { font-weight: normal; }
+/* Reveal the pill link on hover OR keyboard focus, so a keyboard user tabbing to
+   it sees it (and it stays clickable), not just on mouse hover. */
+.field-pill--reveal .pill-reveal:focus-visible { opacity: 1; pointer-events: auto; }
+.chip-select { position: relative; display: inline-flex; align-items: center; }
+.chip-trigger {
+  display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 2px 4px; margin: -2px -4px; /* chips stay put; the pad gives a hover target */
+  border: 0; background: none; cursor: pointer; border-radius: 7px;
+}
+.chip-trigger:hover { background: var(--bg-1); }
+.chip-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.chip-empty { color: var(--text-mute); font-size: 13px; }
+/* Issue titles get long — a chip's label truncates; the "+N" reads the rest. */
+.chip-label { display: block; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip-overflow { color: var(--text-mute); font-size: 12px; }
+/* The search/create input that heads every chip menu (OptionMenu `header`). */
+.chip-search {
+  width: 100%; margin-bottom: 6px; padding: 4px 7px;
+  border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg-1); color: var(--text); font: inherit; font-size: 13px;
+}
+.chip-search:focus { outline: none; border-color: var(--accent); }
+/* "Create <query>" — the OptionMenu `footer` row for free-text tags. */
+.chip-create { width: 100%; color: var(--text-dim); font-style: italic; }
+/* Cap the chip menu so a long option label ellipsis-truncates instead of blowing
+   the popover (and the page h-scroll) wide. Scoped so the board's own OptionMenu
+   is untouched. */
+.chip-menu { max-width: 260px; }
+.chip-menu .filter-opt-label { min-width: 0; }

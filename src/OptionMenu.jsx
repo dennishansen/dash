@@ -23,9 +23,9 @@ function CheckIcon() {
   );
 }
 
-export function OptionMenu({ options, selected, single, onToggle, renderOption, header, footer }) {
+export function OptionMenu({ options, selected, single, onToggle, renderOption, header, footer, className = '' }) {
   return (
-    <div className="owner-menu filter-menu">
+    <div className={`owner-menu filter-menu${className ? ` ${className}` : ''}`}>
       {header}
       <ul className="filter-optlist" role="listbox" aria-multiselectable={!single}>
         {options.map(o => {
