@@ -161,7 +161,25 @@ export function ChangesBoard({ visible = true }) {
   const [drag, setDrag] = useState(null);
   const bodyRefs = useRef({});   // colKey → column-body DOM node (for geometry)
   const didDragRef = useRef(false); // suppress the Link click that follows a drag
+  const kanbanRef = useRef(null); // the horizontal kanban scroller (for ⌘-wheel)
   useEffect(() => { setOverride({}); }, [data]);
+  // ⌘-wheel scrolls the wide kanban horizontally — the natural gesture when a
+  // mouse (or trackpad) only sends a vertical delta. Gated on there actually
+  // being horizontal overflow, so ⌘-wheel keeps its native browser zoom when the
+  // board already fits. Non-passive so preventDefault takes. Re-runs on `data` so
+  // it attaches once the board (and its scroller) has mounted.
+  useEffect(() => {
+    const el = kanbanRef.current;
+    if (!el) return undefined;
+    const onWheel = (e) => {
+      if (!e.metaKey || !e.deltaY) return;
+      if (el.scrollWidth <= el.clientWidth) return; // no horizontal overflow → leave ⌘-wheel to the browser
+      el.scrollLeft += e.deltaY;
+      e.preventDefault();
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [data]);
 
   const cols = useMemo(() => {
     const out = Object.fromEntries(BUCKETS.map(b => [b.key, []]));
@@ -519,7 +537,7 @@ export function ChangesBoard({ visible = true }) {
       {writeErr ? <div className="error" onClick={() => setWriteErr(null)} style={{ cursor: 'pointer' }}>{writeErr}</div> : null}
       {loading && !data ? <div className="spin">loading…</div> : null}
       {data ? (
-        <div className={`kanban kanban-5${drag ? ' is-dragging' : ''}`}>
+        <div ref={kanbanRef} className={`kanban kanban-5${drag ? ' is-dragging' : ''}`}>
           {BUCKETS.map(b => (
             <IssueColumn key={b.key} title={b.title} tone={b.tone}
               items={displayItems(b.key)} emptyMsg={`nothing ${b.title.toLowerCase()}`}

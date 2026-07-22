@@ -123,7 +123,7 @@ async function statusBySession() {
 // --- the checker ------------------------------------------------------------
 // Returns one row per live agent with all signals + a reap verdict. Pure read.
 export async function pruneCandidates({ idleMinutes = IDLE_MINUTES } = {}) {
-  const [agents, tree, statuses, selected] = await Promise.all([
+  const [agents, tree, statuses, mainSel] = await Promise.all([
     liveAgents(), processTree(), statusBySession(), selectedChats().then((s) => new Set(s)),
   ]);
   return agents.map((a) => {
@@ -132,7 +132,7 @@ export async function pruneCandidates({ idleMinutes = IDLE_MINUTES } = {}) {
     const inProgress = links.some((l) => l.status === 'in-progress');
     const busy = busyReason(a.pid, tree);
     const ownCpu = tree.byPid.get(a.pid)?.cpu ?? 0;
-    const viewed = selected.has(a.sessionId);
+    const viewed = mainSel.has(a.sessionId);
     const keepReasons = [];
     if (viewed) keepReasons.push('currently selected');
     if (idle == null) keepReasons.push('no transcript found');

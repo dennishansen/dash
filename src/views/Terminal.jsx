@@ -112,17 +112,6 @@ function ChatPane({ issueId, sessionId, mode, active, onSession, agent }) {
   // other chat must name one before it can connect.
   const isMain = issueId === 'main';
 
-  // Record THIS chat as my currently-selected one when its pane is on screen, so
-  // the idle reaper never stops a chat I have open — stored on my profile, so it
-  // holds across devices. One write per selection change; switching chats
-  // overwrites it, so only my current pick is ever protected.
-  useEffect(() => {
-    if (!active || !sessionId) return;
-    const email = userEmail();
-    if (!email) return;
-    setSelectedChat(email, sessionId).catch(() => {});
-  }, [active, sessionId]);
-
   useEffect(() => {
     if (!issueId || (!sessionId && !isMain) || !hostRef.current) return;
 
@@ -698,6 +687,16 @@ export function MainTerminal({ active }) {
   // The main chat connects without a session id — the PTY's `ready` names the
   // real one, surfaced here so the header can show a copyable address.
   const [sid, setSid] = useState(null);
+  // Mirror the open main chat to my profile so the idle reaper (a separate
+  // process) can see which main chat I have open and never stop it. Main chats
+  // are machine-local and have no board row, so the profile is the only signal;
+  // an issue's selection lives in its row's selected_session, which the reaper
+  // already reads, so issues need no per-user write.
+  useEffect(() => {
+    if (!active || !sid) return;
+    const email = userEmail();
+    if (email) setSelectedChat(email, sid).catch(() => {});
+  }, [active, sid]);
   return (
     <div className="issue-terminal-wrap">
       <div className="issue-terminal-bar">
