@@ -1,6 +1,7 @@
 import React from 'react';
 import { DockPanel } from './dock.jsx';
 import { useHotkey } from './hotkeys.js';
+import { hk, hkCaps } from './hotkey-registry.js';
 import { MAIN_ENV, appUrlForEnv, appPortForEnv, normalizeAppPath } from './app-env.mjs';
 import { Refresh, ChevronDown, ChevronLeft, ChevronRight, ArrowUpRight } from './icons.jsx';
 import { useChatStatus } from './api.js';
@@ -123,7 +124,7 @@ export function WorkspacePanel({ env, port, appPath = '/', reloadKey = 0, reload
   // directional chords (⌘←/→ steer focus, ⌘↑/↓ page issues). When focus is
   // INSIDE the app iframe (cross-origin) its keydowns can't reach us — the
   // toggle works when the dash chrome or terminal holds focus.
-  useHotkey('Mod+KeyE', () => selectView(view === 'app' ? 'code' : 'app'), { enabled: open, terminal: 'handle', repeat: false });
+  useHotkey(hk('appCode'), () => selectView(view === 'app' ? 'code' : 'app'), { enabled: open, terminal: 'handle', repeat: false });
 
   return (
     <DockPanel
@@ -137,9 +138,9 @@ export function WorkspacePanel({ env, port, appPath = '/', reloadKey = 0, reload
       <div className="app-bar workspace-bar">
         <div className="workspace-switch" role="tablist" aria-label="Workspace view">
           <button type="button" role="tab" data-view="app" aria-selected={view === 'app'} tabIndex={view === 'app' ? 0 : -1}
-            title="App view (⌘E)" aria-label="App view" className={view === 'app' ? 'is-selected' : ''} onClick={() => selectView('app')} onKeyDown={onViewKeyDown}><AppIcon /></button>
+            title={`App view (${hkCaps('appCode')})`} aria-label="App view" className={view === 'app' ? 'is-selected' : ''} onClick={() => selectView('app')} onKeyDown={onViewKeyDown}><AppIcon /></button>
           <button type="button" role="tab" data-view="code" aria-selected={view === 'code'} tabIndex={view === 'code' ? 0 : -1}
-            title="Code view (⌘E)" aria-label="Code view" className={view === 'code' ? 'is-selected' : ''} onClick={() => selectView('code')} onKeyDown={onViewKeyDown}><CodeIcon /></button>
+            title={`Code view (${hkCaps('appCode')})`} aria-label="Code view" className={view === 'code' ? 'is-selected' : ''} onClick={() => selectView('code')} onKeyDown={onViewKeyDown}><CodeIcon /></button>
         </div>
         {view === 'code' && chatStatus ? <LocBadge added={chatStatus.added} removed={chatStatus.removed} /> : null}
         {view === 'app' ? (

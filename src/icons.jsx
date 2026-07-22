@@ -114,6 +114,18 @@ export function Search({ size = 14 }) {
   );
 }
 
+// A keyboard — framed body with three rows of key dots and a spacebar. The
+// topbar opener for the keyboard-shortcuts overlay, sat beside the search icon.
+export function Keyboard({ size = 15 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="2" y="5.5" width="20" height="13" rx="2" />
+      <path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 12.5h.01M10 12.5h.01M14 12.5h.01M18 12.5h.01M8.5 15.5h7" />
+    </svg>
+  );
+}
+
 export function Pencil({ size = 14 }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" {...stroke} aria-hidden="true">

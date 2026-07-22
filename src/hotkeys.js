@@ -21,6 +21,10 @@ import { useEffect, useRef } from 'react';
 //     yields the key to the PTY. (So Ctrl+E / Ctrl+←→ stay readline's, not ours.)
 //   • real text fields (inputs, non-terminal textareas, contenteditable) always
 //     keep the key unless a hotkey opts in with `allowInInput`.
+//   • an open modal ([aria-modal="true"]) OWNS the keyboard: every hotkey yields
+//     while focus is inside it, so no command acts on the surface behind it and
+//     modals can't stack. Its own keys are local handlers on its focused element,
+//     not global hotkeys — there is no opt-in, "yield everything" IS the contract.
 //   • scoping — an `enabled` gate (panel open / board visible / route mounted).
 //
 // Invariant: at most one enabled binding per (combo, phase) — `stopPropagation`
@@ -77,14 +81,35 @@ function matches(e, spec) {
   return keyMatches(e, spec.key);
 }
 
+// Does keydown `e` match `combo`? Same parse + match logic `useHotkey` uses,
+// exposed for the few LOCAL onKeyDown handlers that own a single field's keys
+// (a modal's own Esc / a second opener) and so can't be global hotkeys — they
+// still source their combo from the registry via `matchesCombo(e, hk('id'))`
+// instead of hand-rolling `(e.metaKey||e.ctrlKey) && e.key==='Enter'`.
+export function matchesCombo(e, combo) {
+  return matches(e, parseCombo(combo));
+}
+
 // What kind of surface currently holds focus, for the focus rules:
 //   'terminal' — xterm's hidden helper textarea (a PTY surface, not a text field)
+//   'modal'    — focus is inside an open modal dialog ([aria-modal="true"]). A
+//               modal OWNS the keyboard: every hotkey yields to it, so no route /
+//               board / panel command acts on the surface behind it. The modal's
+//               own keys are LOCAL handlers on its focused element (the ⌘K palette
+//               and the ? overlay both work this way), never global hotkeys — so
+//               "yield everything" is the whole contract, no per-hotkey opt-in.
+//               Checked before 'input' so a modal that contains a text field (the
+//               palette's search box) still reads as a modal, not a plain field.
 //   'input'    — a real text field (input / textarea / select / contenteditable)
 //   'none'     — anything else (buttons, body, the board)
+// A popover that is NOT aria-modal (a status menu, the tag/owner pickers) is
+// deliberately not 'modal' — it owns only its own Escape (a capture-phase local
+// listener), while the rest of the keyboard still works behind it.
 export function focusedFieldKind(target) {
   const t = target;
   if (!t || t.nodeType !== 1) return 'none';
   if (t.classList && t.classList.contains('xterm-helper-textarea')) return 'terminal';
+  if (t.closest && t.closest('[aria-modal="true"]')) return 'modal';
   if (t.isContentEditable) return 'input';
   const tag = t.tagName;
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return 'input';
@@ -131,6 +156,7 @@ export function useHotkey(combo, handler, opts = {}) {
       if (!matches(e, spec)) return;
       if (when && !when(e)) return;                      // finer ownership gate
       const kind = focusedFieldKind(e.target);
+      if (kind === 'modal') return;                      // a modal owns the keyboard; its keys are local
       if (kind === 'input' && !allowInInput) return;     // real text field keeps the key
       if (kind === 'terminal' && terminal !== 'handle') return; // key belongs to the PTY
       if (handlerRef.current && handlerRef.current(e) === false) return; // handler declined

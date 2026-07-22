@@ -8,6 +8,7 @@ import { useSelection } from '../selection.jsx';
 import { columnCompare, archiveCompare, ARCHIVE_COLS } from '../board-sort.js';
 import { searchIssues } from '../issue-search.js';
 import { useHotkey } from '../hotkeys.js';
+import { hk } from '../hotkey-registry.js';
 import { Avatar, usePeople, useDismiss } from '../profiles.jsx';
 import { OptionMenu } from '../OptionMenu.jsx';
 import {
@@ -448,22 +449,22 @@ export function ChangesBoard({ visible = true }) {
   // pauses them mid pointer-drag. Bubble phase (capture:false).
   const navEnabled = visible && !drag;
   const boardOpts = { enabled: navEnabled, capture: false, when: boardOwnsKeyboard };
-  useHotkey('ArrowUp', () => moveSelection('up'), boardOpts);
-  useHotkey('ArrowDown', () => moveSelection('down'), boardOpts);
-  useHotkey('ArrowLeft', () => moveSelection('left'), boardOpts);
-  useHotkey('ArrowRight', () => moveSelection('right'), boardOpts);
-  useHotkey('Alt+ArrowUp', () => moveSelection('top'), boardOpts);
-  useHotkey('Alt+ArrowDown', () => moveSelection('bottom'), boardOpts);
-  useHotkey('Shift+ArrowUp', () => extendSelection('up'), boardOpts);
-  useHotkey('Shift+ArrowDown', () => extendSelection('down'), boardOpts);
-  useHotkey('Enter', () => { if (!selectedId) return false; navigate(`/changes/${encodeURIComponent(selectedId)}`); }, boardOpts);
+  useHotkey(hk('boardCursor', 'up'), () => moveSelection('up'), boardOpts);
+  useHotkey(hk('boardCursor', 'down'), () => moveSelection('down'), boardOpts);
+  useHotkey(hk('boardCursor', 'left'), () => moveSelection('left'), boardOpts);
+  useHotkey(hk('boardCursor', 'right'), () => moveSelection('right'), boardOpts);
+  useHotkey(hk('boardJump', 'top'), () => moveSelection('top'), boardOpts);
+  useHotkey(hk('boardJump', 'bottom'), () => moveSelection('bottom'), boardOpts);
+  useHotkey(hk('boardExtend', 'up'), () => extendSelection('up'), boardOpts);
+  useHotkey(hk('boardExtend', 'down'), () => extendSelection('down'), boardOpts);
+  useHotkey(hk('boardOpen'), () => { if (!selectedId) return false; navigate(`/changes/${encodeURIComponent(selectedId)}`); }, boardOpts);
   // ⌘↑/⌘↓ nudge the run (rank write). Gated on a passive surface (not the route)
   // so the hidden board still CONSUMES ⌘↑/↓ in the hand-off frame after navigating
   // to a detail — no native page-scroll leaks — while reorderSelection only ACTS
   // when onBoardRoute. Yields to the terminal like the cursor keys.
   const reorderOpts = { enabled: navEnabled, capture: false, when: passiveSurface };
-  useHotkey('Mod+ArrowUp', () => reorderSelection('up'), reorderOpts);
-  useHotkey('Mod+ArrowDown', () => reorderSelection('down'), reorderOpts);
+  useHotkey(hk('boardReorder', 'up'), () => reorderSelection('up'), reorderOpts);
+  useHotkey(hk('boardReorder', 'down'), () => reorderSelection('down'), reorderOpts);
 
   // On board load, park the keyboard cursor on the top of In Progress (where
   // active work is) so arrows move from there immediately. Only when nothing is

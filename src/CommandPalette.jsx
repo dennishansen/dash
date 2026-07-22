@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
-import { useHotkey } from './hotkeys.js';
+import { useHotkey, matchesCombo } from './hotkeys.js';
+import { hk } from './hotkey-registry.js';
 import { useIssues } from './api.js';
 import { listChanges, listBodies } from './board-store.js';
 import { issueHaystack } from './issue-search.js';
@@ -91,9 +92,12 @@ export function CommandPalette() {
     setOpen(true);
   }, []);
 
-  // The one global command. Capture-phase + terminal:'handle' so it beats the
-  // chat PTY; allowInInput so a second ⌘K (input focused) toggles it closed.
-  useHotkey('Mod+KeyK', () => { open ? close() : openPalette(); },
+  // The one global command — OPENS the palette. Capture-phase + terminal:'handle'
+  // so it beats the chat PTY; allowInInput so it fires while a non-modal field
+  // (the board search box) owns focus. It never has to CLOSE: once open, the
+  // palette is an aria-modal, so the primitive yields ⌘K to it — closing is a
+  // local key on the focused input below (the modal owns its own keys).
+  useHotkey(hk('search'), () => { if (!open) openPalette(); },
     { terminal: 'handle', allowInInput: true, repeat: false });
 
   // The pointer twin of ⌘K: the topbar search icon dispatches this so a click
@@ -177,7 +181,10 @@ function PaletteModal({ onClose }) {
       e.preventDefault(); e.stopPropagation();
       const r = results[active];
       if (r) go(r.issue.id);
-    } else if (e.key === 'Escape') {
+    } else if (matchesCombo(e, 'Escape') || matchesCombo(e, hk('search'))) {
+      // BARE Esc closes; so does a second ⌘K — both via matchesCombo, so a
+      // MODIFIED Escape doesn't steal it. The modal owns its own keys now that
+      // the primitive yields all hotkeys to it.
       e.preventDefault(); e.stopPropagation();
       onClose();
     } else if (e.key === 'Tab') {

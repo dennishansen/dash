@@ -13,13 +13,15 @@ import { SelectionProvider } from './selection.jsx';
 import { ChatControlContext } from './chat-control.jsx';
 import { WorkspacePanel } from './WorkspacePanel.jsx';
 import { CommandPalette } from './CommandPalette.jsx';
+import { ShortcutsOverlay } from './ShortcutsOverlay.jsx';
+import { hk, hkCaps } from './hotkey-registry.js';
 import {
   DockPanel, startDockResize, loadW,
   CHAT_DEFAULT_W, APP_DEFAULT_W, DOCK_MIN_W, MAIN_MIN_W, LEFT_W,
 } from './dock.jsx';
 import { useLocalBackend } from './capabilities.js';
 import { appPortForEnv } from './app-env.js';
-import { ArrowUpRight, WorkspacePanelIcon, Search } from './icons.jsx';
+import { ArrowUpRight, WorkspacePanelIcon, Search, Keyboard } from './icons.jsx';
 import { useFetch, useAsync } from './api.js';
 import { stateCounts, listChanges } from './board-store.js';
 import { onAuth, ensureFreshToken, ensureDevSession, signOut } from './auth.js';
@@ -259,10 +261,10 @@ function CrumbCopy({ id, section }) {
   // ⌘S copies the open id — same action + "copied ✓" flash as clicking the crumb.
   // CrumbCopy only mounts on a detail route, so this never fires on the board
   // (where ⌘S copies the selected card). terminal:'handle' so it works over chat.
-  useHotkey('Mod+KeyS', () => { onCopy(); }, { terminal: 'handle', repeat: false });
+  useHotkey(hk('detailCopyId'), () => { onCopy(); }, { terminal: 'handle', repeat: false });
   return (
     <button type="button" className={`crumb-cur crumb-copy${copied ? ' copied' : ''}`}
-      onClick={onCopy} title={copied ? 'Copied!' : `${label} — click to copy id (${id}) · ⌘S`}>
+      onClick={onCopy} title={copied ? 'Copied!' : `${label} — click to copy id (${id}) · ${hkCaps('detailCopyId')}`}>
       {copied ? 'copied ✓' : label}
     </button>
   );
@@ -307,16 +309,32 @@ function TopBar({ leftCollapsed, onToggleLeft, chatOpen, onToggleChat, appOpen, 
           </span>
         ))}
       </nav>
+      {/* The trailing action buttons are one cluster — a tight internal gap so
+          they read as a set, kept separate from the wide crumbs↔actions gap the
+          topbar's own flex gap gives. */}
+      <div className="topbar-actions">
       {/* Search opens the ⌘K palette by pointer — present on every route's nav,
           the mouse twin of the global chord. */}
       <button
         type="button"
         className="topbar-btn search-open"
-        title="Search issues (⌘K)"
+        title={`Search issues (${hkCaps('search')})`}
         aria-label="Search issues"
         onClick={() => window.dispatchEvent(new CustomEvent('dash:open-palette'))}
       >
         <Search size={15} />
+      </button>
+      {/* Keyboard shortcuts overlay opener, beside search — the pointer twin of
+          the `?` chord, and the way in while a field or the terminal owns focus
+          (where bare `?` yields). Present on every route's nav. */}
+      <button
+        type="button"
+        className="topbar-btn shortcuts-open"
+        title={`Keyboard shortcuts (${hkCaps('shortcuts')})`}
+        aria-label="Keyboard shortcuts"
+        onClick={() => window.dispatchEvent(new CustomEvent('dash:open-shortcuts'))}
+      >
+        <Keyboard size={15} />
       </button>
       {/* Two panel toggles, each shown only while its panel is CLOSED — once open,
           the panel's own ✕ (top-left of its navbar) is how you close it. Ordered
@@ -331,6 +349,7 @@ function TopBar({ leftCollapsed, onToggleLeft, chatOpen, onToggleChat, appOpen, 
         </button>
       ) : null}
       {!appOpen ? <AppToggle env={appEnv} port={appPort} onToggle={onToggleApp} /> : null}
+      </div>
     </header>
   );
 }
@@ -708,6 +727,9 @@ function Shell() {
       {/* ⌘K command palette — a route-agnostic modal (portals to body), so it
           works over the board, a detail view, or the chat terminal alike. */}
       <CommandPalette />
+      {/* `?` keyboard-shortcuts overlay — same portal pattern, renders the one
+          hotkey registry grouped by scope. */}
+      <ShortcutsOverlay />
     </div>
     </ChatControlContext.Provider>
   );

@@ -429,6 +429,14 @@ select:focus {
   top: 0;
   z-index: 30;
 }
+/* The trailing action buttons (search · shortcuts · chat · app) read as one
+   cluster — a tight 2px internal gap, independent of the topbar's wider gap that
+   separates the cluster from the breadcrumbs. */
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
 .topbar-btn {
   display: inline-flex;
   align-items: center;
@@ -3730,6 +3738,77 @@ img.zoomable {
   border-radius: 10px;
   box-shadow: 0 16px 60px rgba(0, 0, 0, 0.45);
   overflow: hidden;
+}
+
+/* Keyboard-shortcuts overlay — the `?` modal. Reuses the palette's backdrop +
+   panel shell (.cmdk-backdrop/.cmdk-panel); everything below is the shortcuts
+   list itself: a scrolling column of scope groups, each a label + key-caps row. */
+.hk-panel {
+  width: min(680px, 100%);
+  max-height: 78vh;
+}
+.hk-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+.hk-title { color: var(--text); font-size: 14px; font-weight: 600; }
+.hk-dismiss { font-size: 12px; }
+.hk-scroll {
+  overflow-y: auto;
+  padding: 8px 16px 14px;
+}
+.hk-group { margin-top: 12px; }
+.hk-group:first-child { margin-top: 4px; }
+/* Out-of-context surface (the route you're NOT on) — legible but recessed, so
+   the shortcuts that fire HERE read first. */
+.hk-group.is-dim { opacity: 0.42; }
+.hk-group-title {
+  margin: 0 0 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-mute);
+}
+.hk-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 5px 0;
+  min-height: 26px;
+}
+.hk-row + .hk-row { border-top: 1px solid var(--line); }
+.hk-label { color: var(--text); font-size: 13px; min-width: 0; }
+/* Right rail of key-caps. A cluster (↑↓←→, ⌥↑ ⌥↓) lays its combos out with a
+   wider gap between combos than between the caps within one combo. */
+.hk-keys {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+.hk-combo { display: inline-flex; gap: 3px; }
+.hk-cap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border: 1px solid var(--line-2);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: var(--bg-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1;
 }
 .cmdk-input-row {
   display: flex;
