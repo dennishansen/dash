@@ -1,7 +1,7 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { Link, useParams, useNavigate, useLocation } from 'react-router-dom';
 import { useAsync, useIssuesRealtime, fmtDate } from '../api.js';
-import { changeDetail, renameChange, updateChangeField, setChangeStatus, deleteChange } from '../board-store.js';
+import { changeDetail, renameChange, updateChangeField, setChangeStatus, deleteChange, listChanges } from '../board-store.js';
 import { BUCKETS } from './ChangesBoard.jsx';
 import { useLocalBackend } from '../capabilities.js';
 import { useSelection, useIssueNav } from '../selection.jsx';
@@ -9,8 +9,8 @@ import { useActivity } from '../activity-store.js';
 import { Markdown } from './Markdown.jsx';
 import { CopyButton } from './CopyButton.jsx';
 import { useChatControl } from '../chat-control.jsx';
-import { X, Plus, Pencil, Trash } from '../icons.jsx';
-import { Avatar, PersonLabel, usePeople, useDismiss, normalizeEmail } from '../profiles.jsx';
+import { X, Pencil, Trash, User } from '../icons.jsx';
+import { Avatar, usePeople, useDismiss, normalizeEmail } from '../profiles.jsx';
 
 // Inline-editable issue title. Looks like the static <h2> (CSS .title-edit),
 // gaining a box outline only on hover / focus. Enter or blur saves via
@@ -74,59 +74,97 @@ function EditableTitle({ id, title, onSaved, autoFocus }) {
 // A tag pill that reveals a remove-X on its right on hover (over a gradient
 // fade matching the pill fill). Clicking removes the tag immediately — tags are
 // a cheap, single-click-curated list, so no confirm.
-function TagPill({ id, tag, tags, onChanged }) {
-  const remove = async (e) => {
-    e.preventDefault(); e.stopPropagation();
-    const next = tags.filter(t => t !== tag);
-    const r = await updateChangeField(id, 'tags', next);
-    if (!(r && r.error)) onChanged();
-  };
-  return (
-    <Link to={`/changes?tag=${encodeURIComponent(tag)}`} className="field-pill field-pill--reveal field-pill--tag">
-      {tag}
-      <button type="button" className="pill-reveal pill-reveal--remove"
-        title="Remove tag" aria-label={`Remove tag ${tag}`} onClick={remove}>
-        <X size={12} />
-      </button>
-    </Link>
-  );
-}
+// Tags as a Notion-style multiselect. The value ITSELF is the trigger: the tag
+// pills (or an "Empty" placeholder when there are none) are clickable and open
+// the editor — no per-pill remove-X, no "+"/"+N" buttons. Inside, the dropdown
+// lists the CHECKED tags first, then every other tag below, each a checkbox row
+// you toggle in place — so you see the whole set and add/remove by clicking. A
+// search box filters and, since issue tags are free text, offers "Create <tag>"
+// for a query that matches nothing. Built on the owner-picker chrome (.owner-menu
+// / .owner-pick).
+function TagMultiSelect({ id, tags, allTags, onChanged }) {
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState('');
+  const inputRef = useRef(null);
+  const close = () => { setOpen(false); setQ(''); };
+  const wrapRef = useDismiss(open, close);
+  // Capture phase + stopPropagation so Escape closes the menu WITHOUT also
+  // reaching the detail view's "Escape → back to board" listener — the same
+  // pattern StatusPill / OwnerAvatar use.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [open]);
+  useEffect(() => { if (open) inputRef.current?.focus(); }, [open]);
 
-// Inline tag adder: a "+" that swaps to a tiny text input. Enter commits a
-// trimmed, non-empty, non-duplicate tag; Escape/blur cancels.
-function TagAdd({ id, tags, onChanged }) {
-  const [editing, setEditing] = useState(false);
-  const [val, setVal] = useState('');
-  const ref = useRef(null);
-  useEffect(() => { if (editing) ref.current?.focus(); }, [editing]);
-  const commit = async () => {
-    const t = val.trim();
-    setEditing(false); setVal('');
-    if (!t || tags.includes(t)) return;
-    const r = await updateChangeField(id, 'tags', [...tags, t]);
-    if (!(r && r.error)) onChanged();
+  const toggle = async (t) => {
+    const tag = t.trim();
+    if (!tag) return;
+    const next = tags.includes(tag) ? tags.filter(x => x !== tag) : [...tags, tag];
+    const r = await updateChangeField(id, 'tags', next);
+    if (!(r && r.error)) onChanged?.();
   };
-  if (!editing) {
-    return (
-      <button type="button" className="icon-btn tag-add" title="Add a tag"
-        aria-label="Add a tag" onClick={() => setEditing(true)}><Plus size={13} /></button>
-    );
-  }
+  const VISIBLE = 2; // pills shown inline before collapsing the rest into "+N"
+  const query = q.trim();
+  const match = (t) => t.toLowerCase().includes(query.toLowerCase());
+  // Checked first, then the rest — the whole vocabulary, so you can see and flip any.
+  const checked = (query ? tags.filter(match) : tags);
+  const rest = (allTags || []).filter(t => !tags.includes(t) && (!query || match(t)));
+  const canCreate = !!query && ![...(allTags || []), ...tags].some(t => t.toLowerCase() === query.toLowerCase());
+  const commitFirst = () => {
+    if (checked[0] && !rest.length && !canCreate) return; // nothing new to do
+    if (rest[0]) { toggle(rest[0]); setQ(''); }
+    else if (canCreate) { toggle(query); setQ(''); }
+  };
+
+  const Option = (t) => (
+    <li key={t}>
+      <button type="button" className={`owner-pick${tags.includes(t) ? ' is-current' : ''}`}
+        role="option" aria-selected={tags.includes(t)} onClick={() => toggle(t)}>
+        <span className="tag-check">{tags.includes(t) ? '✓' : ''}</span>
+        <span className="tag-opt-label">{t}</span>
+      </button>
+    </li>
+  );
+
   return (
-    <input
-      ref={ref}
-      className="tag-add-input"
-      value={val}
-      spellCheck={false}
-      aria-label="new tag"
-      placeholder="tag"
-      onChange={e => setVal(e.target.value)}
-      onKeyDown={e => {
-        if (e.key === 'Enter') { e.preventDefault(); commit(); }
-        else if (e.key === 'Escape') { e.preventDefault(); setEditing(false); setVal(''); }
-      }}
-      onBlur={commit}
-    />
+    <span className="tag-select" ref={wrapRef}>
+      <button type="button" className="tag-trigger" title="Edit tags"
+        aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen(o => !o)}>
+        {tags.length ? (
+          <>
+            {tags.slice(0, VISIBLE).map(t => <span key={t} className="field-pill field-pill--tag">{t}</span>)}
+            {tags.length > VISIBLE ? <span className="tag-overflow">+{tags.length - VISIBLE}</span> : null}
+          </>
+        ) : <span className="tag-empty">Empty</span>}
+      </button>
+      {open ? (
+        <div className="owner-menu tag-menu" role="dialog" aria-label="Edit tags">
+          <input ref={inputRef} className="tag-menu-search" value={q} spellCheck={false}
+            placeholder="Search or create…" aria-label="Search or create a tag"
+            onChange={e => setQ(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { e.preventDefault(); commitFirst(); }
+              else if (e.key === 'Escape') { e.preventDefault(); close(); }
+            }} />
+          <ul role="listbox" aria-multiselectable="true">
+            {checked.map(Option)}
+            {checked.length && rest.length ? <li className="tag-menu-sep" aria-hidden="true" /> : null}
+            {rest.map(Option)}
+            {canCreate ? (
+              <li>
+                <button type="button" className="owner-pick tag-create" onClick={() => { toggle(query); setQ(''); }}>
+                  Create “{query}”
+                </button>
+              </li>
+            ) : null}
+            {!checked.length && !rest.length && !canCreate ? <li className="owner-menu-empty dim">no tags yet</li> : null}
+          </ul>
+        </div>
+      ) : null}
+    </span>
   );
 }
 
@@ -165,15 +203,19 @@ function ConvoPill({ id, convo, conversations, onChanged, onOpen }) {
   );
 }
 
-// The owner property — ALWAYS present, owned or not. "Nobody holds this" is a
-// real answer an issue has to be able to give, and a row that appears only once
-// someone is assigned leaves nowhere to click to assign them.
+// The owner affordance — a compact avatar button beside the status pill under the
+// title, NOT a property row. An owner is metadata about WHO, and reads best as a
+// face next to the state, the way every issue tracker shows an assignee. Empty is
+// a real, first-class answer, so it's not hidden: a dotted circle holding a grey
+// person glyph, quiet at rest but a real "assign" button. Assigned swaps to the
+// person's photo. Clicking either opens the roster picker; picking reassigns, the
+// menu's "unassign" clears it.
 //
-// An owner is ONE person, so the value itself is the control: click the person
-// (or the "unassigned" placeholder) to open the picker, and the hover-X on the
-// pill releases it. `owner` holds an EMAIL — the same key profiles and the
-// allow-list use — so the person shown is an exact lookup, never a name match.
-function OwnerRow({ id, owner }) {
+// `owner` holds an EMAIL — the same key profiles and the allow-list use — so the
+// person shown is an exact lookup, never a name match, and the picker is the only
+// way to set it from the UI, which is what keeps the column from drifting back
+// into the free text it used to be.
+function OwnerAvatar({ id, owner }) {
   const [picking, setPicking] = useState(false);
   const people = usePeople();
   const wrapRef = useDismiss(picking, () => setPicking(false));
@@ -192,49 +234,128 @@ function OwnerRow({ id, owner }) {
     if (email !== (owner || null)) updateChangeField(id, 'owner', email);
   };
   const key = normalizeEmail(owner);
+  // The avatar is nameless on its face, so the tooltip/label must carry WHO —
+  // otherwise a hover reads "Change owner" and the assignee's name is lost.
+  // Resolve from the roster; fall back to the email.
+  const name = key ? (people.find(p => p.email === key)?.name || key) : null;
+  const label = name ? `Owner: ${name} — click to change` : 'Assign an owner';
 
   return (
+    <span className="owner-avatar-wrap" ref={wrapRef}>
+      <button type="button" className={`owner-avatar${key ? ' is-set' : ' is-empty'}`}
+        title={label}
+        aria-haspopup="listbox" aria-expanded={picking}
+        aria-label={label}
+        onClick={() => setPicking(p => !p)}>
+        {key ? <Avatar email={key} size={22} showTooltip={false} /> : <User size={14} />}
+      </button>
+      {picking ? (
+        <ul className="owner-menu" role="listbox">
+          {people.map(p => (
+            <li key={p.email}>
+              <button type="button" className={`owner-pick${p.email === key ? ' is-current' : ''}`}
+                role="option" aria-selected={p.email === key} onClick={() => assign(p.email)}>
+                <Avatar email={p.email} size={18} showTooltip={false} />
+                <span className="person-name">{p.name}</span>
+              </button>
+            </li>
+          ))}
+          {key ? (
+            <li>
+              <button type="button" className="owner-pick owner-pick--clear"
+                onClick={() => assign(null)}>unassign</button>
+            </li>
+          ) : null}
+          {people.length === 0 ? <li className="owner-menu-empty dim">nobody on this board yet</li> : null}
+        </ul>
+      ) : null}
+    </span>
+  );
+}
+
+// A read-only property row — a label and a list of value pills (branch names,
+// commit shas, session ids). No adder: these are derived worktree/chat metadata,
+// not user-set. Empty renders a dim "none" (only reached under "more").
+function ReadonlyRow({ label, values }) {
+  return (
     <div className="field-row">
-      <span className="k">owner</span>
-      <span className="v owner-v" ref={wrapRef}>
-        {key ? (
-          <span className="field-pill field-pill--reveal owner-pill">
-            <button type="button" className="owner-open" title="Change owner"
-              aria-haspopup="listbox" aria-expanded={picking} onClick={() => setPicking(p => !p)}>
-              <PersonLabel email={key} size={16} />
-            </button>
-            <button type="button" className="pill-reveal pill-reveal--remove"
-              title="Unassign" aria-label="Unassign owner" onClick={() => assign(null)}>
-              <X size={12} />
-            </button>
-          </span>
-        ) : (
-          <button type="button" className="owner-empty" title="Assign an owner"
-            aria-haspopup="listbox" aria-expanded={picking} onClick={() => setPicking(p => !p)}>
-            unassigned
-          </button>
-        )}
-        {picking ? (
-          <ul className="owner-menu" role="listbox">
-            {people.map(p => (
-              <li key={p.email}>
-                <button type="button" className={`owner-pick${p.email === key ? ' is-current' : ''}`}
-                  role="option" aria-selected={p.email === key} onClick={() => assign(p.email)}>
-                  <Avatar email={p.email} size={18} showTooltip={false} />
-                  <span className="person-name">{p.name}</span>
-                </button>
-              </li>
-            ))}
-            {key ? (
-              <li>
-                <button type="button" className="owner-pick owner-pick--clear"
-                  onClick={() => assign(null)}>unassign</button>
-              </li>
-            ) : null}
-            {people.length === 0 ? <li className="owner-menu-empty dim">nobody on this board yet</li> : null}
-          </ul>
-        ) : null}
+      <span className="k">{label}</span>
+      <span className="v">
+        {values.length
+          ? values.map(v => <span key={v} className="field-pill">{v}</span>)
+          : <span className="field-empty">none</span>}
       </span>
+    </div>
+  );
+}
+
+// A read-only timestamp property — created / updated. Humanized like every other
+// date (fmtDate → "Jul 21st"), full ISO in the tooltip. Always set, never an add
+// control; lives under "more" as metadata.
+function MetaRow({ label, iso }) {
+  return (
+    <div className="field-row">
+      <span className="k">{label}</span>
+      <span className="v"><span className="field-meta" title={iso || ''}>{fmtDate(iso)}</span></span>
+    </div>
+  );
+}
+
+// The properties BELOW the top bar. Status, owner and tags live up in the bar
+// (StatusPill / OwnerAvatar / TagMultiSelect); the read-only worktree/chat
+// metadata lands here as one ordered list where each row's `policy` decides where
+// it renders:
+//   whenSet — a labelled row, but only once it holds a value (branch, commits,
+//             sessions); empty ones fold under "Show more properties"
+//   meta    — always under "Show more properties" (created/updated, read-only)
+// So filled metadata sits right under the bar; everything empty or incidental
+// tucks into the expander. Empty branch/commits/sessions only exist under "more"
+// on a LOCAL backend — remotely they are structurally always empty, so listing
+// them there would be permanent noise (`local !== false` keeps them in while the
+// probe is still deciding). Expand state is per-mount — the parent keys this by
+// issue id, so navigating to another issue resets it.
+function IssueProperties({ data, local }) {
+  const [open, setOpen] = useState(false);
+  const branches = (data.branches?.length ? data.branches : [data.branch]).filter(Boolean);
+  const commits = (data.commits || []).map(c => String(c).slice(0, 9));
+  const sessions = data.sessions || [];
+
+  const props = [];
+  if (branches.length || local !== false) props.push({ policy: 'whenSet', has: branches.length > 0, node: <ReadonlyRow key="branch" label="branch" values={branches} /> });
+  if (commits.length || local !== false) props.push({ policy: 'whenSet', has: commits.length > 0, node: <ReadonlyRow key="commits" label="commits" values={commits} /> });
+  if (sessions.length || local !== false) props.push({ policy: 'whenSet', has: sessions.length > 0, node: <ReadonlyRow key="sessions" label="sessions" values={sessions} /> });
+  // Timestamps last — always present, always under "more".
+  props.push({ policy: 'meta', has: true, node: <MetaRow key="created" label="created" iso={data.created} /> });
+  props.push({ policy: 'meta', has: true, node: <MetaRow key="updated" label="updated" iso={data.updated} /> });
+
+  const isShown = (p) => p.policy === 'whenSet' && p.has;
+  const shown = props.filter(isShown);
+  const hidden = props.filter(p => !isShown(p));
+
+  return (
+    <>
+      {shown.map(p => p.node)}
+      {hidden.length ? (
+        <>
+          {open ? <div className="more-props">{hidden.map(p => p.node)}</div> : null}
+          <button type="button" className="more-props-toggle" aria-expanded={open}
+            onClick={() => setOpen(o => !o)}>
+            {open ? 'Show fewer properties' : '+ Show more properties'}
+          </button>
+        </>
+      ) : null}
+    </>
+  );
+}
+
+// A labelled cell for the top bar: a small grey label ABOVE its value (status
+// pill, owner avatar, tags), so the bar reads as a Notion-style property strip.
+// The value keeps its own control unchanged.
+function PropCell({ label, children }) {
+  return (
+    <div className="prop-cell">
+      <span className="prop-label">{label}</span>
+      <span className="prop-value">{children}</span>
     </div>
   );
 }
@@ -402,6 +523,11 @@ export function ChangeDetail() {
   const activity = useActivity();
   // Read the issue straight from Supabase (board-store) so detail works remotely.
   const { data, err, loading, refresh } = useAsync(`change:${id}`, () => changeDetail(id));
+  // Every tag in use across the board — the tag multiselect's option list (issue
+  // tags are free text, so this is a convenience set, not a closed vocabulary).
+  // Shares the board's 'changes' cache key, so it's already warm.
+  const { data: allIssues } = useAsync('changes', listChanges);
+  const allTags = useMemo(() => [...new Set((allIssues || []).flatMap(r => r.tags || []))].sort(), [allIssues]);
   // Live updates everywhere: any issue row change arrives over the browser-side
   // Supabase Realtime subscription the board uses (realtime.js), so convos /
   // branches refresh without a poll wait — local and remote alike.
@@ -448,13 +574,20 @@ export function ChangeDetail() {
               : <h2>{data.title || data.id}</h2>}
           </div>
           <div className="detail-sub">
-            {data.live
-              ? <span className="pill live-tag">● live</span>
-              : isIssue
-                ? <StatusPill id={data.id} status={status} onChanged={refresh} />
-                : <span className={`pill bucket-${status}`}>{status}</span>}
-            {!isIssue ? <span className="itag" style={{ marginLeft: 8 }}>branch</span> : null}
-            {data.created ? <span className="dim" style={{ marginLeft: 8 }}>created {fmtDate(data.created)}</span> : null}
+            {data.live ? <span className="pill live-tag">● live</span> : null}
+            {isIssue ? (
+              <>
+                <PropCell label="status"><StatusPill id={data.id} status={status} onChanged={refresh} /></PropCell>
+                <PropCell label="owner"><OwnerAvatar id={data.id} owner={data.owner} /></PropCell>
+                <PropCell label="tags"><TagMultiSelect id={data.id} tags={data.tags || []} allTags={allTags} onChanged={refresh} /></PropCell>
+              </>
+            ) : (
+              <>
+                {!data.live ? <span className={`pill bucket-${status}`}>{status}</span> : null}
+                <span className="itag" style={{ marginLeft: 8 }}>branch</span>
+                {data.created ? <span className="dim" style={{ marginLeft: 8 }}>created {fmtDate(data.created)}</span> : null}
+              </>
+            )}
           </div>
         </div>
         {/* On delete, park the board cursor where the deleted card WAS: the card
@@ -466,36 +599,17 @@ export function ChangeDetail() {
       </div>
 
       <div className="issue-fields">
-        {isIssue ? <OwnerRow id={data.id} owner={data.owner} /> : null}
-        {data.branch || data.branches?.length ? (
-          <div className="field-row">
-            <span className="k">branch</span>
-            <span className="v">{(data.branches?.length ? data.branches : [data.branch]).filter(Boolean).map(b => <span key={b} className="field-pill">{b}</span>)}</span>
-          </div>
-        ) : null}
-        {data.commits?.length ? (
-          <div className="field-row">
-            <span className="k">commits</span>
-            <span className="v">{data.commits.map(c => <span key={c} className="field-pill">{String(c).slice(0, 9)}</span>)}</span>
-          </div>
-        ) : null}
-        {data.sessions?.length ? (
-          <div className="field-row">
-            <span className="k">sessions</span>
-            <span className="v">{data.sessions.map(s => <span key={s} className="field-pill">{s}</span>)}</span>
-          </div>
-        ) : null}
         {isIssue ? (
-          <div className="field-row">
-            <span className="k">tags</span>
-            <span className="v">
-              {(data.tags || []).map(t => (
-                <TagPill key={t} id={data.id} tag={t} tags={data.tags || []} onChanged={refresh} />
-              ))}
-              <TagAdd id={data.id} tags={data.tags || []} onChanged={refresh} />
-            </span>
-          </div>
-        ) : null}
+          <IssueProperties key={data.id} data={data} local={local} />
+        ) : (
+          <>
+            {(data.branches?.length ? data.branches : [data.branch]).filter(Boolean).length ? (
+              <ReadonlyRow label="branch" values={(data.branches?.length ? data.branches : [data.branch]).filter(Boolean)} />
+            ) : null}
+            {data.commits?.length ? <ReadonlyRow label="commits" values={data.commits.map(c => String(c).slice(0, 9))} /> : null}
+            {data.sessions?.length ? <ReadonlyRow label="sessions" values={data.sessions} /> : null}
+          </>
+        )}
         {data.conversations?.length ? (
           <div className="field-row">
             <span className="k">convos</span>

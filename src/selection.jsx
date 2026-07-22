@@ -71,7 +71,7 @@ export function useSelection() { return useContext(SelectionContext); }
 // the wrong scope — the board reordering a card you just left, or the detail
 // re-navigating from the board. We match the hash PATHNAME only — stripping the
 // query the same way the router derives `pathname` — so a filtered board route
-// like `#/changes?tag=x` (a TagPill link) still counts as the board, and
+// like `#/changes?tag=x` (a tag-filter link) still counts as the board, and
 // `#/changes/?tag=x` (trailing slash, no id) is the board, not a detail.
 const hashPath = () => (window.location.hash || '').replace(/^#/, '').split('?')[0];
 export const isBoardRoute = () => /^\/changes\/?$/.test(hashPath());

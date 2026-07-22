@@ -3963,3 +3963,213 @@ img.zoomable {
 }
 .profile-pop-remove:hover { color: var(--bad); }
 .profile-pop-err { font-size: 11px; color: var(--bad); text-align: center; }
+
+/* ============================================================
+ * NOTION-STYLE PROPERTIES + STRUCTURED BOARD FILTERS
+ * Appended so these override the older single-tag-filter / property-row rules
+ * above (same specificity → later wins); new selectors just add. See
+ * board-filters.js, OptionMenu.jsx, ChangesBoard FilterBar, ChangeDetail.
+ * ============================================================ */
+
+/* --- Structured board filter bar (replaces the old .tag-bar chip row) --- */
+.filter-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.filter-bar .count { font-size: 13px; white-space: nowrap; align-self: center; }
+/* Each field is the anchor for its own value popover. */
+.filter-field { position: relative; display: inline-flex; align-items: center; }
+/* board-chrome sits UNDER the sticky column heads (z 2) at rest so they cover it
+   on vertical scroll — but a filter dropdown must clear them, so lift the whole
+   chrome above the heads only while a value menu is open. */
+.board-chrome:has(.filter-menu) { z-index: 3; }
+
+/* An active field reads as a two-part pill: "Key: values" + a clear-X. */
+.filter-pill {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--sel-line);
+  border-radius: 11px;
+  background: var(--sel-bg);
+  overflow: hidden;
+}
+.filter-pill-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.filter-pill-key { color: var(--text-mute); }
+.filter-pill-val {
+  color: var(--accent);
+  max-width: 24ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.filter-pill-val.is-any { color: var(--text-mute); font-style: italic; }
+.filter-pill-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 6px;
+  border: 0;
+  border-left: 1px solid var(--sel-line);
+  background: none;
+  color: var(--text-mute);
+  cursor: pointer;
+}
+.filter-pill-x:hover { color: var(--warn); background: var(--warn-bg); }
+/* The entry point when a field is not yet in play — a dashed "+ Add filter". */
+.filter-add {
+  padding: 2px 10px;
+  font-size: 13px;
+  border-radius: 11px;
+  border: 1px dashed var(--line-2);
+  background: none;
+  color: var(--text-mute);
+  cursor: pointer;
+}
+.filter-add:hover { color: var(--text); border-color: var(--text-mute); }
+/* OptionMenu reuses the owner-picker popover chrome (.owner-menu) as its OUTER
+   box, stacking an optional header (the operator <select>) + the option list +
+   an optional footer. The list itself scrolls, so the header stays pinned. */
+.filter-menu { min-width: 190px; }
+.filter-optlist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+/* The per-field operator picker at the top of an owner/tags menu. */
+.filter-op {
+  width: 100%;
+  margin-bottom: 4px;
+  padding: 4px 6px;
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  background: var(--bg-1);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+/* The "— no owner —" hint shown when an is-empty/is-not-empty operator needs no values. */
+.filter-menu-note { padding: 4px 7px 2px; font-size: 12px; }
+.filter-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 14px;
+  width: 14px;
+  color: var(--accent);
+}
+.filter-opt-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.filter-clear-all {
+  padding: 2px 9px;
+  font-size: 13px;
+  border-radius: 11px;
+  border: 1px solid transparent;
+  background: var(--warn-bg);
+  color: var(--warn);
+  cursor: pointer;
+}
+.filter-clear-all:hover { color: var(--text); }
+
+/* --- Detail header: the divider moves off the head and onto issue-fields, so
+   the properties block reads as one unit closed by a single rule below. --- */
+.detail-head { margin-bottom: 14px; padding-bottom: 0; border-bottom: none; }
+
+/* --- The top bar under the title: status / owner / tags as a Notion-style
+   property strip — each a small grey label ABOVE its value. --- */
+.detail-sub { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 12px 16px; margin-top: 10px; }
+.prop-cell { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.prop-label { font-size: 11px; color: var(--text-mute); letter-spacing: 0.01em; }
+.prop-value { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-height: 24px; }
+/* Non-issue (branch-kind) bar keeps the old inline row. */
+.detail-sub > .pill, .detail-sub > .itag, .detail-sub > .dim { align-self: center; }
+
+/* --- Properties block below the bar: the divider now closes it. --- */
+.issue-fields { margin: 0 0 18px; display: flex; flex-direction: column; gap: 8px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
+/* Property-value pill, un-scoped so a tag pill looks the same in the top bar
+   (tags) as in the fields block below (branch/commits/sessions). */
+.field-pill {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  padding: 1px 8px;
+  border-radius: 7px;
+  background: var(--bg-1);
+  color: var(--text-dim);
+  border: 1px solid transparent;
+  text-decoration: none;
+}
+.field-pill--tag { font-weight: 600; }
+
+/* --- Tags as a multiselect in the top bar. The pills (or "Empty") ARE the
+   trigger; the popover reuses the .owner-menu chrome. --- */
+.tag-select { position: relative; display: inline-flex; align-items: center; }
+.tag-trigger {
+  display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 2px 4px; margin: -2px -4px; /* pills stay put; the pad gives a hover target */
+  border: 0; background: none; cursor: pointer; border-radius: 7px;
+}
+.tag-trigger:hover { background: var(--bg-1); }
+.tag-empty { color: var(--text-mute); font-size: 13px; }
+/* Truncation indicator — the pills are cut to a couple, the rest read as "+N". */
+.tag-overflow { color: var(--text-mute); font-size: 12px; }
+.tag-menu { min-width: 200px; padding: 6px; }
+.tag-menu-search {
+  width: 100%; margin-bottom: 6px; padding: 4px 7px;
+  border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg-1); color: var(--text); font: inherit; font-size: 13px;
+}
+.tag-menu-search:focus { outline: none; border-color: var(--accent); }
+.tag-menu ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow-y: auto; }
+.tag-menu .owner-pick { gap: 6px; }
+/* Hairline between the checked group (top) and the rest (below). */
+.tag-menu-sep { height: 1px; background: var(--line); margin: 4px 2px; }
+.tag-check { width: 12px; flex: 0 0 12px; text-align: center; color: var(--accent); }
+.tag-opt-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tag-create { color: var(--text-dim); font-style: italic; }
+
+/* --- "Show more properties" expander + its read-only rows. --- */
+.issue-fields .more-props { display: flex; flex-direction: column; gap: 6px; }
+.issue-fields .more-props-toggle {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 1px 6px 1px 0;
+  border: 0; background: none;
+  color: var(--text-mute); cursor: pointer;
+  font-family: var(--font-ui); font-size: 13px; border-radius: 6px;
+}
+.issue-fields .more-props-toggle:hover { color: var(--text-dim); }
+.issue-fields .field-empty { color: var(--text-mute); font-size: 13px; }
+.issue-fields .field-meta { color: var(--text-dim); font-size: 13px; }
+
+/* --- Owner avatar (beside the status pill under the title). --- */
+.owner-avatar-wrap { position: relative; display: inline-flex; }
+.owner-avatar {
+  display: inline-grid; place-items: center;
+  width: 24px; height: 24px; padding: 0;
+  border: 0; border-radius: 50%; background: none;
+  color: var(--text-mute); cursor: pointer;
+}
+/* Empty = a dotted ring holding a grey person glyph. */
+.owner-avatar.is-empty { border: 1px dashed var(--line-2); }
+.owner-avatar.is-empty:hover { color: var(--text-dim); border-color: var(--text-mute); }
+/* Assigned = the person's photo/initial; a hover ring signals it's re-clickable. */
+.owner-avatar.is-set:hover { box-shadow: 0 0 0 2px var(--line-2); }

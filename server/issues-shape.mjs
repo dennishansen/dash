@@ -32,6 +32,10 @@ export function shapeRow(row) {
     // seed; written on switch / non-reviewer chat create, never by a reviewer.
     selected_session: row.selected_session ?? null,
     created: row.created || null,
+    // The DB insert timestamp — the reliable "when created" (the legacy `created`
+    // date column above is often null). Surfaced as a read-only detail property;
+    // undefined on list rows (LIST_COLS omits it), which is fine — only detail shows it.
+    created_at: row.created_at || null,
     updated: row.updated_at || null,
     closed: row.closed_at || null,   // when it entered done/rejected (sorts the archive cols)
     order: row.rank != null ? Number(row.rank) : null,

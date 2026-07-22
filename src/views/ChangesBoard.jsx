@@ -8,7 +8,13 @@ import { useSelection } from '../selection.jsx';
 import { columnCompare, archiveCompare, ARCHIVE_COLS } from '../board-sort.js';
 import { searchIssues } from '../issue-search.js';
 import { useHotkey } from '../hotkeys.js';
-import { Avatar, useDismiss } from '../profiles.jsx';
+import { Avatar, usePeople, useDismiss } from '../profiles.jsx';
+import { OptionMenu } from '../OptionMenu.jsx';
+import {
+  FILTER_FIELDS, CREATED_BUCKETS, SINGLE_SELECT_FIELDS, FILTER_OPERATORS, DEFAULT_OP,
+  fieldHasOperators, valuesNeeded, emptyFilters, anyFilterActive, fieldActive,
+  issueMatchesFilters, tagOptions, ownerEmailsPresent, todayStr,
+} from '../board-filters.js';
 
 function SearchIcon() {
   return (
@@ -89,12 +95,29 @@ export function ChangesBoard({ visible = true }) {
   const [searchOpen, setSearchOpen] = useState(false);
   const searchWrapRef = useDismiss(searchOpen, () => setSearchOpen(false));
   const [showFilters, setShowFilters] = useState(false);
-  const [activeTags, setActiveTags] = useState(() => new Set());
-  const toggleTag = (t) => setActiveTags(prev => {
-    const next = new Set(prev);
-    next.has(t) ? next.delete(t) : next.add(t);
-    return next;
-  });
+  // Structured filter state: a Set per field (owner/tags/created), multi-select
+  // OR within a field and AND across fields — see board-filters.js. Replaces the
+  // old tags-only `activeTags` Set. Transient (per-load), unlike view-mode.
+  const [filters, setFilters] = useState(emptyFilters);
+  // A created-bucket filter measures against "today", so the board must notice a
+  // day boundary even while idle — without polling. `dayTick` bumps at the next
+  // local midnight (the timer reschedules itself via its own dep) and whenever the
+  // tab regains focus; the `filtered` memo reads `todayStr()` fresh on any bump.
+  // At rest this is a single pending timer, no interval.
+  const [dayTick, setDayTick] = useState(0);
+  useEffect(() => {
+    const onVis = () => { if (document.visibilityState === 'visible') setDayTick(t => t + 1); };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, []);
+  useEffect(() => {
+    const now = new Date();
+    // Exact next local midnight — setTimeout fires at-or-after its delay, so by the
+    // time it runs `todayStr()` already reads the new day (no fudge-factor buffer).
+    const nextMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+    const timer = setTimeout(() => setDayTick(t => t + 1), nextMidnight - now);
+    return () => clearTimeout(timer);
+  }, [dayTick]);
   const [hidden, setHidden] = useState(() => {
     try { return new Set(JSON.parse(localStorage.getItem('dash-hidden-cols') || '[]')); }
     catch { return new Set(); }
@@ -106,25 +129,25 @@ export function ChangesBoard({ visible = true }) {
     return next;
   });
 
-  // All tags present across the board, for the filter chips.
-  const allTags = useMemo(() => {
-    const s = new Set();
-    for (const i of data ?? []) for (const t of i.tags ?? []) s.add(t);
-    return [...s].sort();
-  }, [data]);
-
   const filtered = useMemo(() => {
-    let rows = data ?? [];
-    if (activeTags.size) rows = rows.filter(i => (i.tags ?? []).some(t => activeTags.has(t)));
-    // Same matcher the ⌘K palette uses — one search, not two (issue-search.js).
+    // `now` fresh each derivation (not frozen at mount), so a created-bucket
+    // filter reads the right day even on a board left open across midnight — and
+    // realtime data pushes re-run this memo continually. Structured filters first
+    // (owner/tags/created), then the same free-text matcher the ⌘K palette uses —
+    // one search, not two (issue-search.js). searchIssues trims the query, so a
+    // whitespace-only search is NOT a filter — consistent with `filterActive`
+    // (also trimmed), so drag/keyboard-reorder never renumber a hidden subset.
+    const now = todayStr();
+    let rows = (data ?? []).filter(i => issueMatchesFilters(i, filters, now));
     rows = searchIssues(rows, search);
     return rows;
-  }, [data, activeTags, search]);
+  }, [data, filters, search, dayTick]);
 
-  // Drag is disabled while a filter is active: a column then shows only a subset
-  // of its cards, so renumbering it from the visible set would collide with (and
-  // reorder relative to) the hidden cards. Clear the filter to reorder.
-  const filterActive = activeTags.size > 0 || search.trim() !== '';
+  // Drag is disabled while ANY filter is active — a structured field OR the
+  // search box: a column then shows only a subset of its cards, so renumbering it
+  // from the visible set would collide with (and reorder relative to) the hidden
+  // cards. Clear the filters to reorder.
+  const filterActive = anyFilterActive(filters) || search.trim() !== '';
 
   // Pointer-drag reorder + restatus. The grabbed card lifts off and follows the
   // cursor (a fixed-position clone); a placeholder holds the drop slot in the
@@ -449,10 +472,10 @@ export function ChangesBoard({ visible = true }) {
         <h2>Issues</h2>
         <div className="header-right">
           <button
-            className={`filter-toggle${showFilters || activeTags.size ? ' is-on' : ''}`}
+            className={`filter-toggle${showFilters || anyFilterActive(filters) ? ' is-on' : ''}`}
             onClick={() => setShowFilters(s => !s)}
             title={showFilters ? 'Hide filters' : 'Show filters'}
-            aria-label="Toggle tag filters"
+            aria-label="Toggle filters"
             aria-pressed={showFilters}
           >
             <FilterIcon />
@@ -485,26 +508,12 @@ export function ChangesBoard({ visible = true }) {
           )}
         </div>
       </div>
-      {/* Tag filters sit directly above the board they filter; revealed by the
-          filter toggle, and forced open whenever a tag filter is active. */}
-      {showFilters || activeTags.size ? (
-        <div className="tag-bar">
-          <div className="tag-chips">
-            {allTags.map(t => (
-              <button
-                key={t}
-                className={`chip${activeTags.has(t) ? ' chip-on' : ''}`}
-                onClick={() => toggleTag(t)}
-              >{t}</button>
-            ))}
-            {activeTags.size ? (
-              <>
-                <button className="chip chip-clear" onClick={() => setActiveTags(new Set())}>clear</button>
-                <span className="dim count">{filtered.length} of {data?.length ?? 0}</span>
-              </>
-            ) : null}
-          </div>
-        </div>
+      {/* Structured filters sit directly above the board they filter, revealed
+          by the funnel toggle. ALWAYS closable — collapsing hides the bar even
+          while filters are active; the toggle stays lit so a hidden filter is
+          never silent (mirrors the collapsed-search accent). */}
+      {showFilters ? (
+        <FilterBar data={data} filters={filters} setFilters={setFilters} shownCount={filtered.length} />
       ) : null}
       {err ? <div className="error">{err}</div> : null}
       {writeErr ? <div className="error" onClick={() => setWriteErr(null)} style={{ cursor: 'pointer' }}>{writeErr}</div> : null}
@@ -534,6 +543,166 @@ export function ChangesBoard({ visible = true }) {
           {dragItem.live ? <div className="kcard-head"><span className="pill live-tag">● live</span></div> : null}
           <div className="kcard-title">{dragItem.title}</div>
         </div>
+      ) : null}
+    </div>
+  );
+}
+
+// Human labels for the three filter fields (the pill key + the add-menu rows).
+const FIELD_LABEL = { owner: 'Owner', tags: 'Tags', created: 'Created' };
+
+// The Notion-style structured filter bar: a pill per active field (each a summary
+// that reopens its value menu, plus an X to clear that field) and a "+ Add filter"
+// button that offers the fields not yet in play. Each field's value menu is the
+// shared OptionMenu, with an operator <select> in its header for owner/tags; the
+// operators + matcher live in board-filters.js, so this component is pure wiring.
+// Rendered ONLY while the panel is open — the filters themselves live in the
+// board, so collapsing hides the bar without dropping the active filter.
+function FilterBar({ data, filters, setFilters, shownCount }) {
+  // Which value menu is open: a field key, the sentinel '__add__' for the
+  // add-filter menu, or null. One-at-a-time; click-outside / Escape closes it.
+  const [openField, setOpenField] = useState(null);
+  const wrapRef = useDismiss(!!openField, () => setOpenField(null));
+  useHotkey('Escape', () => setOpenField(null),
+    { enabled: !!openField, terminal: 'handle', allowInInput: true });
+
+  // Owner options = the name-sorted roster ∩ owners actually present on the
+  // board (a filter offers only values that can match). Reads the one roster
+  // every card reads — no request per option.
+  const people = usePeople();
+  const tags = useMemo(() => tagOptions(data), [data]);
+  const ownersPresent = useMemo(() => ownerEmailsPresent(data), [data]);
+  const owners = useMemo(
+    () => people.filter(p => ownersPresent.has(p.email)),
+    [people, ownersPresent]);
+
+  // {value,label} options for a field — the value menu rows and the pill summary.
+  const optionsFor = (field) => {
+    if (field === 'owner')   return owners.map(p => ({ value: p.email, label: p.name }));
+    if (field === 'tags')    return tags.map(t => ({ value: t, label: t }));
+    if (field === 'created') return CREATED_BUCKETS.map(b => ({ value: b.value, label: b.label }));
+    return [];
+  };
+
+  // Switch a field's operator. empty/not-empty carry no values, so crossing
+  // between the valued pair (contains/not-contains) and the valueless pair drops
+  // the value set; staying inside the valued pair keeps it.
+  const setFieldOp = (field, op) => setFilters(prev => {
+    const keep = valuesNeeded(op) && valuesNeeded(prev[field].op);
+    return { ...prev, [field]: { op, values: keep ? prev[field].values : new Set() } };
+  });
+  const toggleValue = (field, value) => setFilters(prev => {
+    const cur = prev[field];
+    const has = cur.values.has(value);
+    // Single-select fields (created) REPLACE on pick — a second click on the
+    // active value clears it. Multi-select fields (owner, tags) toggle in place.
+    const values = SINGLE_SELECT_FIELDS.has(field)
+      ? new Set(has ? [] : [value])
+      : (() => { const s = new Set(cur.values); has ? s.delete(value) : s.add(value); return s; })();
+    return { ...prev, [field]: { ...cur, values } };
+  });
+  const clearField = (field) => {
+    setFilters(prev => ({ ...prev, [field]: { op: DEFAULT_OP, values: new Set() } }));
+    setOpenField(o => (o === field ? null : o)); // an emptied open field would linger as a pill
+  };
+  const clearAll = () => { setFilters(emptyFilters()); setOpenField(null); };
+
+  // A field shows a pill once it is ACTIVE (values, or an is-empty/not-empty op)
+  // OR its menu is open (so picking it from the add-menu gives its value menu
+  // somewhere to anchor). Owner/tags are always addable — they can filter by
+  // is-empty/is-not-empty with no value options; created needs its buckets.
+  const pillFields = FILTER_FIELDS.filter(f => fieldActive(f, filters[f]) || openField === f);
+  const addable = FILTER_FIELDS.filter(
+    f => !fieldActive(f, filters[f]) && openField !== f && (fieldHasOperators(f) || optionsFor(f).length > 0));
+
+  // The pill's value text: "<operator> <values>" for owner/tags, the bucket for
+  // created. A placeholder ("any" / "contains …") reads dim/italic.
+  const summarize = (field) => {
+    const { op, values } = filters[field];
+    const opts = optionsFor(field);
+    const labels = () => [...values].map(v => opts.find(o => o.value === v)?.label ?? v).join(', ');
+    if (!fieldHasOperators(field)) return values.size ? labels() : 'any';
+    const opLabel = FILTER_OPERATORS.find(o => o.value === op)?.label.toLowerCase();
+    if (!valuesNeeded(op)) return opLabel;                    // "is empty" / "is not empty"
+    return values.size ? `${opLabel} ${labels()}` : `${opLabel} …`;
+  };
+  const isPlaceholder = (field) => {
+    const { op, values } = filters[field];
+    return values.size === 0 && (!fieldHasOperators(field) || valuesNeeded(op));
+  };
+
+  const active = anyFilterActive(filters);
+  const total = data?.length ?? 0;
+
+  return (
+    <div className="filter-bar" ref={wrapRef}>
+      {pillFields.map(field => (
+        <div className="filter-field" key={field}>
+          <span className="filter-pill">
+            <button type="button" className="filter-pill-open"
+              aria-haspopup="listbox" aria-expanded={openField === field}
+              onClick={() => setOpenField(o => (o === field ? null : field))}>
+              <span className="filter-pill-key">{FIELD_LABEL[field]}</span>
+              <span className={`filter-pill-val${isPlaceholder(field) ? ' is-any' : ''}`}>
+                {summarize(field)}
+              </span>
+            </button>
+            <button type="button" className="filter-pill-x"
+              title={`Clear ${FIELD_LABEL[field]} filter`} aria-label={`Clear ${FIELD_LABEL[field]} filter`}
+              onClick={() => clearField(field)}>
+              <ClearIcon />
+            </button>
+          </span>
+          {openField === field ? (
+            <OptionMenu
+              options={!fieldHasOperators(field) || valuesNeeded(filters[field].op) ? optionsFor(field) : []}
+              selected={filters[field].values}
+              single={SINGLE_SELECT_FIELDS.has(field)}
+              onToggle={(v) => toggleValue(field, v)}
+              renderOption={field === 'owner'
+                ? (o) => (<><Avatar email={o.value} size={18} showTooltip={false} /><span className="person-name">{o.label}</span></>)
+                : undefined}
+              header={fieldHasOperators(field) ? (
+                <select className="filter-op" value={filters[field].op}
+                  aria-label={`${FIELD_LABEL[field]} operator`}
+                  onChange={(e) => setFieldOp(field, e.target.value)}>
+                  {FILTER_OPERATORS.map(op => <option key={op.value} value={op.value}>{op.label}</option>)}
+                </select>
+              ) : null}
+              footer={fieldHasOperators(field) && !valuesNeeded(filters[field].op) ? (
+                <div className="filter-menu-note dim">
+                  {filters[field].op === 'empty' ? `— no ${field} —` : `— any ${field} —`}
+                </div>
+              ) : null} />
+          ) : null}
+        </div>
+      ))}
+
+      {addable.length ? (
+        <div className="filter-field">
+          <button type="button" className="filter-add"
+            aria-haspopup="menu" aria-expanded={openField === '__add__'}
+            onClick={() => setOpenField(o => (o === '__add__' ? null : '__add__'))}>
+            + Add filter
+          </button>
+          {openField === '__add__' ? (
+            <ul className="owner-menu filter-menu" role="menu">
+              {addable.map(f => (
+                <li key={f}>
+                  <button type="button" className="owner-pick" role="menuitem"
+                    onClick={() => setOpenField(f)}>{FIELD_LABEL[f]}</button>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+
+      {active ? (
+        <>
+          <button type="button" className="filter-clear-all" onClick={clearAll}>clear all</button>
+          <span className="dim count">{shownCount} of {total}</span>
+        </>
       ) : null}
     </div>
   );
