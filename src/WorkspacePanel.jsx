@@ -2,7 +2,7 @@ import React from 'react';
 import { DockPanel } from './dock.jsx';
 import { useHotkey } from './hotkeys.js';
 import { MAIN_ENV, appUrlForEnv, appPortForEnv, normalizeAppPath } from './app-env.mjs';
-import { Refresh, ChevronDown, ArrowUpRight } from './icons.jsx';
+import { Refresh, ChevronDown, ChevronLeft, ChevronRight, ArrowUpRight } from './icons.jsx';
 import { useChatStatus } from './api.js';
 import { useEnvSession } from './chat-session-store.js';
 
@@ -90,6 +90,12 @@ export function WorkspacePanel({ env, port, appPath = '/', reloadKey = 0, reload
   // remounts src with a cache-bust) is the universal fallback that reloads ANY
   // route back to its launch point.
   const refreshApp = () => iframeRef.current?.contentWindow?.postMessage({ type: 'artifact:reload' }, '*');
+  // Back/forward step the guest's OWN history — same cooperating-guest channel as
+  // refresh, because the cross-origin frame's history is unreachable from here.
+  // We can't read its history length across origins, so both stay enabled and are
+  // a no-op at either end (exactly how a browser's chrome behaves there).
+  const backApp = () => iframeRef.current?.contentWindow?.postMessage({ type: 'artifact:back' }, '*');
+  const forwardApp = () => iframeRef.current?.contentWindow?.postMessage({ type: 'artifact:forward' }, '*');
   const hardRefreshApp = () => setFrameBust(Date.now());
   const frameUrl = appUrlForEnv(env);
 
@@ -138,6 +144,18 @@ export function WorkspacePanel({ env, port, appPath = '/', reloadKey = 0, reload
         {view === 'code' && chatStatus ? <LocBadge added={chatStatus.added} removed={chatStatus.removed} /> : null}
         {view === 'app' ? (
           <>
+            {available ? (
+              <div className="app-bar-nav">
+                <button type="button" className="app-bar-reload" onClick={backApp}
+                  title="Back" aria-label="Back">
+                  <ChevronLeft size={14} />
+                </button>
+                <button type="button" className="app-bar-reload" onClick={forwardApp}
+                  title="Forward" aria-label="Forward">
+                  <ChevronRight size={14} />
+                </button>
+              </div>
+            ) : null}
             {available ? (
               <span className="app-bar-host">
                 localhost:{shownPort}

@@ -96,6 +96,14 @@ export function CommandPalette() {
   useHotkey('Mod+KeyK', () => { open ? close() : openPalette(); },
     { terminal: 'handle', allowInInput: true, repeat: false });
 
+  // The pointer twin of ⌘K: the topbar search icon dispatches this so a click
+  // reaches the same modal the chord opens (one palette, two affordances).
+  useEffect(() => {
+    const onOpen = () => { if (!open) openPalette(); };
+    window.addEventListener('dash:open-palette', onOpen);
+    return () => window.removeEventListener('dash:open-palette', onOpen);
+  }, [open, openPalette]);
+
   // The modal (and its lazy 'issue-bodies' fetch) mounts only while open — so
   // app-load never pays for description data nobody searched. The issues-cache
   // keeps it warm across opens.

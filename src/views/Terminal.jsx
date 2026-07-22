@@ -8,11 +8,14 @@ import { Plus, X, Pencil } from '../icons.jsx';
 import { viewportText } from '../spinner.js';
 import { agentById, agentChoices, DEFAULT_AGENT } from '../agents.js';
 import { reportActivity, clearActivity } from '../activity-store.js';
+import { setSelectedChat } from '../../server/profiles-store.mjs';
+import { userEmail } from '../auth.js';
 import { useSessionOwner } from '../session-pool.js';
 import { acquireWebgl, releaseWebgl } from './term-renderer.js';
 import { CopyButton } from './CopyButton.jsx';
 import { emitIssuesChange, subscribeIssues } from '../realtime.js';
 import { getTerminalToken } from '../terminal-token.js';
+import { updateChangeField } from '../board-store.js';
 
 const AGENTS = agentChoices();
 const LAST_AGENT_KEY = 'dash-chat-agent';
@@ -26,6 +29,15 @@ const rememberAgent = (id) => { try { localStorage.setItem(LAST_AGENT_KEY, id); 
 function AgentBadge({ agent }) {
   const m = agentById(agent);
   return <span className={`agent-badge agent-badge-${m.id}`} title={m.label}>{m.short}</span>;
+}
+
+// A ROLE pill shown ALONGSIDE the agent badge. A reviewer chat is still a
+// claude/codex CLI, so its role reads as an extra tag next to the agent, not a
+// swap — and it's what makes a reviewer read distinctly in the switcher (it's
+// never the default selection and never dots the card).
+function RoleBadge({ role }) {
+  if (!role) return null;
+  return <span className={`agent-badge role-badge role-badge-${role}`} title={`${role} chat`}>{role}</span>;
 }
 
 // The choice popover shared by the "+" button and the empty state: one row per
@@ -99,6 +111,17 @@ function ChatPane({ issueId, sessionId, mode, active, onSession, agent }) {
   // The main chat rides --continue and carries no client session id; every
   // other chat must name one before it can connect.
   const isMain = issueId === 'main';
+
+  // Record THIS chat as my currently-selected one when its pane is on screen, so
+  // the idle reaper never stops a chat I have open — stored on my profile, so it
+  // holds across devices. One write per selection change; switching chats
+  // overwrites it, so only my current pick is ever protected.
+  useEffect(() => {
+    if (!active || !sessionId) return;
+    const email = userEmail();
+    if (!email) return;
+    setSelectedChat(email, sessionId).catch(() => {});
+  }, [active, sessionId]);
 
   useEffect(() => {
     if (!issueId || (!sessionId && !isMain) || !hostRef.current) return;
@@ -502,23 +525,6 @@ function ChatPane({ issueId, sessionId, mode, active, onSession, agent }) {
   );
 }
 
-// A hidden pane for a LIVE chat that isn't the issue's selected one — so every
-// live session stays mounted (socket + working/idle detector) even when the
-// switcher shows a sibling, and an issue with two live chats dots correctly for
-// both. Ownership-gated like the main pane: if another issue's pane owns the
-// session (it's selected/visible there), this renders nothing. display:none is
-// safe for a pane — hidden panes skip resize and hold no GPU context, and the
-// detector reads the buffer, not the paint (same contract as pool-hidden panels).
-function ShadowChatPane({ issueId, sessionId, agent }) {
-  const owned = useSessionOwner(issueId, sessionId, false);
-  if (!owned) return null;
-  return (
-    <div style={{ display: 'none' }}>
-      <ChatPane issueId={issueId} sessionId={sessionId} mode="resume" active={false} agent={agent} />
-    </div>
-  );
-}
-
 // What a chat is CALLED, in one place: the name the user gave it if there is
 // one, else the derived default. The default stays positional ("chat 2") — it
 // describes where the chat sits in this env's list, which is exactly what an
@@ -611,6 +617,7 @@ function ChatSwitcher({ chats, selected, onSelect, onNew, onUnlink, onRename, bu
           {editing ? (
             <>
               {selChat ? <AgentBadge agent={selChat.agent} /> : null}
+              {selChat ? <RoleBadge role={selChat.role} /> : null}
               <input className="issue-chat-name-input" autoFocus value={draft}
                 placeholder={selChat ? chatDefaultLabel(selChat, selIdx) : ''}
                 aria-label="Chat name"
@@ -625,6 +632,7 @@ function ChatSwitcher({ chats, selected, onSelect, onNew, onUnlink, onRename, bu
             <button className="issue-chat-trigger-main" onClick={() => setOpen(v => !v)}
               disabled={!chats.length} aria-haspopup="listbox" aria-expanded={open}>
               {selChat ? <AgentBadge agent={selChat.agent} /> : null}
+              {selChat ? <RoleBadge role={selChat.role} /> : null}
               <span className="issue-chat-trigger-label">{triggerLabel}</span>
             </button>
           )}
@@ -644,6 +652,7 @@ function ChatSwitcher({ chats, selected, onSelect, onNew, onUnlink, onRename, bu
                 <button className="issue-chat-pick" disabled={!c.resumable}
                   onClick={() => { onSelect(c.sessionId); setOpen(false); }}>
                   <AgentBadge agent={c.agent} />
+                  <RoleBadge role={c.role} />
                   <span className="issue-chat-pick-label">{chatLabel(c, i)}</span>
                 </button>
                 <CopyButton text={c.sessionId} title="Copy chat session id" />
@@ -745,39 +754,45 @@ export function IssueTerminal({ issueId, requestSession, active }) {
     refresh();
   }, [issueId, refresh, local]);
 
-  // Auto-open a chat once chats are known: the LAST-OPENED one (remembered per
-  // issue) if it's still resumable, else the most-recently-linked resumable. A
-  // chat is resumable wherever its transcript lives — not only inside the issue's
-  // own worktree — so this does NOT gate on state.worktree.
+  // Auto-open a chat once chats are known. The issue's EXPLICIT selected_session
+  // (shared, stored on the row) is the source of truth: it wins whenever it names
+  // a resumable work chat — even a dormant one, because opening the card resumes
+  // it. A never-selected issue falls back to the live work chat, then the most-
+  // recently-linked one, and an ACTIVE first-open persists that pick so the choice
+  // becomes explicit and the board can warm it thereafter. Reviewers are never
+  // auto-opened. A chat is resumable wherever its transcript lives, so this
+  // doesn't gate on state.worktree.
   useEffect(() => {
     if (state.loading || selected) return;
-    const resumable = (state.chats || []).filter(c => c.resumable);
-    if (!resumable.length) return;
-    const lastId = localStorage.getItem(`dash-chat-last:${issueId}`);
-    const last = resumable.find(c => c.sessionId === lastId);
-    // Prefer a chat whose PTY is already LIVE: reattaching to it is free, while
-    // picking a dormant sibling would cold-spawn claude. This is what keeps
-    // board-load auto-attach cheap (it only ever seeds issues that HAVE a live
-    // chat). Honour the human's last-opened choice when it is itself live;
-    // otherwise the live one wins, then last-opened, then most-recently-linked.
-    const liveChat = resumable.find(c => c.live);
-    const pick = (last && last.live ? last : null) || liveChat || last || resumable[resumable.length - 1];
+    const work = (state.chats || []).filter(c => c.resumable && c.role !== 'reviewer');
+    if (!work.length) return;
+    const explicit = state.selected_session && work.find(c => c.sessionId === state.selected_session);
+    const pick = explicit || work.find(c => c.live) || work[work.length - 1];
     setSelected(pick.sessionId);
     setMode('resume');
-  }, [state, selected, issueId]);
+    // Heal a never-selected issue to explicit on its first ACTIVE open (a real
+    // open is a choice; a hidden pool mount is not, so it never persists).
+    if (active && !state.selected_session) {
+      updateChangeField(issueId, 'selected_session', pick.sessionId);
+    }
+  }, [state, selected, issueId, active]);
 
-  // Remember the open chat per issue, so reopening the issue lands on it.
-  useEffect(() => {
-    if (selected && issueId) localStorage.setItem(`dash-chat-last:${issueId}`, selected);
-  }, [selected, issueId]);
+  // Select a chat to open. Persists the choice as the issue's explicit shared
+  // selected_session for a WORK chat; a reviewer is shown locally but NEVER
+  // persisted, so selection can't flip to a reviewer and the card keeps speaking
+  // for the work chat.
+  const selectChat = useCallback((sid) => {
+    setSelected(sid);
+    setMode('resume');
+    const chat = (state.chats || []).find(c => c.sessionId === sid);
+    if (chat && chat.role !== 'reviewer') updateChangeField(issueId, 'selected_session', sid);
+  }, [issueId, state.chats]);
 
   // A convo pill in the detail view asked to open a specific chat. The nonce
   // re-fires the selection even when the same session is clicked again.
   useEffect(() => {
-    if (requestSession?.sessionId) {
-      setSelected(requestSession.sessionId);
-      setMode('resume');
-    }
+    if (requestSession?.sessionId) selectChat(requestSession.sessionId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestSession?.nonce, requestSession?.sessionId]);
 
   // Create a worktree (if needed) + a new chat of the given agent. For codex the
@@ -825,11 +840,11 @@ export function IssueTerminal({ issueId, requestSession, active }) {
       });
       const data = await r.json();
       if (!r.ok || data.error) { setError(data.error || 'unlink failed'); return; }
-      // Server-mediated row write (conversation unlink) — announce it too.
+      // Server-mediated row write (conversation unlink) — announce it too. The
+      // server clears a now-dangling selected_session authoritatively (see the
+      // DELETE handler), so the refresh below reflects the fallback with no second
+      // write here.
       emitIssuesChange('UPDATE', { id: issueId });
-      if (localStorage.getItem(`dash-chat-last:${issueId}`) === sessionId) {
-        localStorage.removeItem(`dash-chat-last:${issueId}`);
-      }
       if (selected === sessionId) setSelected(null); // auto-open picks the next
       await refresh();
     } catch (e) {
@@ -933,13 +948,15 @@ export function IssueTerminal({ issueId, requestSession, active }) {
     );
   }
 
+  const selectedChat = (state.chats || []).find(c => c.sessionId === selected);
+
   return (
     <div className="issue-terminal-wrap">
       <div className="issue-terminal-bar">
         <ChatSwitcher
           chats={state.chats || []}
           selected={selected}
-          onSelect={(sid) => { setSelected(sid); setMode('resume'); }}
+          onSelect={selectChat}
           onNew={newChat}
           onUnlink={unlinkChat}
           onRename={renameChat}
@@ -947,16 +964,16 @@ export function IssueTerminal({ issueId, requestSession, active }) {
         />
       </div>
       {error && <p className="issue-empty-err">{error}</p>}
-      {selected && owned && (
+      {/* Exactly ONE pane per issue: its selected chat. When this env is VISIBLE
+          the user asked for it, so it mounts (resuming a dormant chat if need be);
+          when HIDDEN (the board pool) it mounts only if the chat is already LIVE,
+          never cold-spawning claude on board load. The needs-input dot therefore
+          reflects the selected chat alone — a reviewer or a second work chat never
+          flags the card. */}
+      {selected && owned && (active || selectedChat?.live) && (
         <ChatPane key={selected} issueId={issueId} sessionId={selected} mode={mode} active={active}
-          agent={(state.chats || []).find(c => c.sessionId === selected)?.agent || DEFAULT_AGENT} />
+          agent={selectedChat?.agent || DEFAULT_AGENT} />
       )}
-      {/* Every OTHER live chat of this issue keeps a hidden pane mounted, so
-          "one pane per live session" holds even with several live chats on one
-          card — switching the switcher never kills a sibling's detection. */}
-      {(state.chats || []).filter((c) => c.live && c.sessionId !== selected).map((c) => (
-        <ShadowChatPane key={c.sessionId} issueId={issueId} sessionId={c.sessionId} agent={c.agent} />
-      ))}
     </div>
   );
 }

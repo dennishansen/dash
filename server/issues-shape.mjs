@@ -27,6 +27,10 @@ export function shapeRow(row) {
     // The App-pane target path (null = '/', the canvas). Stored beside `port`;
     // the /open redirect lands the iframe on localhost:<port><app_path>.
     app_path: row.app_path ?? null,
+    // The EXPLICIT chat to open for this issue (null = never selected). Source of
+    // truth for the switcher's auto-open and the board's attach-only-selected
+    // seed; written on switch / non-reviewer chat create, never by a reviewer.
+    selected_session: row.selected_session ?? null,
     created: row.created || null,
     updated: row.updated_at || null,
     closed: row.closed_at || null,   // when it entered done/rejected (sorts the archive cols)

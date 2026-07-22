@@ -447,23 +447,47 @@ export function agentChoices() {
   return Object.values(AGENTS).map(a => ({ id: a.id, label: a.label }));
 }
 
-// A conversations[] entry → { agent, sessionId }. Bare uuid = claude (backward
-// compatible with every pre-existing row); `<agent>:<uuid>` = that agent.
+// Roles a chat can carry BEYOND its agent. A `reviewer` is a chat spawned to
+// review the branch (usually codex): it rides ALONGSIDE the agent, never
+// replaces it, and is orthogonal — a reviewer is still a claude/codex CLI. Kept
+// as its own token so the trailing sessionId stays a clean uuid and so the
+// "never the default selection / never dots the card" rules key off one field.
+export const ROLES = { reviewer: true };
+
+// A conversations[] entry → { agent, role, sessionId }. The entry is an optional
+// role token, then an optional agent token, then the bare session uuid:
+//   `<uuid>`                 → claude, no role   (every pre-existing row)
+//   `codex:<uuid>`           → codex,  no role
+//   `reviewer:codex:<uuid>`  → codex,  reviewer
+//   `reviewer:<uuid>`        → claude, reviewer
+// KNOWN tokens are peeled off the FRONT (order-independent); the first unknown
+// segment is the sessionId and keeps its bytes verbatim, so every read path
+// (transcript, liveness, delete-resolve) still gets a clean id.
 export function parseHandle(entry) {
-  if (typeof entry !== 'string') return { agent: DEFAULT_AGENT, sessionId: '' };
-  const i = entry.indexOf(':');
-  if (i > 0) {
-    const maybe = entry.slice(0, i);
-    if (AGENTS[maybe]) return { agent: maybe, sessionId: entry.slice(i + 1) };
+  if (typeof entry !== 'string') return { agent: DEFAULT_AGENT, role: null, sessionId: '' };
+  let rest = entry, agent = DEFAULT_AGENT, role = null;
+  for (;;) {
+    const i = rest.indexOf(':');
+    if (i <= 0) break;
+    const head = rest.slice(0, i);
+    if (ROLES[head] && !role) role = head;
+    else if (AGENTS[head] && agent === DEFAULT_AGENT) agent = head;
+    else break; // unknown token → this is the sessionId
+    rest = rest.slice(i + 1);
   }
-  return { agent: DEFAULT_AGENT, sessionId: entry };
+  return { agent, role, sessionId: rest };
 }
 
-// { agent, sessionId } → conversations[] entry. Claude stays a bare uuid so
-// existing rows and the many-callers that read conversations as plain ids are
-// unchanged; other agents get an `<agent>:` prefix.
-export function formatHandle(agent, sessionId) {
-  return agent && agent !== DEFAULT_AGENT ? `${agent}:${sessionId}` : sessionId;
+// { agent, sessionId, role } → conversations[] entry. Claude-with-no-role stays a
+// bare uuid so existing rows and the many callers that read conversations as
+// plain ids are unchanged; other agents get an `<agent>:` prefix and a reviewer
+// gets a leading `reviewer:` token (role first, then agent, then uuid).
+export function formatHandle(agent, sessionId, role = null) {
+  const parts = [];
+  if (role && ROLES[role]) parts.push(role);
+  if (agent && agent !== DEFAULT_AGENT) parts.push(agent);
+  parts.push(sessionId);
+  return parts.join(':');
 }
 
 // Read paths (readTranscript, resolveChat, liveness) are reached by bare uuid

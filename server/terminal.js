@@ -344,12 +344,13 @@ async function chatHandlesFor(env) {
   return Array.isArray(row?.conversations) ? row.conversations : [];
 }
 
-// Link a chat to an environment, encoding its agent in the handle (bare uuid =
-// claude, `codex:<uuid>` = codex — see formatHandle). Issue chats append to the
-// shared Supabase conversations[]; MAIN appends to the machine-local store. ONE
-// entry per call (both append paths de-dupe).
-async function linkChat(env, sessionId, agent = DEFAULT_AGENT) {
-  const handle = formatHandle(agent, sessionId);
+// Link a chat to an environment, encoding its agent AND role in the handle (bare
+// uuid = claude, `codex:<uuid>` = codex, `reviewer:codex:<uuid>` = codex reviewer
+// — see formatHandle). Issue chats append to the shared Supabase conversations[];
+// MAIN appends to the machine-local store. ONE entry per call (both append paths
+// de-dupe).
+async function linkChat(env, sessionId, agent = DEFAULT_AGENT, role = null) {
+  const handle = formatHandle(agent, sessionId, role);
   if (env === MAIN_ENV) return linkMainChat(handle);
   const { appendToArray } = await import('./issues-store.mjs');
   return appendToArray(env, 'conversations', [handle]);
@@ -667,17 +668,17 @@ export async function issueChats(env) {
   // 2 × convos-per-issue. A live PTY short-circuits the scan entirely.
   const live = globalThis.__labChats;
   const chats = [];
-  for (const { sessionId, agent } of conversations) {
+  for (const { sessionId, agent, role } of conversations) {
     const name = names[sessionId] || null; // null = show the derived default
     const session = live?.get(sessionId);
-    if (liveSession(session)) { chats.push({ sessionId, agent, name, resumable: true, live: true, cwd: null }); continue; }
+    if (liveSession(session)) { chats.push({ sessionId, agent, name, role, resumable: true, live: true, cwd: null }); continue; }
     // Live in ANOTHER dash server on this machine counts as live too — the
     // attach path redirects there, so reporting it resumable+live is honest,
     // and reporting it dormant would invite the duplicate cold resume.
     const owner = await liveChatOwner(sessionId);
-    if (owner && owner.pid !== process.pid) { chats.push({ sessionId, agent, name, resumable: true, live: true, cwd: null }); continue; }
+    if (owner && owner.pid !== process.pid) { chats.push({ sessionId, agent, name, role, resumable: true, live: true, cwd: null }); continue; }
     const { resumable, cwd } = await resolveChat(sessionId);
-    chats.push({ sessionId, agent, name, resumable, live: false, cwd });
+    chats.push({ sessionId, agent, name, role, resumable, live: false, cwd });
   }
   return { worktree: !!dir, dir, chats };
 }
@@ -1364,6 +1365,17 @@ export function autonomousChatIntro(issueId, title, flow = 'change', agent = DEF
   return `This chat is scoped to issue ${named}${st}, and you were launched autonomously to implement it end-to-end. Run \`node scripts/board.mjs get ${issueId}\` to load the full issue, then invoke the \`${skill}\` skill and carry it through to completion — ${tail}`;
 }
 
+// Intro for a REVIEWER chat — a chat spawned to REVIEW the change on this
+// worktree's branch, not to implement anything. It rides the same eager
+// server-side spawn as an autonomous kick-off (so the PTY survives the launcher's
+// turn cycle — the whole reason reviewers moved off the reaped background bash),
+// but the brief points it at the diff and asks for findings, not edits. Agent-
+// agnostic: codex or claude both gather their own context from git + the source.
+export function reviewerChatIntro(issueId, title) {
+  const named = title ? `\`${issueId}\` — "${title}"` : `\`${issueId}\``;
+  return `You are a CODE REVIEWER for issue ${named}. A change was implemented on THIS branch (the worktree you are in) — review it, do NOT edit any files. Run \`git status\` first. The change under review is usually the UNCOMMITTED working tree, so start with \`git diff HEAD\` (and if that's empty, the branch is committed — use \`git show HEAD\` / \`git diff HEAD~1\`). Ignore unrelated pre-existing divergence from \`main\` — review only THIS change. Read both CLAUDE.md files for the project's principles, then read the changed source. Report, most-severe first and each with a \`file:line\`: correctness bugs and broken edge cases (give a concrete failing input → wrong output); contract/interface violations; and change-philosophy problems (a band-aid over a wrong model, a pattern that should have been unified, a backwards-compat shim that should have been a deletion, a name that lies). Be concise and specific. If nothing would block merge, say so plainly. You are the reviewer — end with your findings rather than offering to implement fixes.`;
+}
+
 // Intro for a NEW main chat — the main-root analog of issueChatIntro. Claude
 // gets `/main` (the trunk-mode skill: work directly on the primary checkout, no
 // worktree); codex, which has no Claude-Code skills, gets the same orientation
@@ -1729,9 +1741,19 @@ export async function handleTerminalHttp(req, res, segs) {
     const issueId = new URL(req.url, 'http://x').searchParams.get('issue');
     if (!issueId) return json({ error: 'issue required' }, 400);
     const data = await issueChats(issueId);
-    // Main has no reserved dev-server port (its app preview rides the origin);
-    // only an issue reserves one — skip the Supabase read for main.
-    data.port = issueId === MAIN_ENV ? null : await issuePort(issueId);
+    if (issueId === MAIN_ENV) {
+      // Main has no reserved port (its app preview rides the origin) and no
+      // shared issue row — its selected chat is per-browser (localStorage).
+      data.port = null;
+      data.selected_session = null;
+    } else {
+      // ONE row read for BOTH the reserved dev-server port and the explicit
+      // selected chat, so the switcher's auto-open sees the shared choice.
+      const { get } = await import('./issues-store.mjs');
+      const row = await get(issueId).catch(() => null);
+      data.port = row && row.port != null ? Number(row.port) : null;
+      data.selected_session = row?.selected_session ?? null;
+    }
     return json(data);
   }
 
@@ -1857,7 +1879,13 @@ export async function handleTerminalHttp(req, res, segs) {
     const agent = agentById(body.agent).id; // normalize unknown → claude
     if (!issue) return json({ error: 'issue required' }, 400);
     const isMain = issue === MAIN_ENV;
-    const autonomous = body.autonomous && !isMain; // main is never an autonomous kick-off
+    // A reviewer chat reviews a branch — always issue-scoped, never main.
+    const role = body.role === 'reviewer' ? 'reviewer' : null;
+    if (role && isMain) return json({ error: 'a reviewer chat requires an issue, not main' }, 400);
+    // A reviewer FORCES the eager server-side spawn (like an autonomous kick-off)
+    // so its PTY is owned by the server and survives the launcher's turn cycle —
+    // that survival is the whole point of moving reviews off the reaped bash task.
+    const autonomous = (body.autonomous || role === 'reviewer') && !isMain;
     // Main runs in the repo root with no worktree and no reserved port; an issue
     // must exist as a row and gets a worktree + port (idempotent).
     let dir, port = null;
@@ -1873,6 +1901,29 @@ export async function handleTerminalHttp(req, res, segs) {
       dir = wt.dir; port = alloc.port ?? null;
     }
     const flowVal = flow === 'bug' ? 'bug' : 'change';
+    // The autonomous first turn: a reviewer gets the review brief, everything
+    // else gets the implement-it brief. `prompt` overrides either.
+    const autonomousIntro = (meta) => prompt
+      || (role === 'reviewer'
+        ? reviewerChatIntro(issue, meta.title)
+        : autonomousChatIntro(issue, meta.title, flow, agent, meta.status));
+    // Creating a WORK chat makes it the issue's selected chat (the one the card
+    // speaks for), covering the + button, spawn-issue and kick-off in one place.
+    // A reviewer NEVER writes selected_session, so selection can't flip to it.
+    const selectChat = async (sid) => {
+      if (isMain || role === 'reviewer') return;
+      const { update } = await import('./issues-store.mjs');
+      // Retry once: the chat is already linked (and, when autonomous, its PTY is
+      // spawned), so we must NEVER fail the request and strand a live chat — but a
+      // transient PATCH failure would leave the new chat unselected, which the
+      // create-select contract forbids, so the persisted selection is worth a
+      // second attempt. A persistent failure self-heals: the creating client shows
+      // the chat locally, and the next card-open re-picks + persists it.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try { const r = await update(issue, { selected_session: sid }); if (!r?.error) return; }
+        catch { /* transient — retry, then fall through to best-effort */ }
+      }
+    };
 
     if (!agentById(agent).dashMintsId) {
       // CODEX: it mints its own id, so we spawn eagerly (human AND autonomous),
@@ -1883,13 +1934,11 @@ export async function handleTerminalHttp(req, res, segs) {
       if (isMain) intro = mainChatIntro(agent);
       else {
         const meta = await issueMeta(issue);
-        intro = autonomous
-          ? (prompt || autonomousChatIntro(issue, meta.title, flow, agent, meta.status))
-          : issueChatIntro(issue, meta.title, meta.status);
+        intro = autonomous ? autonomousIntro(meta) : issueChatIntro(issue, meta.title, meta.status);
       }
       const r = await spawnCodexNewChat({ issueId: issue, cwd: dir, cols: 100, rows: 30, initialPrompt: intro, model });
       if (r.error) return json({ error: r.error }, 500);
-      const link = await linkChat(issue, r.sessionId, agent);
+      const link = await linkChat(issue, r.sessionId, agent, role);
       if (link?.error) {
         // Codex is spawned BEFORE the link (its id doesn't exist until it runs),
         // so a link failure would strand a live, UNLINKED codex process — invisible
@@ -1900,29 +1949,32 @@ export async function handleTerminalHttp(req, res, segs) {
         chats.delete(r.sessionId);
         return json({ error: `link failed: ${link.error}` }, 500);
       }
+      await selectChat(r.sessionId);
       return json({ ok: true, sessionId: r.sessionId, agent, mode: 'new',
-        ...(autonomous ? { autonomous: true, flow: flowVal } : {}), dir, port });
+        ...(autonomous ? { autonomous: true, flow: flowVal } : {}), ...(role ? { role } : {}), dir, port });
     }
 
     // CLAUDE: the dash mints the uuid up front and links it; the PTY spawns
     // lazily when the browser attaches (human, with mainChatIntro/issueChatIntro
     // chosen there) or eagerly now (autonomous — issue only).
     const sessionId = crypto.randomUUID();
-    const link = await linkChat(issue, sessionId, agent);
+    const link = await linkChat(issue, sessionId, agent, role);
     if (link?.error) return json({ error: `link failed: ${link.error}` }, 500);
     if (autonomous) {
       // Spawn the real claude PTY immediately, keyed by sessionId (same key
       // attachChat uses for a 'new' chat) so a later browser open REATTACHES
       // to this running process rather than spawning a second one. The intro
-      // tells it to run the flow to completion instead of waiting for direction.
+      // tells it to run the flow to completion (or, for a reviewer, to review).
       const meta = await issueMeta(issue);
-      const intro = prompt || autonomousChatIntro(issue, meta.title, flow, agent, meta.status);
+      const intro = autonomousIntro(meta);
       const spawned = spawnChat({ issueId: issue, sessionId, mode: 'new', cwd: dir, cols: 100, rows: 30, initialPrompt: intro, key: sessionId, model, effort, agent });
       // A freshly-minted uuid losing its claim means another server claimed it
       // in the same instant — vanishingly rare, but never fork: report it.
       if (!spawned) return json({ error: 'chat is live in another dash server' }, 409);
-      return json({ ok: true, sessionId, agent, mode: 'new', autonomous: true, flow: flowVal, dir, port });
+      await selectChat(sessionId);
+      return json({ ok: true, sessionId, agent, mode: 'new', autonomous: true, flow: flowVal, ...(role ? { role } : {}), dir, port });
     }
+    await selectChat(sessionId);
     return json({ ok: true, sessionId, agent, mode: 'new', dir, port });
   }
 
@@ -1942,13 +1994,21 @@ export async function handleTerminalHttp(req, res, segs) {
       await setChatName(issue, session, '');
       return json({ ok: true });
     }
-    const { removeFromArray } = await import('./issues-store.mjs');
+    const { removeFromArray, get, update } = await import('./issues-store.mjs');
     const r = await removeFromArray(issue, 'conversations', [handle]);
     if (r?.error) return json({ error: `unlink failed: ${r.error}` }, 500);
     // A name belongs to the LINK, not to the transcript: drop it with the
     // association so an unlinked-then-relinked chat starts from the default and
     // the map can't accumulate keys for chats the env no longer has.
     await setChatName(issue, session, '');
+    // Keep the invariant: selected_session must point at a LINKED chat. If we just
+    // unlinked the selected one, clear it so auto-open falls back and the board
+    // stops warming a chat this issue no longer tracks. Authoritative here (not
+    // just in the client) so a direct API unlink can't leave it dangling.
+    try {
+      const row = await get(issue).catch(() => null);
+      if (row?.selected_session === session) await update(issue, { selected_session: null });
+    } catch { /* best-effort; the unlink itself succeeded */ }
     await invalidateIssuesCache();
     return json({ ok: true });
   }

@@ -76,6 +76,26 @@ export async function upsert(email, fields) {
   return { ok: true, email: key };
 }
 
+// --- currently-selected chat -------------------------------------------------
+//
+// The session id of the chat this person has open right now, stored on their
+// profile so it is correct across devices (sign in elsewhere and it follows) and
+// readable by the idle-chat reaper, which must never stop a chat someone has
+// selected. Written only by the owner (upsert, RLS-gated to email=auth.email());
+// null clears it.
+export async function setSelectedChat(email, sessionId) {
+  const key = normalizeEmail(email);
+  if (!key) return { error: 'setSelectedChat requires an email' };
+  return upsert(key, { selected_chat: sessionId || null });
+}
+
+// Every chat currently selected by anyone — the set the reaper skips. Read-all
+// (the reaper carries the service key); one column, so it stays cheap.
+export async function selectedChats() {
+  const rows = await rest(REST, 'GET', '?selected_chat=not.is.null&select=selected_chat');
+  return [...new Set((rows || []).map((r) => r.selected_chat).filter(Boolean))];
+}
+
 // The one shape an avatar key may have: `<scope uuid>/<32 hex>.<ext>`. Exactly
 // one slash and no dots but the extension, so a traversal segment
 // (`mine/../theirs/x.png`) cannot be expressed at all. The database enforces the

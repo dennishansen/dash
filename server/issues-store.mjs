@@ -40,7 +40,7 @@ export const VALID_STATUS = new Set(['maybe', 'future', 'next', 'in-progress', '
 
 // Columns the list endpoint needs — everything but `body` (kept off the list
 // path so it stays cheap as the corpus grows past hundreds). Detail fetches `*`.
-const LIST_COLS = 'id,title,tags,branches,sessions,commits,conversations,status,rank,owner,created,updated_at,closed_at,port,chat_names';
+const LIST_COLS = 'id,title,tags,branches,sessions,commits,conversations,status,rank,owner,created,updated_at,closed_at,port,chat_names,selected_session';
 
 const enc = encodeURIComponent;
 

@@ -19,7 +19,7 @@ import {
 } from './dock.jsx';
 import { useLocalBackend } from './capabilities.js';
 import { appPortForEnv } from './app-env.js';
-import { ArrowUpRight, WorkspacePanelIcon } from './icons.jsx';
+import { ArrowUpRight, WorkspacePanelIcon, Search } from './icons.jsx';
 import { useFetch, useAsync } from './api.js';
 import { stateCounts, listChanges } from './board-store.js';
 import { onAuth, ensureFreshToken, ensureDevSession, signOut } from './auth.js';
@@ -262,7 +262,7 @@ function CrumbCopy({ id, section }) {
   useHotkey('Mod+KeyS', () => { onCopy(); }, { terminal: 'handle', repeat: false });
   return (
     <button type="button" className={`crumb-cur crumb-copy${copied ? ' copied' : ''}`}
-      onClick={onCopy} title={copied ? 'Copied!' : `${label} — click to copy id (${id})`}>
+      onClick={onCopy} title={copied ? 'Copied!' : `${label} — click to copy id (${id}) · ⌘S`}>
       {copied ? 'copied ✓' : label}
     </button>
   );
@@ -307,6 +307,17 @@ function TopBar({ leftCollapsed, onToggleLeft, chatOpen, onToggleChat, appOpen, 
           </span>
         ))}
       </nav>
+      {/* Search opens the ⌘K palette by pointer — present on every route's nav,
+          the mouse twin of the global chord. */}
+      <button
+        type="button"
+        className="topbar-btn search-open"
+        title="Search issues (⌘K)"
+        aria-label="Search issues"
+        onClick={() => window.dispatchEvent(new CustomEvent('dash:open-palette'))}
+      >
+        <Search size={15} />
+      </button>
       {/* Two panel toggles, each shown only while its panel is CLOSED — once open,
           the panel's own ✕ (top-left of its navbar) is how you close it. Ordered
           to mirror the columns: chat (inner) then app (outer, hugs the edge). */}
@@ -474,26 +485,43 @@ function Shell() {
     }
   }, [chatOpen, activeEnv]);
 
-  // Seed the pool with every issue that has a LIVE server-side chat (the
-  // `/terminal/live` set) — chats that exist on the server but were never opened
-  // this session. Mounting their (hidden) ChatPane REATTACHES to the running PTY
-  // (cheap — no claude spawn, no transcript scan) and starts reporting
-  // working/idle, so the "needs input" dots populate without a manual card open.
-  // We deliberately do NOT cold-resume dormant chats here: that would both
-  // stampede the server and silently resurrect finished conversations — their dot
-  // appears when the human actually opens the card, as before.
+  // Seed the pool from the LIVE server-side chats (the `/terminal/live` pairs)
+  // that each issue has EXPLICITLY selected — its `selected_session`. At most one
+  // pane per issue, and only when that chat is already live, so the board still
+  // never cold-spawns on load AND a reviewer / a second work chat never warms or
+  // dots a card (they're never an issue's selected_session). The env is the
+  // SELECTING issue; however many pooled issues later want the same session, only
+  // the ownership winner mounts its ChatPane (see session-pool.js). Mounting the
+  // (hidden) ChatPane REATTACHES to the running PTY (cheap — no claude spawn, no
+  // transcript scan) and starts reporting working/idle, so the selected chat's
+  // "needs input" dot populates without a manual card open.
   //
   // Background work yields to the foreground: the initial seed is DEFERRED to
   // browser idle (first paint + any immediate card-open win) and THROTTLED a
-  // couple per tick. A 30s poll catches chats that come alive later (e.g. an
-  // autonomously-spawned issue). A ref tracks what's been queued so re-seeds and
-  // openedEnvs changes don't double-mount.
+  // couple per tick. A 30s poll catches chats that come alive (or get selected)
+  // later (e.g. an autonomously-spawned issue). A ref tracks which SESSIONS have
+  // been queued so re-seeds and openedEnvs changes don't double-mount.
   const seededRef = React.useRef(new Set());
+  // Latest board rows for selected_session resolution — a ref so the mount-once
+  // seed effect below reads fresh data without re-running.
+  const changesRef = React.useRef(null);
+  changesRef.current = changes;
   React.useEffect(() => {
     let cancelled = false;
     let pumpTimer = null;
-    const trickleIn = (ids) => {
-      const queue = ids.filter((id) => id && !seededRef.current.has(id));
+    const trickleIn = (pairs) => {
+      // Resolution needs the board rows; until they land, defer the whole batch
+      // (nothing is marked seeded) and retry shortly.
+      const rows = changesRef.current;
+      if (!rows) { pumpTimer = setTimeout(seed, 1000); return; }
+      // Warm EXACTLY the chat each issue points its explicit selected_session at —
+      // and only because it turned up in /terminal/live is it already LIVE, so
+      // this still never cold-spawns. A live session that NO issue has selected (a
+      // reviewer, a second work chat, a revived dormant sibling) is deliberately
+      // skipped: the board dot speaks for the one chat you'd actually resume, and
+      // a reviewer must never flag a card. The env is the SELECTING issue itself.
+      const envFor = (session) => rows.find((r) => r.selected_session === session)?.id;
+      const queue = pairs.filter((p) => p && p.session && !seededRef.current.has(p.session) && envFor(p.session));
       if (!queue.length) return;
       let i = 0;
       const STEP = 2;
@@ -502,9 +530,12 @@ function Shell() {
         const batch = queue.slice(i, i + STEP);
         i += STEP;
         if (batch.length) {
-          batch.forEach((id) => seededRef.current.add(id));
+          batch.forEach((p) => seededRef.current.add(p.session));
+          // Set-dedupe: two live sessions can resolve to the SAME issue, and a
+          // duplicate env id would mount duplicate same-key panels.
+          const envs = [...new Set(batch.map((p) => envFor(p.session)))];
           setOpenedEnvs((prev) => {
-            const add = batch.filter((id) => !prev.includes(id));
+            const add = envs.filter((id) => id && !prev.includes(id));
             return add.length ? [...prev, ...add] : prev;
           });
         }
@@ -516,7 +547,7 @@ function Shell() {
       try {
         const r = await fetch('/api/dash/terminal/live');
         const d = await r.json();
-        if (!cancelled && Array.isArray(d.issues)) trickleIn(d.issues);
+        if (!cancelled && Array.isArray(d.sessions)) trickleIn(d.sessions);
       } catch { /* no local backend (remote) — nothing to seed */ }
     };
     const ric = window.requestIdleCallback;

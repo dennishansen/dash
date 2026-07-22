@@ -3336,6 +3336,10 @@ img.zoomable {
 }
 .app-bar-reload:hover { color: var(--text); background: var(--bg-1); border-color: var(--line); }
 .app-bar-reload > svg { display: block; }
+/* Back/forward pair, left of the address bar — a snug group that drives the
+   iframe's own history over the cooperating-guest channel. */
+.app-bar-nav { display: inline-flex; align-items: center; gap: 2px; margin-right: 8px; }
+.app-bar-nav .app-bar-reload { margin-left: 0; }
 /* The actions cluster floats at the far right: split refresh, then the ↗
    new-tab link. The split's two halves read as one control — shared rounded
    ends, flat where they meet. */
@@ -3657,6 +3661,19 @@ img.zoomable {
   color: #2f9e6e;
   background: color-mix(in srgb, #2f9e6e 13%, transparent);
   border-color: color-mix(in srgb, #2f9e6e 30%, transparent);
+}
+/* A role tag (reviewer) rides beside the agent badge — a distinct amber so a
+   reviewer chat reads apart from a work chat at a glance without stealing the
+   agent's colour. */
+.role-badge-reviewer {
+  color: #e0a23a; /* dark is the default root */
+  background: color-mix(in srgb, #e0a23a 15%, transparent);
+  border-color: color-mix(in srgb, #e0a23a 34%, transparent);
+}
+:root[data-theme='light'] .role-badge-reviewer {
+  color: #b9791a;
+  background: color-mix(in srgb, #b9791a 12%, transparent);
+  border-color: color-mix(in srgb, #b9791a 30%, transparent);
 }
 
 .issue-chat-pick-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
