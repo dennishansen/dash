@@ -13,6 +13,11 @@ export function shapeRow(row) {
     title: row.title || row.id,
     status: row.status,
     owner: row.owner ?? null,
+    // Who filed the issue — immutable historical provenance, ALWAYS a human
+    // (git identity for CLI creates, the signed-in email for browser creates).
+    // No FK, unlike owner: a frozen snapshot that survives the creator leaving
+    // the team. Null on pre-column rows (never backfilled by guess).
+    created_by: row.created_by ?? null,
     tags: Array.isArray(row.tags) ? row.tags : [],
     branches,
     sessions: Array.isArray(row.sessions) ? row.sessions : [],

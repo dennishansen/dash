@@ -35,6 +35,11 @@ create table if not exists public.issues (
   status        text not null default 'next',     -- kanban column (see CHECK below)
   rank          integer,                          -- order within a column (set by RPCs)
   owner         text,                             -- optional assignee, nullable
+  -- Who filed the issue — immutable provenance, stamped by a trigger (below) to
+  -- the JWT email on a browser insert / a normalized allow-listed identity on a
+  -- service insert. Unlike owner it has NO foreign key: a frozen snapshot that
+  -- must survive the creator leaving the team (dash_allowed_emails hard-deletes).
+  created_by    text,
 
   -- Array fields. The app appends/removes de-duped values; empty array default.
   tags          text[] not null default '{}',
@@ -196,6 +201,47 @@ returns boolean language sql security definer stable as $$
     where lower(email) = lower(coalesce(auth.jwt() ->> 'email', ''))
   );
 $$;
+
+-- ---------------------------------------------------------------------------
+-- created_by — stamp + freeze the issue's creator (immutable provenance).
+-- ---------------------------------------------------------------------------
+-- created_by is a FROZEN snapshot of who filed an issue, and unlike owner it has
+-- no foreign key (it must survive the creator leaving the team, and
+-- dash_allowed_emails hard-deletes on offboarding). One trigger guarantees it
+-- can be neither spoofed nor rewritten:
+--   • UPDATE (any role)              → new := old. Write-once, set at insert.
+--   • INSERT by a browser (JWT)      → created_by := the JWT email, ignoring what
+--                                       the client sent. Unspoofable.
+--   • INSERT by service_role (CLI)   → normalize the payload (the CLI resolves an
+--                                       allow-list-validated git identity itself).
+--   • INSERT, any role               → the resolved created_by must be a CURRENT
+--                                       allow-listed human. The check is INLINE
+--                                       here (not a callable helper) so there is no
+--                                       membership oracle an outsider could probe;
+--                                       a trigger fn can't be invoked over REST.
+create or replace function public.issues_stamp_creator()
+returns trigger language plpgsql security definer set search_path to 'public' as $$
+begin
+  if tg_op = 'UPDATE' then
+    new.created_by = old.created_by;                 -- frozen: set once, at insert
+    return new;
+  end if;
+  if auth.email() is not null then
+    new.created_by = lower(auth.email());            -- browser insert: force real identity
+  elsif new.created_by is not null then
+    new.created_by = lower(new.created_by);          -- service_role insert: normalize the payload
+  end if;
+  if new.created_by is not null
+     and not exists (select 1 from public.dash_allowed_emails where email = new.created_by) then
+    raise exception 'created_by "%" is not an allow-listed email', new.created_by
+      using errcode = '23514';
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists issues_created_by_immutable on public.issues;
+create trigger issues_created_by_immutable before insert or update on public.issues
+  for each row execute function public.issues_stamp_creator();
 
 -- ---------------------------------------------------------------------------
 -- Row-Level Security — the whole point of the "safe to serve publicly" claim.

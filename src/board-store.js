@@ -16,6 +16,7 @@ import {
   listAll, listBodies as listBodiesStore, get, create, update, setRanks, moveColumn, setStatus, setDep, remove, VALID_STATUS,
 } from '../server/issues-store.mjs';
 import { shapeRow } from '../server/issues-shape.mjs';
+import { userEmail } from './auth.js';
 
 // Live cards first is a git concept (none here), so the remote order is simply
 // created desc — the same secondary sort the local path uses.
@@ -48,7 +49,11 @@ export async function changeDetail(id) {
 export async function createChange(status, ids) {
   if (!VALID_STATUS.has(status)) return { error: `invalid status "${status}"` };
   const id = `i-${randomHex(3)}`;
-  const r = await create({ id, title: 'New issue', status, created: today() });
+  // The signed-in creator — immutable provenance. The DB trigger also forces
+  // created_by to the JWT email on an authenticated insert, so this can't be
+  // spoofed; sending it just keeps the payload correct before the refetch.
+  const created_by = userEmail();
+  const r = await create({ id, title: 'New issue', status, created: today(), created_by });
   if (r.error) return r;
   const rank = await setRanks([id, ...(Array.isArray(ids) ? ids : [])]);
   if (rank.error) return rank;
