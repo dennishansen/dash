@@ -3958,7 +3958,6 @@ img.zoomable {
   align-self: center;
 }
 .card-prop-tag { font-size: 11px; padding: 0 6px; }
-.card-prop-more { color: var(--text-mute); font-size: 11px; }
 .card-prop-id { color: var(--text-mute); font-family: var(--font-mono, monospace); font-size: 11px; }
 .card-prop-date { color: var(--text-mute); font-size: 11px; white-space: nowrap; }
 
@@ -4344,6 +4343,14 @@ img.zoomable {
 /* Tags no longer bold — they match the one consistent property-select chip look;
    the class stays as a semantic/test hook. Overrides the earlier bold rule. */
 .field-pill--tag { font-weight: normal; }
+/* A toned tag (see tag-style.js — `bug` today). Rides the themed --bad tokens so
+   it reads correctly in light and dark without a second rule. Background only —
+   it keeps the base's transparent border, so it carries no ring and stays
+   exactly the same size as every other pill. */
+.field-pill--danger {
+  background: var(--bad-bg);
+  color: var(--bad);
+}
 /* Reveal the pill link on hover OR keyboard focus, so a keyboard user tabbing to
    it sees it (and it stays clickable), not just on mouse hover. */
 .field-pill--reveal .pill-reveal:focus-visible { opacity: 1; pointer-events: auto; }
@@ -4366,7 +4373,10 @@ img.zoomable {
 }
 /* Issue titles get long — a chip's label truncates; the "+N" reads the rest. */
 .chip-label { display: block; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chip-overflow { color: var(--text-mute); font-size: 12px; }
+/* The "+N" truncation indicator carries NO weight of its own — it is drawn with
+   the exact same classes as the pills it stands in for (.field-pill, plus
+   .card-prop-tag on a board card), so it reads as one of them rather than as a
+   different element. The class stays as a semantic / test hook. */
 /* The search/create input that heads every chip menu (OptionMenu `header`). */
 .chip-search {
   width: 100%; margin-bottom: 6px; padding: 4px 7px;

@@ -13,6 +13,7 @@ import { X, Pencil, Trash, User, ArrowUpRight } from '../icons.jsx';
 import { Avatar, PersonLabel, usePeople, useDismiss, normalizeEmail } from '../profiles.jsx';
 import { OptionMenu } from '../OptionMenu.jsx';
 import { useAnchoredPopover } from '../popover.js';
+import { tagPillClass } from '../tag-style.js';
 
 // Inline-editable issue title. Looks like the static <h2> (CSS .title-edit),
 // gaining a box outline only on hover / focus. Enter or blur saves via
@@ -155,7 +156,7 @@ function ChipMultiSelect({ selected, options, onToggle, onCreate, triggerTitle, 
         {selected.length ? (
           <>
             {selected.slice(0, VISIBLE).map(s => <Chip key={s.key} {...s} />)}
-            {selected.length > VISIBLE ? <span className="chip-overflow">+{selected.length - VISIBLE}</span> : null}
+            {selected.length > VISIBLE ? <span className="field-pill chip-overflow">+{selected.length - VISIBLE}</span> : null}
           </>
         ) : <EmptySlot label={emptyLabel} />}
       </div>
@@ -198,7 +199,7 @@ function TagSelect({ id, tags, allTags, onChanged }) {
     const r = await updateChangeField(id, 'tags', next);
     if (!(r && r.error)) onChanged?.();
   };
-  const selected = tags.map(t => ({ key: t, label: t, className: 'field-pill--tag' }));
+  const selected = tags.map(t => ({ key: t, label: t, className: tagPillClass(t) }));
   const options = (allTags || []).map(t => ({ key: t, label: t }));
   return (
     <ChipMultiSelect selected={selected} options={options} onToggle={toggle} onCreate={toggle}
@@ -358,7 +359,7 @@ function PillValue({ values }) {
   return (
     <span className="prop-pills">
       {values.slice(0, PILL_CAP).map(v => <span key={v} className="field-pill" title={v}>{v}</span>)}
-      {extra > 0 ? <span className="chip-overflow" title={values.slice(PILL_CAP).join('\n')}>+{extra}</span> : null}
+      {extra > 0 ? <span className="field-pill chip-overflow" title={values.slice(PILL_CAP).join('\n')}>+{extra}</span> : null}
     </span>
   );
 }

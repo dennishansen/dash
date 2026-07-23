@@ -13,6 +13,7 @@ import { Avatar, usePeople, useDismiss } from '../profiles.jsx';
 import { OptionMenu } from '../OptionMenu.jsx';
 import { useAnchoredPopover } from '../popover.js';
 import { CARD_PROPS, useCardProps, toggleCardProp, reorderCardProps } from '../card-props.js';
+import { tagPillClass } from '../tag-style.js';
 import {
   FILTER_FIELDS, CREATED_BUCKETS, SINGLE_SELECT_FIELDS, FILTER_OPERATORS, DEFAULT_OP,
   fieldHasOperators, valuesNeeded, emptyFilters, anyFilterActive, fieldActive,
@@ -872,10 +873,10 @@ function cardPropValue(key, i) {
     return (
       <>
         {tags.slice(0, CARD_TAG_CAP).map(t => (
-          <span key={t} className="field-pill field-pill--tag card-prop-tag">{t}</span>
+          <span key={t} className={`field-pill ${tagPillClass(t)} card-prop-tag`}>{t}</span>
         ))}
         {tags.length > CARD_TAG_CAP
-          ? <span className="card-prop-more" title={tags.slice(CARD_TAG_CAP).join('\n')}>+{tags.length - CARD_TAG_CAP}</span>
+          ? <span className="field-pill card-prop-tag chip-overflow" title={tags.slice(CARD_TAG_CAP).join('\n')}>+{tags.length - CARD_TAG_CAP}</span>
           : null}
       </>
     );
