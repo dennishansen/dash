@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { useAsync, useIssuesRealtime } from '../api.js';
+import { useAsync, useIssuesRealtime, fmtDate } from '../api.js';
 import { useActivity } from '../activity-store.js';
 import { listChanges, createChange, moveChange, reorderChange } from '../board-store.js';
 import { insertionIndex } from './dragOrder.js';
@@ -11,6 +11,8 @@ import { useHotkey } from '../hotkeys.js';
 import { hk } from '../hotkey-registry.js';
 import { Avatar, usePeople, useDismiss } from '../profiles.jsx';
 import { OptionMenu } from '../OptionMenu.jsx';
+import { useAnchoredPopover } from '../popover.js';
+import { CARD_PROPS, useCardProps, toggleCardProp, reorderCardProps } from '../card-props.js';
 import {
   FILTER_FIELDS, CREATED_BUCKETS, SINGLE_SELECT_FIELDS, FILTER_OPERATORS, DEFAULT_OP,
   fieldHasOperators, valuesNeeded, emptyFilters, anyFilterActive, fieldActive,
@@ -29,6 +31,16 @@ function FilterIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <path d="M2 4h12M4.5 8h7M6.5 12h3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+    </svg>
+  );
+}
+// An eye — the display-properties control. Deliberately unlike the funnel beside
+// it: filters change WHICH cards show, this changes what each card SHOWS.
+function PropsIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M1.5 8s2.4-4 6.5-4 6.5 4 6.5 4-2.4 4-6.5 4-6.5-4-6.5-4Z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+      <circle cx="8" cy="8" r="1.8" stroke="currentColor" strokeWidth="1.3" />
     </svg>
   );
 }
@@ -499,6 +511,7 @@ export function ChangesBoard({ visible = true }) {
           >
             <FilterIcon />
           </button>
+          <DisplayProps />
           {!searchOpen ? (
             <button className={`filter-toggle search-toggle${search ? ' is-active' : ''}`}
               onClick={() => setSearchOpen(true)}
@@ -562,6 +575,51 @@ export function ChangesBoard({ visible = true }) {
           {dragItem.live ? <div className="kcard-head"><span className="pill live-tag">● live</span></div> : null}
           <div className="kcard-title">{dragItem.title}</div>
         </div>
+      ) : null}
+    </div>
+  );
+}
+
+// The "+ Add filter" menu — the one popover here that isn't an OptionMenu (its
+// rows pick a FIELD, they don't toggle a value). Its own component so it can take
+// the shared viewport placement, which is a mounted-means-open hook.
+function AddFilterMenu({ fields, onPick }) {
+  const { ref, style } = useAnchoredPopover(true);
+  return (
+    <ul className="owner-menu filter-menu" role="menu" ref={ref} style={style}>
+      {fields.map(f => (
+        <li key={f}>
+          <button type="button" className="owner-pick" role="menuitem"
+            onClick={() => onPick(f)}>{FIELD_LABEL[f]}</button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+// The display-properties control: an eye button beside the filter funnel that
+// opens the shared OptionMenu over the card-property catalogue. The funnel picks
+// WHICH cards show; this picks WHAT each card shows on its right edge. The
+// choice lives in card-props.js (persisted, shared) — every card subscribes
+// there, so this component only draws the menu.
+function DisplayProps() {
+  const [open, setOpen] = useState(false);
+  const { order, shown } = useCardProps();
+  const label = (key) => CARD_PROPS.find(p => p.key === key)?.label || key;
+  const wrapRef = useDismiss(open, () => setOpen(false));
+  useHotkey('Escape', () => setOpen(false), { enabled: open, terminal: 'handle', allowInInput: true });
+  return (
+    <div className="props-menu-wrap" ref={wrapRef}>
+      <button className={`filter-toggle${open ? ' is-on' : ''}`}
+        onClick={() => setOpen(o => !o)}
+        title="Properties shown on cards" aria-label="Properties shown on cards"
+        aria-haspopup="listbox" aria-expanded={open}>
+        <PropsIcon />
+      </button>
+      {open ? (
+        <OptionMenu className="props-menu"
+          options={order.map(k => ({ value: k, label: label(k) }))}
+          selected={shown} onToggle={toggleCardProp} onReorder={reorderCardProps} />
       ) : null}
     </div>
   );
@@ -704,16 +762,7 @@ function FilterBar({ data, filters, setFilters, shownCount }) {
             onClick={() => setOpenField(o => (o === '__add__' ? null : '__add__'))}>
             + Add filter
           </button>
-          {openField === '__add__' ? (
-            <ul className="owner-menu filter-menu" role="menu">
-              {addable.map(f => (
-                <li key={f}>
-                  <button type="button" className="owner-pick" role="menuitem"
-                    onClick={() => setOpenField(f)}>{FIELD_LABEL[f]}</button>
-                </li>
-              ))}
-            </ul>
-          ) : null}
+          {openField === '__add__' ? <AddFilterMenu fields={addable} onPick={setOpenField} /> : null}
         </div>
       ) : null}
 
@@ -796,16 +845,59 @@ function IssueCard({ i, colKey, onPointerDown, didDragRef, dragDisabled, selecte
       className={`kcard issue-card status-${i.status}${i.live ? ' is-live' : ''}${draggable ? ' draggable' : ''}${selected ? ' is-selected' : ''}${range ? ' is-range' : ''}`}
       {...dragProps}>
       {i.live ? <div className="kcard-head"><span className="pill live-tag" title={`branch live (pid ${i.live_pid})`}>● live</span></div> : null}
-      {/* The owner's avatar trails the title, reading against the card's right
-          edge — a card is already dense, so who holds it is a glance, not a line.
-          An UNOWNED issue shows nothing: no placeholder person, no empty circle.
-          <Avatar> reads the roster every other surface reads (one fetch for the
-          whole board), so this costs no request per card. */}
+      {/* The chosen display properties trail the title, reading against the
+          card's right edge — a card is already dense, so each is a glance, not a
+          line. Owner alone by default (see card-props.js). */}
       <div className="kcard-title-row">
         {idle ? <span className="kcard-idle-dot" title="chat idle — needs your input" /> : null}
         <div className="kcard-title">{i.title}</div>
-        <Avatar email={i.owner} size={17} className="card-avatar" />
+        <CardProps i={i} />
       </div>
     </Link>
+  );
+}
+
+// The properties trailing a card, against its right edge — a card is already
+// dense, so each is a glance, not a line. Which ones show, and in what order, is
+// the shared display-properties choice (owner alone, last, by default). A
+// property with no value renders nothing at all rather than a placeholder — an
+// unowned issue shows no empty circle, an untagged one no empty chip. Tags cut
+// to two with a "+N", the same truncation the issue page uses.
+const CARD_TAG_CAP = 2;
+function cardPropValue(key, i) {
+  if (key === 'owner') return <Avatar email={i.owner} size={17} className="card-avatar" />;
+  if (key === 'tags') {
+    const tags = i.tags || [];
+    if (!tags.length) return null;
+    return (
+      <>
+        {tags.slice(0, CARD_TAG_CAP).map(t => (
+          <span key={t} className="field-pill field-pill--tag card-prop-tag">{t}</span>
+        ))}
+        {tags.length > CARD_TAG_CAP
+          ? <span className="card-prop-more" title={tags.slice(CARD_TAG_CAP).join('\n')}>+{tags.length - CARD_TAG_CAP}</span>
+          : null}
+      </>
+    );
+  }
+  if (key === 'id') return <span className="card-prop-id">{i.id}</span>;
+  if (key === 'created') {
+    const created = i.created_at || i.created;
+    return created ? <span className="card-prop-date" title={`created ${created}`}>{fmtDate(created)}</span> : null;
+  }
+  if (key === 'updated') {
+    return i.updated ? <span className="card-prop-date" title={`updated ${i.updated}`}>{fmtDate(i.updated)}</span> : null;
+  }
+  return null;
+}
+function CardProps({ i }) {
+  const { order, shown } = useCardProps();
+  if (!shown.size) return null;
+  return (
+    <span className="card-props">
+      {order.filter(k => shown.has(k)).map(k => (
+        <React.Fragment key={k}>{cardPropValue(k, i)}</React.Fragment>
+      ))}
+    </span>
   );
 }

@@ -1358,6 +1358,38 @@ h3 {
    readable line length; left-anchored within .main's padding. */
 .detail { max-width: 560px; margin-inline: auto; }
 
+/* Wide enough pane: the properties move out of the flow above the body and
+   become a column to its RIGHT — the head spans both, the properties take a
+   fixed 200, and the body takes what's left up to its 560px reading measure. The
+   pair is capped and centred as ONE block. The class is set from a measurement
+   of the pane (SIDEBAR_MIN in ChangeDetail), so JS and CSS never disagree about
+   the threshold. */
+.detail--sidebar {
+  max-width: calc(560px + 32px + 200px);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 200px;
+  column-gap: 32px;
+  align-items: start;
+}
+.detail--sidebar > .detail-head { grid-column: 1 / -1; }
+/* In column mode the properties read as their own light card — a hairline grey
+   box with rounded corners — rather than a bare list; the strip's bottom rule
+   (which separated properties from body when stacked) has no job here. */
+.detail--sidebar > .issue-fields {
+  grid-column: 2;
+  grid-row: 2 / span 99;   /* stay beside whatever the body grows into */
+  margin: 0;
+  padding: 12px 14px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.detail--sidebar > .recap-body,
+.detail--sidebar > .body-empty-add,
+.detail--sidebar > .empty { grid-column: 1; }
+/* One property per row, each filling the column and truncating inside itself. */
+.props-strip--column { flex-direction: column; align-items: stretch; gap: 14px; }
+.props-strip--column .prop-cell { max-width: none; width: 100%; }
+
 .detail-head {
   display: flex;
   align-items: flex-start;
@@ -2511,10 +2543,15 @@ textarea.body-edit {
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
-  /* fill the flex row beside the idle dot so the clamp still measures full width */
+  /* fill the flex row beside the idle dot so the clamp still measures full width.
+     The min-width is a FLOOR, not a fit: a card's property run wraps to its own
+     line below rather than squeezing the title into a two-character column. */
   flex: 1 1 auto;
-  min-width: 0;
+  min-width: 60%;
 }
+/* A card's title row wraps: the properties ride beside the title while they fit
+   and drop to their own line under it when they don't. */
+.kcard-title-row { flex-wrap: wrap; row-gap: 6px; }
 /* Idle-chat marker — a small red dot to the left of the title on in-progress
    cards/detail whose mounted chat is waiting for input (see activity-store.js).
    It's absolutely positioned into the left gutter (out of flow), so the title
@@ -2724,9 +2761,7 @@ textarea.body-edit {
 .status-trigger:hover:not(:disabled) { border-color: var(--line-2); }
 .status-trigger:disabled { cursor: default; opacity: 0.6; }
 .status-menu {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
+  position: fixed;
   z-index: 40;
   margin: 0;
   padding: 4px;
@@ -2778,7 +2813,7 @@ textarea.body-edit {
 /* The status pill sits beside a large title — shrink its text and tighten the
    shape so it reads as a quiet tag, not a chunky badge. Scoped to the detail
    header so the kanban card/column pills keep their size. */
-.detail-sub .pill {
+.detail-sub .pill, .props-strip .pill {
   font-size: 10px;
   letter-spacing: 0.4px;
   padding: 2px 6px;
@@ -3913,10 +3948,19 @@ img.zoomable {
 
 .person-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* On a card the avatar trails the title, pinned to the right edge — the title
-   keeps the whole line and the avatar never pushes it. Absent when unowned, so
-   nothing reserves space for it either. */
-.kcard-title-row .card-avatar { margin-left: auto; align-self: center; }
+/* The chosen properties trail the title, pinned to the card's right edge — the
+   title keeps the whole line and the run never pushes it. A property with no
+   value renders nothing, so nothing reserves space for it either. The run itself
+   never wraps or shrinks the title below its ellipsis. */
+.card-props {
+  margin-left: auto; flex: 0 0 auto;
+  display: flex; align-items: center; gap: 6px;
+  align-self: center;
+}
+.card-prop-tag { font-size: 11px; padding: 0 6px; }
+.card-prop-more { color: var(--text-mute); font-size: 11px; }
+.card-prop-id { color: var(--text-mute); font-family: var(--font-mono, monospace); font-size: 11px; }
+.card-prop-date { color: var(--text-mute); font-size: 11px; white-space: nowrap; }
 
 /* ── Owner property row ───────────────────────────────────────────────────── */
 .owner-v { position: relative; }
@@ -3934,10 +3978,11 @@ img.zoomable {
   font: inherit; font-size: 13px; cursor: pointer;
 }
 .owner-empty:hover { color: var(--text-dim); border-color: var(--text-mute); }
+/* Every dropdown is placed against the VIEWPORT by useAnchoredPopover (top/left
+   set inline): fixed, so a menu is never part of a pane's scroll extent and can
+   never stretch the app sideways, and so it can flip away from an edge. */
 .owner-menu {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
+  position: fixed;
   z-index: 40;
   margin: 0;
   padding: 4px;
@@ -4061,6 +4106,23 @@ img.zoomable {
 .filter-bar .count { font-size: 13px; white-space: nowrap; align-self: center; }
 /* Each field is the anchor for its own value popover. */
 .filter-field { position: relative; display: inline-flex; align-items: center; }
+/* The display-properties button + its menu. align-self/items:stretch so the
+   button inside still matches the search field's height — wrapping it in a
+   positioning box otherwise shrink-wraps it. */
+.props-menu-wrap { position: relative; display: inline-flex; align-self: stretch; align-items: stretch; }
+.props-menu { min-width: 180px; }
+/* A reorderable menu: each row is grip + option, and the grip is the only drag
+   handle (clicking the row still toggles the property). */
+.filter-menu--reorder .filter-optlist li { display: flex; align-items: center; gap: 2px; }
+.filter-menu--reorder .filter-opt { flex: 1 1 auto; min-width: 0; }
+.opt-grip {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 14px; flex: 0 0 14px;
+  color: var(--text-mute); cursor: grab; touch-action: none;
+}
+.opt-grip:hover { color: var(--text-dim); }
+.filter-optlist li.is-dragging { opacity: 0.65; }
+.filter-optlist li.is-dragging .opt-grip { cursor: grabbing; }
 /* board-chrome sits UNDER the sticky column heads (z 2) at rest so they cover it
    on vertical scroll — but a filter dropdown must clear them, so lift the whole
    chrome above the heads only while a value menu is open. */
@@ -4172,12 +4234,28 @@ img.zoomable {
    the properties block reads as one unit closed by a single rule below. --- */
 .detail-head { margin-bottom: 14px; padding-bottom: 0; border-bottom: none; }
 
-/* --- The top bar under the title: status / owner / tags as a Notion-style
-   property strip — each a small grey label ABOVE its value. --- */
+/* The property strip: every property as a small grey label ABOVE its value, laid
+   out horizontally and wrapping when the row runs out of width. Collapsed, an
+   inline height holds it to its first row and the cells that wrapped past that
+   row go visibility:hidden — they keep their place (so the fit stays measurable,
+   and they drop out of the tab order) while an open menu on a VISIBLE cell can
+   still spill past the strip. align-content pins the wrapped lines to the top so
+   that fixed height can't redistribute them. Each cell carries its own max
+   width, so a long value truncates inside its cell, not into its neighbours. */
+.props-strip { display: flex; align-items: flex-start; align-content: flex-start; flex-wrap: wrap; gap: 12px 16px; }
+.prop-cell--offrow { visibility: hidden; pointer-events: none; }
 .detail-sub { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 12px 16px; margin-top: 10px; }
 .prop-cell { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .prop-label { font-size: 11px; color: var(--text-mute); letter-spacing: 0.01em; }
-.prop-value { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-height: 24px; }
+.prop-value { display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; min-height: 24px; min-width: 0; }
+/* The truncating run inside a cell: pills shrink and ellipsize here, while a
+   sibling control (the dependency "+") keeps its full size beside it. */
+.prop-pills { display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
+.props-strip .field-pill {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.props-strip .chip-trigger { flex-wrap: nowrap; min-width: 0; overflow: hidden; }
+.props-strip .chip-overflow { flex: 0 0 auto; }
 /* Non-issue (branch-kind) bar keeps the old inline row. */
 .detail-sub > .pill, .detail-sub > .itag, .detail-sub > .dim { align-self: center; }
 
@@ -4225,8 +4303,9 @@ img.zoomable {
 .tag-opt-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tag-create { color: var(--text-dim); font-style: italic; }
 
-/* --- "Show more properties" expander + its read-only rows. --- */
-.issue-fields .more-props { display: flex; flex-direction: column; gap: 6px; }
+/* "Show more properties" — the collapse control under the strip. Quiet and dim;
+   clicking un-clips the strip so the cells that didn't fit the first row appear,
+   and flips the label to "Show fewer". Renders only when something is out of sight. */
 .issue-fields .more-props-toggle {
   align-self: flex-start;
   margin-top: 2px;
@@ -4236,7 +4315,9 @@ img.zoomable {
   font-family: var(--font-ui); font-size: 13px; border-radius: 6px;
 }
 .issue-fields .more-props-toggle:hover { color: var(--text-dim); }
-.issue-fields .field-empty { color: var(--text-mute); font-size: 13px; }
+/* Text-valued properties keep a grey word for their empty state (created by →
+   "unknown"): there is no chip there for a dashed slot to stand in for. */
+.issue-fields .field-word-empty { color: var(--text-mute); font-size: 13px; }
 .issue-fields .field-meta { color: var(--text-dim); font-size: 13px; }
 
 /* --- Owner avatar (beside the status pill under the title). --- */
@@ -4274,7 +4355,15 @@ img.zoomable {
 }
 .chip-trigger:hover { background: var(--bg-1); }
 .chip-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.chip-empty { color: var(--text-mute); font-size: 13px; }
+/* An empty property reads as a dashed slot the size of a chip — a shape waiting
+   to be filled, lining up with the filled cells beside it. Interactive where the
+   property is editable (it IS the chip trigger), inert where it isn't. */
+.field-empty {
+  display: inline-block;
+  width: 34px; height: 18px;
+  border: 1px dashed var(--line-2);
+  border-radius: 7px;
+}
 /* Issue titles get long — a chip's label truncates; the "+N" reads the rest. */
 .chip-label { display: block; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chip-overflow { color: var(--text-mute); font-size: 12px; }

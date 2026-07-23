@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef, useMemo } from 'react';
+import React, { useEffect, useLayoutEffect, useState, useRef, useMemo } from 'react';
 import { Link, useParams, useNavigate, useLocation } from 'react-router-dom';
 import { useAsync, useIssuesRealtime, fmtDate } from '../api.js';
 import { changeDetail, renameChange, updateChangeField, setChangeStatus, setChangeDep, deleteChange, listChanges } from '../board-store.js';
@@ -10,8 +10,9 @@ import { Markdown } from './Markdown.jsx';
 import { CopyButton } from './CopyButton.jsx';
 import { useChatControl } from '../chat-control.jsx';
 import { X, Pencil, Trash, User, ArrowUpRight } from '../icons.jsx';
-import { Avatar, usePeople, useDismiss, normalizeEmail } from '../profiles.jsx';
+import { Avatar, PersonLabel, usePeople, useDismiss, normalizeEmail } from '../profiles.jsx';
 import { OptionMenu } from '../OptionMenu.jsx';
+import { useAnchoredPopover } from '../popover.js';
 
 // Inline-editable issue title. Looks like the static <h2> (CSS .title-edit),
 // gaining a box outline only on hover / focus. Enter or blur saves via
@@ -72,6 +73,14 @@ function EditableTitle({ id, title, onSaved, autoFocus }) {
   );
 }
 
+// A property with no value: a dashed slot the size of a chip, not the words
+// "Empty" / "none" — an empty cell then reads as a shape waiting to be filled and
+// still lines up with a filled one. Text-valued properties (created by) keep
+// their grey word instead; there is no chip there to stand in for.
+function EmptySlot({ label }) {
+  return <span className="field-empty" role="presentation" title={label} aria-label={label} />;
+}
+
 // One chip inside a ChipMultiSelect trigger. A plain display pill (the trigger
 // wrapper owns the click that opens the editor). When the chip carries a `to` it
 // also gets a hover/focus-reveal external-link glyph (the .field-pill--reveal
@@ -102,7 +111,7 @@ function Chip({ label, className = '', to }) {
 //   selected: [{ key, label, className?, to? }]  the chips currently on
 //   options:  [{ key, label }]                   the add-vocabulary (selected filtered out)
 //   onToggle(key)   flip membership       onCreate(query)?  add a brand-new member
-function ChipMultiSelect({ selected, options, onToggle, onCreate, triggerTitle, emptyLabel = 'Empty', searchPlaceholder = 'Search…', emptyHint }) {
+function ChipMultiSelect({ selected, options, onToggle, onCreate, triggerTitle, emptyLabel = 'nothing set', searchPlaceholder = 'Search…', emptyHint }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState('');
   const inputRef = useRef(null);
@@ -148,7 +157,7 @@ function ChipMultiSelect({ selected, options, onToggle, onCreate, triggerTitle, 
             {selected.slice(0, VISIBLE).map(s => <Chip key={s.key} {...s} />)}
             {selected.length > VISIBLE ? <span className="chip-overflow">+{selected.length - VISIBLE}</span> : null}
           </>
-        ) : <span className="chip-empty">{emptyLabel}</span>}
+        ) : <EmptySlot label={emptyLabel} />}
       </div>
       {open ? (
         <OptionMenu
@@ -280,6 +289,7 @@ function ConvoPill({ id, convo, conversations, onChanged, onOpen }) {
 // into the free text it used to be.
 function OwnerAvatar({ id, owner }) {
   const [picking, setPicking] = useState(false);
+  const { ref: menuRef, style: menuStyle } = useAnchoredPopover(picking);
   const people = usePeople();
   const wrapRef = useDismiss(picking, () => setPicking(false));
   // Escape closes the picker without also reaching the detail view's bubble-
@@ -313,7 +323,7 @@ function OwnerAvatar({ id, owner }) {
         {key ? <Avatar email={key} size={22} showTooltip={false} /> : <User size={14} />}
       </button>
       {picking ? (
-        <ul className="owner-menu" role="listbox">
+        <ul className="owner-menu" role="listbox" ref={menuRef} style={menuStyle}>
           {people.map(p => (
             <li key={p.email}>
               <button type="button" className={`owner-pick${p.email === key ? ' is-current' : ''}`}
@@ -336,92 +346,149 @@ function OwnerAvatar({ id, owner }) {
   );
 }
 
-// A read-only property row — a label and a list of value pills (branch names,
-// commit shas, session ids). No adder: these are derived worktree/chat metadata,
-// not user-set. Empty renders a dim "none" (only reached under "more").
-function ReadonlyRow({ label, values }) {
+// Read-only value pills (branch names, commit shas, session ids: derived
+// worktree/chat metadata, not user-set). Capped at two visible with the rest
+// collapsing into a "+N" — the same truncation the chip trigger uses — so a
+// cell's width stays predictable however many an issue collects. Empty reads a
+// dashed slot like every other empty cell.
+const PILL_CAP = 2;
+function PillValue({ values }) {
+  if (!values.length) return <EmptySlot label="nothing set" />;
+  const extra = values.length - PILL_CAP;
   return (
-    <div className="field-row">
-      <span className="k">{label}</span>
-      <span className="v">
-        {values.length
-          ? values.map(v => <span key={v} className="field-pill">{v}</span>)
-          : <span className="field-empty">none</span>}
-      </span>
-    </div>
+    <span className="prop-pills">
+      {values.slice(0, PILL_CAP).map(v => <span key={v} className="field-pill" title={v}>{v}</span>)}
+      {extra > 0 ? <span className="chip-overflow" title={values.slice(PILL_CAP).join('\n')}>+{extra}</span> : null}
+    </span>
   );
 }
 
-// A read-only timestamp property — created / updated. Humanized like every other
-// date (fmtDate → "Jul 21st"), full ISO in the tooltip. Always set, never an add
-// control; lives under "more" as metadata.
-function MetaRow({ label, iso }) {
-  return (
-    <div className="field-row">
-      <span className="k">{label}</span>
-      <span className="v"><span className="field-meta" title={iso || ''}>{fmtDate(iso)}</span></span>
-    </div>
-  );
-}
-
-// The properties BELOW the top bar. Status, owner and tags live up in the bar
-// (StatusPill / OwnerAvatar / TagSelect); the read-only worktree/chat
-// metadata lands here as one ordered list where each row's `policy` decides where
-// it renders:
-//   whenSet — a labelled row, but only once it holds a value (branch, commits,
-//             sessions); empty ones fold under "Show more properties"
-//   meta    — always under "Show more properties" (created/updated, read-only)
-// So filled metadata sits right under the bar; everything empty or incidental
-// tucks into the expander. Empty branch/commits/sessions only exist under "more"
-// on a LOCAL backend — remotely they are structurally always empty, so listing
-// them there would be permanent noise (`local !== false` keeps them in while the
-// probe is still deciding). Expand state is per-mount — the parent keys this by
-// issue id, so navigating to another issue resets it.
-function IssueProperties({ data, local }) {
+// Every property of an issue, as one strip of labelled cells — status, owner,
+// tags and the dependencies included, so there is a single properties surface
+// rather than a bar plus a list. Nothing hides by policy: the strip wraps, and
+// while collapsed only its FIRST ROW shows, so what "Show more properties"
+// reveals is simply whatever didn't fit. Order is priority — the three that are
+// always editable, then properties holding a value, then empty ones, then the
+// provenance and timestamps — so a narrow pane keeps the meaningful cells on the
+// visible row.
+//
+// The row height and the cells that fit are MEASURED (and re-measured on resize)
+// rather than assumed. Off-row cells stay in the layout with visibility:hidden,
+// which is what keeps that measurement valid while collapsed — and lets an open
+// menu on a visible cell spill past the strip instead of being clipped. Expand
+// state is per-mount — the parent keys this by issue id, so navigating to
+// another issue resets it (no persistence).
+function IssueProperties({ data, known, local, allTags, column, refresh }) {
   const [open, setOpen] = useState(false);
+  const [rowH, setRowH] = useState(0);
+  const [fit, setFit] = useState(0);
+  const stripRef = useRef(null);
+  const id = data.id;
+  const status = data.status || 'next';
+  const requires = data.requires || [];
+  const unlocks = data.unlocks || [];
   const branches = (data.branches?.length ? data.branches : [data.branch]).filter(Boolean);
-  const commits = (data.commits || []).map(c => String(c).slice(0, 9));
   const sessions = data.sessions || [];
 
-  const props = [];
-  if (branches.length || local !== false) props.push({ policy: 'whenSet', has: branches.length > 0, node: <ReadonlyRow key="branch" label="branch" values={branches} /> });
-  if (commits.length || local !== false) props.push({ policy: 'whenSet', has: commits.length > 0, node: <ReadonlyRow key="commits" label="commits" values={commits} /> });
-  if (sessions.length || local !== false) props.push({ policy: 'whenSet', has: sessions.length > 0, node: <ReadonlyRow key="sessions" label="sessions" values={sessions} /> });
-  // Timestamps last — always present, always under "more".
-  props.push({ policy: 'meta', has: true, node: <MetaRow key="created" label="created" iso={data.created} /> });
-  props.push({ policy: 'meta', has: true, node: <MetaRow key="updated" label="updated" iso={data.updated} /> });
+  const pinned = [
+    { key: 'status', label: 'status', value: <StatusPill id={id} status={status} onChanged={refresh} /> },
+    { key: 'owner', label: 'owner', value: <OwnerAvatar id={id} owner={data.owner} /> },
+    { key: 'tags', label: 'tags', width: 190, value: <TagSelect id={id} tags={data.tags || []} allTags={allTags} onChanged={refresh} /> },
+  ];
+  // Dependencies are cells like any other property — an empty one reads as a
+  // dashed slot and is still the editor's trigger, which is how a first edge
+  // gets added.
+  const rest = [
+    { key: 'requires', label: 'requires', width: 210, has: requires.length > 0, attrs: { 'data-dep-field': 'requires' }, value: <DepSelect id={id} field="requires" list={requires} known={known} onChanged={refresh} /> },
+    { key: 'unlocks', label: 'unlocks', width: 210, has: unlocks.length > 0, attrs: { 'data-dep-field': 'unlocks' }, value: <DepSelect id={id} field="unlocks" list={unlocks} known={known} onChanged={refresh} /> },
+  ];
+  // branch/sessions are read-only worktree/chat metadata. When empty they only
+  // exist on a LOCAL backend — remotely they are structurally always empty, so
+  // listing them there would be permanent noise. `local !== false` keeps them in
+  // while the probe is still deciding (null).
+  if (branches.length || local !== false) rest.push({ key: 'branch', label: 'branch', width: 200, has: branches.length > 0, value: <PillValue values={branches} /> });
+  if (sessions.length || local !== false) rest.push({ key: 'sessions', label: 'sessions', width: 200, has: sessions.length > 0, value: <PillValue values={sessions} /> });
 
-  const isShown = (p) => p.policy === 'whenSet' && p.has;
-  const shown = props.filter(isShown);
-  const hidden = props.filter(p => !isShown(p));
+  const cells = [
+    ...pinned,
+    ...rest.filter(p => p.has),
+    ...rest.filter(p => !p.has),
+    // Provenance + timestamps last, all read-only. "created by" pairs with
+    // "created" (who + when); a pre-column row with no stored creator reads
+    // "unknown".
+    { key: 'created', label: 'created', width: 110, value: <span className="field-meta" title={data.created_at || ''}>{fmtDate(data.created_at)}</span> },
+    { key: 'created_by', label: 'created by', width: 170, value: normalizeEmail(data.created_by) ? <PersonLabel email={data.created_by} /> : <span className="field-word-empty">unknown</span> },
+    { key: 'updated', label: 'updated', width: 110, value: <span className="field-meta" title={data.updated || ''}>{fmtDate(data.updated)}</span> },
+  ];
+
+  // How many cells share the first row, and how tall that row is (cells differ
+  // in height — an avatar sits taller than a date, so take the tallest). A
+  // column has one cell per row and shows everything, so it never measures.
+  useLayoutEffect(() => {
+    const el = stripRef.current;
+    if (!el || column) return;
+    const measure = () => {
+      const kids = [...el.children];
+      if (!kids.length) return;
+      const top = kids[0].offsetTop;
+      const row = kids.filter(k => k.offsetTop === top);
+      setRowH(Math.max(...row.map(k => k.offsetHeight)));
+      setFit(row.length);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [data, local, open, column]);
+
+  const overflows = !column && fit > 0 && cells.length > fit;
+  const collapsed = overflows && !open;
 
   return (
     <>
-      {shown.map(p => p.node)}
-      {hidden.length ? (
-        <>
-          {open ? <div className="more-props">{hidden.map(p => p.node)}</div> : null}
-          <button type="button" className="more-props-toggle" aria-expanded={open}
-            onClick={() => setOpen(o => !o)}>
-            {open ? 'Show fewer properties' : '+ Show more properties'}
-          </button>
-        </>
+      <div className={`props-strip${column ? ' props-strip--column' : ''}`} ref={stripRef}
+        style={collapsed && rowH ? { height: rowH } : undefined}>
+        {cells.map((c, i) => (
+          <PropCell key={c.key} label={c.label} width={column ? undefined : c.width}
+            offRow={collapsed && i >= fit} {...(c.attrs || {})}>
+            {c.value}
+          </PropCell>
+        ))}
+      </div>
+      {overflows ? (
+        <button type="button" className="more-props-toggle" aria-expanded={open}
+          onClick={() => setOpen(o => !o)}>
+          {open ? 'Show fewer properties' : `+ Show ${cells.length - fit} more properties`}
+        </button>
       ) : null}
     </>
   );
 }
 
-// A labelled cell for the top bar: a small grey label ABOVE its value (status
-// pill, owner avatar, tags), so the bar reads as a Notion-style property strip.
-// The value keeps its own control unchanged.
-function PropCell({ label, children }) {
+// A labelled property cell: a small grey label ABOVE its value. EVERY property
+// wears this shape — status, owner, tags, dependencies, branch, sessions, the
+// timestamps — so the block reads as one Notion-style strip. `width` caps the
+// cell so a long value truncates inside itself instead of shoving its neighbours
+// off the row. `offRow` is a cell that wrapped past the first row while the
+// strip is collapsed: hidden by visibility, so it keeps its place in the layout
+// (and stays measurable) but is neither visible nor tabbable.
+function PropCell({ label, width, offRow, children, ...rest }) {
   return (
-    <div className="prop-cell">
+    <div className={`prop-cell${offRow ? ' prop-cell--offrow' : ''}`}
+      style={width ? { maxWidth: width } : undefined} {...rest}>
       <span className="prop-label">{label}</span>
       <span className="prop-value">{children}</span>
     </div>
   );
 }
+
+// The properties column is a FIXED 200 with 32 of air beside it; the body keeps
+// its 560px reading measure when there's room and gives way down to 360 when
+// there isn't. So the column appears as soon as the pane can hold the narrow
+// body plus the column — not only once the body is at full width — and the two
+// together stay centred in the pane.
+const BODY_MIN = 360, BODY_MAX = 560, PROPS_W = 200, PROPS_GAP = 32;
+const SIDEBAR_MIN = BODY_MIN + PROPS_GAP + PROPS_W;
 
 // Clickable status pill: looks like the static bucket pill but opens a menu of
 // the six columns. Picking one writes the issue's status directly (setStatus —
@@ -432,6 +499,7 @@ function StatusPill({ id, status, onChanged }) {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const wrapRef = useRef(null);
+  const { ref: menuRef, style: menuStyle } = useAnchoredPopover(open);
   useEffect(() => {
     if (!open) return;
     const onDown = (e) => { if (!wrapRef.current?.contains(e.target)) setOpen(false); };
@@ -460,7 +528,7 @@ function StatusPill({ id, status, onChanged }) {
         {status}
       </button>
       {open ? (
-        <ul className="status-menu" role="listbox">
+        <ul className="status-menu" role="listbox" ref={menuRef} style={menuStyle}>
           {BUCKETS.map(b => (
             <li key={b.key} className={`status-item${b.key === status ? ' is-current' : ''}`}>
               <button type="button" className={`status-pick pill bucket-${b.key}`}
@@ -605,6 +673,25 @@ export function ChangeDetail() {
   // Neighbors on the board's published order — used to park the cursor after a
   // delete (the card that slides into the deleted slot).
   const { prevId, nextId } = useIssueNav(id);
+  // Properties ride to the RIGHT of the body once the pane is wide enough to
+  // hold both, and sit above it as a strip when it isn't. The pane is what
+  // changes width here (the chat/app docks open and close beside it), so this
+  // watches the scroll container rather than the window.
+  const [wide, setWide] = useState(false);
+  useLayoutEffect(() => {
+    const el = document.querySelector('.main');
+    if (!el) return;
+    // The pane's CONTENT box — its padding is not space the columns can use.
+    const measure = () => {
+      const cs = getComputedStyle(el);
+      const inner = el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+      setWide(inner >= SIDEBAR_MIN);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   useEffect(() => {
     const onKey = (e) => {
       const t = e.target;
@@ -631,7 +718,7 @@ export function ChangeDetail() {
   const body = data.body ?? data.recap_text ?? null;
 
   return (
-    <div className="detail">
+    <div className={`detail${wide && isIssue ? ' detail--sidebar' : ''}`}>
       <div className="detail-head">
         <div className="title-block">
           <div className="detail-title-row">
@@ -640,31 +727,19 @@ export function ChangeDetail() {
               ? <EditableTitle id={data.id} title={data.title || data.id} onSaved={refresh} autoFocus={focusTitle} />
               : <h2>{data.title || data.id}</h2>}
           </div>
-          <div className="detail-sub">
-            {data.live ? <span className="pill live-tag">● live</span> : null}
-            {isIssue ? (
-              <>
-                <PropCell label="status"><StatusPill id={data.id} status={status} onChanged={refresh} /></PropCell>
-                <PropCell label="owner"><OwnerAvatar id={data.id} owner={data.owner} /></PropCell>
-                <PropCell label="tags"><TagSelect id={data.id} tags={data.tags || []} allTags={allTags} onChanged={refresh} /></PropCell>
-                {/* Dependencies join the bar as title-chips — but only when
-                    populated. Empty requires/unlocks render nothing (no bare
-                    adder), so the bar stays quiet until an edge actually exists. */}
-                {(data.requires || []).length ? (
-                  <PropCell label="requires"><DepSelect id={data.id} field="requires" list={data.requires} known={known} onChanged={refresh} /></PropCell>
-                ) : null}
-                {(data.unlocks || []).length ? (
-                  <PropCell label="unlocks"><DepSelect id={data.id} field="unlocks" list={data.unlocks} known={known} onChanged={refresh} /></PropCell>
-                ) : null}
-              </>
-            ) : (
-              <>
-                {!data.live ? <span className={`pill bucket-${status}`}>{status}</span> : null}
-                <span className="itag" style={{ marginLeft: 8 }}>branch</span>
-                {data.created ? <span className="dim" style={{ marginLeft: 8 }}>created {fmtDate(data.created)}</span> : null}
-              </>
-            )}
-          </div>
+          {/* Issue properties now live in the strip below (IssueProperties), so
+              the sub-line is only the live tag (when a local worktree is live)
+              for an issue, and the branch/created summary for a live-branch. */}
+          {isIssue ? (
+            data.live ? <div className="detail-sub"><span className="pill live-tag">● live</span></div> : null
+          ) : (
+            <div className="detail-sub">
+              {data.live ? <span className="pill live-tag">● live</span> : null}
+              {!data.live ? <span className={`pill bucket-${status}`}>{status}</span> : null}
+              <span className="itag" style={{ marginLeft: 8 }}>branch</span>
+              {data.created ? <span className="dim" style={{ marginLeft: 8 }}>created {fmtDate(data.created)}</span> : null}
+            </div>
+          )}
         </div>
         {/* On delete, park the board cursor where the deleted card WAS: the card
             below it slides up into that slot (nextId), or if it was last, the one
@@ -676,15 +751,16 @@ export function ChangeDetail() {
 
       <div className="issue-fields">
         {isIssue ? (
-          <IssueProperties key={data.id} data={data} local={local} />
+          <IssueProperties key={data.id} data={data} known={known} local={local} allTags={allTags}
+            column={wide} refresh={refresh} />
         ) : (
-          <>
+          <div className="props-strip">
             {(data.branches?.length ? data.branches : [data.branch]).filter(Boolean).length ? (
-              <ReadonlyRow label="branch" values={(data.branches?.length ? data.branches : [data.branch]).filter(Boolean)} />
+              <PropCell label="branch" width={200}><PillValue values={(data.branches?.length ? data.branches : [data.branch]).filter(Boolean)} /></PropCell>
             ) : null}
-            {data.commits?.length ? <ReadonlyRow label="commits" values={data.commits.map(c => String(c).slice(0, 9))} /> : null}
-            {data.sessions?.length ? <ReadonlyRow label="sessions" values={data.sessions} /> : null}
-          </>
+            {data.commits?.length ? <PropCell label="commits" width={200}><PillValue values={data.commits.map(c => String(c).slice(0, 9))} /></PropCell> : null}
+            {data.sessions?.length ? <PropCell label="sessions" width={200}><PillValue values={data.sessions} /></PropCell> : null}
+          </div>
         )}
         {data.conversations?.length ? (
           <div className="field-row">
