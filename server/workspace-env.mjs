@@ -44,6 +44,34 @@ export function resolveWorktreeDir(issueId) {
   try { return fs.statSync(candidate).isDirectory() ? candidate : null; } catch { return null; }
 }
 
+function worktreeRecords() {
+  const result = spawnSync(
+    'git',
+    ['-C', MAIN_REPO, 'worktree', 'list', '--porcelain'],
+    { encoding: 'utf8' },
+  );
+  return (result.stdout || '').trim().split(/\n\n+/).filter(Boolean);
+}
+
+function parseWorktreeRecord(record) {
+  const lines = record.split('\n');
+  const dir = lines.find((line) => line.startsWith('worktree '))?.slice(9);
+  const branch = lines.find((line) => line.startsWith('branch refs/heads/'))?.slice(18);
+  return { dir, branch };
+}
+
+export function resolveRecordedWorktree(branches = []) {
+  const wanted = new Set(branches);
+  if (wanted.size === 0) return null;
+  const match = worktreeRecords().map(parseWorktreeRecord)
+    .find(({ branch }) => wanted.has(branch));
+  return match?.dir ?? null;
+}
+
+export function resolveIssueWorktree(issueId, branches = []) {
+  return resolveWorktreeDir(issueId) ?? resolveRecordedWorktree(branches);
+}
+
 export function workspaceDirForEnv(env) {
   return env === MAIN_ENV ? MAIN_REPO : resolveWorktreeDir(env);
 }
