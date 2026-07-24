@@ -22,13 +22,31 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { listAll, reservedPorts } from './issues-store.mjs';
+import { listAll, reservedPorts, TABLE as ISSUES_TABLE, PROD_TABLE as ISSUES_PROD } from './issues-store.mjs';
 import { parseHandle } from './agents.mjs';
-import { selectedChats } from './profiles-store.mjs';
+import { selectedChats, TABLE as PROFILES_TABLE, PROD_TABLE as PROFILES_PROD } from './profiles-store.mjs';
 import { freePort } from './ports.mjs';
 
 const pExec = promisify(execFile);
 export const IDLE_MINUTES = 20;
+
+// --- who may reap ------------------------------------------------------------
+// Everything below decides the fate of MACHINE-GLOBAL things: OS processes and
+// TCP listeners that every checkout on this box shares. A board pointed at a
+// CLONED table (a test/dev profiles clone) can't speak for this machine: reading
+// real pids/ports against a cloned board inverts every verdict — nothing matches,
+// so every dev server reads "orphaned" and every chat "not in-progress", and a
+// sweep would stop the whole fleet. So authority is granted only by the exact
+// production tables, and it gates the VERDICT, not merely the kill. Anything not
+// production fails closed.
+export function reapAuthority() {
+  const foreign = [];
+  if (ISSUES_TABLE !== ISSUES_PROD) foreign.push(`issues table "${ISSUES_TABLE}"`);
+  if (PROFILES_TABLE !== PROFILES_PROD) foreign.push(`profiles table "${PROFILES_TABLE}"`);
+  return foreign.length
+    ? { ok: false, reason: `not the production board (${foreign.join(', ')}) — it cannot speak for this machine` }
+    : { ok: true, reason: null };
+}
 
 // --- live agent processes ---------------------------------------------------
 // The REAL session process carries `--session-id <uuid>` but NOT `--bg-pty-host`
@@ -124,6 +142,7 @@ async function statusBySession() {
 // --- the checker ------------------------------------------------------------
 // Returns one row per live agent with all signals + a reap verdict. Pure read.
 export async function pruneCandidates({ idleMinutes = IDLE_MINUTES } = {}) {
+  const auth = reapAuthority();
   const [agents, tree, statuses, mainSel] = await Promise.all([
     liveAgents(), processTree(), statusBySession(), selectedChats().then((s) => new Set(s)),
   ]);
@@ -135,6 +154,9 @@ export async function pruneCandidates({ idleMinutes = IDLE_MINUTES } = {}) {
     const ownCpu = tree.byPid.get(a.pid)?.cpu ?? 0;
     const viewed = mainSel.has(a.sessionId);
     const keepReasons = [];
+    // A board that may not reap keeps everything — and says so, so the report
+    // reads as "I'm not allowed to judge this", not a silent all-clear.
+    if (!auth.ok) keepReasons.push('board may not reap');
     if (viewed) keepReasons.push('currently selected');
     if (idle == null) keepReasons.push('no transcript found');
     else if (idle < idleMinutes) keepReasons.push(`active ${idle.toFixed(0)}m ago`);
@@ -175,15 +197,18 @@ async function liveDevPorts() {
 // in-progress issue (a done/next/rejected issue's leftover server, or an orphan
 // no issue reserves at all).
 export async function devServerCandidates() {
+  const auth = reapAuthority();
   const [live, reserved, issues] = await Promise.all([liveDevPorts(), reservedPorts(), listAll()]);
   const statusById = new Map(issues.map((i) => [i.id, i.status]));
   const issueByPort = new Map([...reserved].map(([id, port]) => [Number(port), id]));
   return live.map(({ port, pid }) => {
     const issue = issueByPort.get(port) || null;
     const status = issue ? (statusById.get(issue) || 'unknown') : null;
+    // "Orphaned" is only meaningful when the board OWNS these ports. On a cloned
+    // board no real port maps to anything, so the flag can never carry a verdict.
     const orphaned = !issue;
     const inProgress = status === 'in-progress';
-    return { port, pid, issue, status, orphaned, reap: !inProgress };
+    return { port, pid, issue, status, orphaned, reap: auth.ok && !inProgress };
   });
 }
 
@@ -214,6 +239,8 @@ function fmtServers(rows) {
 }
 
 async function report() {
+  const auth = reapAuthority();
+  if (!auth.ok) console.log(`⚠ this process may not reap: ${auth.reason}\n  (verdicts below are all "keep" for that reason, not because the fleet is clean)\n`);
   const [rows, servers] = await Promise.all([pruneCandidates(), devServerCandidates()]);
   const reap = rows.filter((r) => r.reap);
   const reapS = servers.filter((s) => s.reap);
@@ -234,6 +261,8 @@ async function report() {
 // reservation; an orphan with no issue is killed by pid. Idempotent — an
 // already-gone target just no-ops.
 export async function reap() {
+  const auth = reapAuthority();
+  if (!auth.ok) { console.log(`reaper: refusing to reap — ${auth.reason}`); return; }
   const [chats, servers] = await Promise.all([pruneCandidates(), devServerCandidates()]);
   const chatKills = chats.filter((c) => c.reap);
   const serverKills = servers.filter((s) => s.reap);

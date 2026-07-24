@@ -32,6 +32,10 @@ import { rest, restUrl, RPC } from './supabase.mjs';
 
 // The board's table. A single fixed table here (no test-isolation split) — the
 // browser's realtime subscription (realtime.js) and this store must name the same one.
+// PROD_TABLE names the one production board so code acting on MACHINE-GLOBAL state
+// (the reaper kills real processes) can ask "am I actually on the real board?"
+// against a single definition.
+export const PROD_TABLE = 'issues';
 export const TABLE = 'issues';
 
 const REST = restUrl(TABLE);

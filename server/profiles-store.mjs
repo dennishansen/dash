@@ -30,9 +30,12 @@ const ENV = (typeof process !== 'undefined' && process.env) || {};
 // the browser the dev server bakes its selection into the bundle via the
 // __ARTIFACT_PROFILES_TABLE__ define (vite.config.js). The allow-list is NOT
 // cloned — membership is real either way, so tests decorate real teammates.
+// The one production profiles table — see issues-store's PROD_TABLE for why the
+// name exists rather than being spelled inline (the reaper's authority check).
+export const PROD_TABLE = 'dash_profiles';
 export const TABLE = ENV.ARTIFACT_PROFILES_TABLE
   || (typeof __ARTIFACT_PROFILES_TABLE__ !== 'undefined' ? __ARTIFACT_PROFILES_TABLE__ : null)
-  || 'dash_profiles';
+  || PROD_TABLE;
 // The roster view that reads each profiles table — an exact pair, not a derived
 // name, so an unknown table fails loudly here instead of querying a view that
 // doesn't exist.
