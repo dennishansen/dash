@@ -657,15 +657,19 @@ select:focus {
   letter-spacing: -0.01em; /* match the detail-view title */
 }
 /* Issues board header: title left, search + refresh right-aligned. */
+/* At the narrow floor the header controls would otherwise spill under the chat
+   column and become clipped and unclickable. Wrapping drops the cluster onto its
+   own row instead, where it has the full pane width. No effect at normal widths. */
 .issues-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 12px;
   margin-bottom: 14px;
 }
 .issues-header h2 { margin: 0; }
-.header-right { display: flex; align-items: center; gap: 10px; }
+.header-right { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 /* Search is an icon + borderless input inside one bordered field (no label). */
 .search-field {
   display: flex;
@@ -3957,7 +3961,7 @@ img.zoomable {
   display: flex; align-items: center; gap: 6px;
   align-self: center;
 }
-.card-prop-tag { font-size: 11px; padding: 0 6px; }
+.card-prop-tag { font-size: 11px; padding: 0 6px; max-width: 120px; }
 .card-prop-id { color: var(--text-mute); font-family: var(--font-mono, monospace); font-size: 11px; }
 .card-prop-date { color: var(--text-mute); font-size: 11px; white-space: nowrap; }
 

@@ -9,6 +9,14 @@ import { useEnvSession } from './chat-session-store.js';
 
 const CodeBrowser = React.lazy(() => import('./CodeBrowser.jsx').then((module) => ({ default: module.CodeBrowser })));
 
+// The App|Code segment persists as a single browser-wide preference, so reopening
+// any workspace lands on the view you last used instead of resetting to App.
+const APP_VIEW_KEY = 'dash-app-view';
+const loadAppView = () => {
+  try { return localStorage.getItem(APP_VIEW_KEY) === 'code' ? 'code' : 'app'; }
+  catch { return 'app'; }
+};
+
 // App = the running preview (a monitor); Code = the repo view (a </> glyph).
 const AppIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -43,10 +51,10 @@ export function WorkspacePanel({ env, port, appPath = '/', reloadKey = 0, reload
   // The App-pane route is editable only for issue envs — MAIN is the canvas at
   // this origin (no worktree row to store a path on).
   const pathEditable = env !== MAIN_ENV && !!onSetAppPath;
-  const [view, setView] = React.useState('app');
+  const [view, setView] = React.useState(loadAppView);
   const chatSession = useEnvSession(env);
   const chatStatus = useChatStatus(chatSession);
-  const [codeMounted, setCodeMounted] = React.useState(false);
+  const [codeMounted, setCodeMounted] = React.useState(() => loadAppView() === 'code');
   const [frameBust, setFrameBust] = React.useState(0);
   const [menuOpen, setMenuOpen] = React.useState(false);
   const actionsRef = React.useRef(null);
@@ -70,6 +78,7 @@ export function WorkspacePanel({ env, port, appPath = '/', reloadKey = 0, reload
     setView(next);
     setMenuOpen(false);
     if (next === 'code') setCodeMounted(true);
+    try { localStorage.setItem(APP_VIEW_KEY, next); } catch { /* private mode: skip */ }
   };
   const onViewKeyDown = (event) => {
     const next = event.key === 'ArrowRight' || event.key === 'End' ? 'code'
