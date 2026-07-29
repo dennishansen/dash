@@ -64,6 +64,38 @@ export function emptyFilters() {
   };
 }
 
+// A filter set is the board's QUESTION — which issues you are looking at — so
+// it has to outlive a reload the way the collapsed columns already do. Sets
+// don't survive JSON and a stored value can be older than the code reading it,
+// so these two are the only places that know how a filter state flattens and how
+// it comes back. Anything unrecognised is dropped rather than trusted: a value
+// that isn't a string, a field the catalogue no longer has, or an operator the
+// table no longer knows (which would restore a field that looks set but
+// constrains nothing).
+export function serializeFilters(filters) {
+  const out = {};
+  for (const field of FILTER_FIELDS) {
+    const sel = filters?.[field];
+    if (!sel) continue;
+    out[field] = { op: sel.op, values: [...sel.values] };
+  }
+  return out;
+}
+
+export function parseFilters(raw) {
+  const next = emptyFilters();
+  if (!raw || typeof raw !== 'object') return next;
+  for (const field of FILTER_FIELDS) {
+    const sel = raw[field];
+    if (!sel || typeof sel !== 'object') continue;
+    next[field].op = OPERATOR[sel.op] ? sel.op : DEFAULT_OP;
+    next[field].values = new Set(
+      (Array.isArray(sel.values) ? sel.values : []).filter(v => typeof v === 'string'),
+    );
+  }
+  return next;
+}
+
 // Is this field constraining the board? created is active once a bucket is
 // chosen. For owner/tags: a values-free operator (empty/not-empty) constrains on
 // its own; a valued one (contains/not-contains) needs ≥1 value; an UNKNOWN

@@ -30,17 +30,39 @@ function EditableTitle({ id, title, onSaved, autoFocus }) {
     const el = ref.current;
     if (el) { el.focus(); el.select(); }
   }, [autoFocus]);
-  // Grow the textarea to fit its content (no scrollbar, no fixed rows).
+  // Grow the textarea to fit its content (no scrollbar, no fixed rows). The
+  // field is border-box, so the height we set has to carry the borders that
+  // scrollHeight doesn't count — otherwise the last line loses 2px off the
+  // bottom, which is invisible on one line and a shaved descender on two.
   const fit = () => {
     const el = ref.current;
     if (!el) return;
+    const cs = getComputedStyle(el);
+    const border = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth);
     el.style.height = 'auto';
-    el.style.height = `${el.scrollHeight}px`;
+    el.style.height = `${el.scrollHeight + border}px`;
   };
   // Resync if server truth changes under us (background refresh / another tab),
   // and re-fit on every value change (typing, resync, mount).
   useEffect(() => { setVal(title); }, [title]);
   useEffect(() => { fit(); }, [val]);
+  // The text also re-wraps when the COLUMN narrows — a dock opening beside it, a
+  // window drag, the properties strip becoming a sidebar — and none of those
+  // change `val`, so the box kept its old height and `overflow: hidden` ate the
+  // new line. Width is the only thing that can re-wrap it; the height changes
+  // coming back through here are our own, and acting on those would loop.
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    let lastW = el.clientWidth;
+    const ro = new ResizeObserver(() => {
+      if (el.clientWidth === lastW) return;
+      lastW = el.clientWidth;
+      fit();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   const save = async () => {
     const next = val.trim();

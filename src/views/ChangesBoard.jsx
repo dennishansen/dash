@@ -17,6 +17,7 @@ import { tagPillClass } from '../tag-style.js';
 import {
   FILTER_FIELDS, CREATED_BUCKETS, SINGLE_SELECT_FIELDS, FILTER_OPERATORS, DEFAULT_OP,
   fieldHasOperators, valuesNeeded, emptyFilters, anyFilterActive, fieldActive,
+  serializeFilters, parseFilters,
   issueMatchesFilters, tagOptions, ownerEmailsPresent, todayStr,
 } from '../board-filters.js';
 
@@ -90,6 +91,29 @@ const onBoardRoute = () => {
 };
 const boardOwnsKeyboard = (e) => passiveSurface(e) && onBoardRoute();
 
+// The board's filter surface, remembered. One key for the whole thing — the
+// structured fields, the free text, and whether either is unfolded — because
+// they are one decision about what you are looking at, and restoring half of it
+// (a live filter with its bar folded away, say) would be worse than none. Same
+// idiom as `dash-hidden-cols` below: a guarded read, a guarded write, and a
+// shape that tolerates being older than the code.
+const FILTER_KEY = 'dash-filters';
+
+function readFilterPrefs() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(FILTER_KEY) || 'null');
+    if (raw && typeof raw === 'object') {
+      return {
+        filters: parseFilters(raw.fields),
+        search: typeof raw.search === 'string' ? raw.search : '',
+        open: raw.open === true,
+        searchOpen: raw.searchOpen === true,
+      };
+    }
+  } catch { /* private mode / corrupt value */ }
+  return { filters: emptyFilters(), search: '', open: false, searchOpen: false };
+}
+
 export function ChangesBoard({ visible = true }) {
   // The board reads Supabase directly (board-store), so it works remotely on
   // Vercel with no /api/dash server. Instant cross-edit refresh comes from a
@@ -101,18 +125,22 @@ export function ChangesBoard({ visible = true }) {
   useIssuesRealtime(refresh);
   const navigate = useNavigate();
   const { selectedId, anchorId, setSelection, chatFocused, setOrder } = useSelection();
-  const [search, setSearch] = useState('');
+  // The whole filter surface — the structured fields, the free text, and whether
+  // either is unfolded — restored as ONE thing, because it is one thought. Read
+  // once, lazily, so a re-render never touches storage.
+  const [prefs] = useState(readFilterPrefs);
+  const [search, setSearch] = useState(prefs.search);
   // The search box collapses to just its icon; clicking expands + focuses it,
   // clicking out (or Escape) collapses it again. An active query is PRESERVED
   // across collapse (the board stays filtered) and the collapsed icon shows an
   // accent tint so a hidden filter is never silent.
-  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(prefs.searchOpen);
   const searchWrapRef = useDismiss(searchOpen, () => setSearchOpen(false));
-  const [showFilters, setShowFilters] = useState(false);
+  const [showFilters, setShowFilters] = useState(prefs.open);
   // Structured filter state: a Set per field (owner/tags/created), multi-select
   // OR within a field and AND across fields — see board-filters.js. Replaces the
-  // old tags-only `activeTags` Set. Transient (per-load), unlike view-mode.
-  const [filters, setFilters] = useState(emptyFilters);
+  // old tags-only `activeTags` Set. Restored from storage (readFilterPrefs).
+  const [filters, setFilters] = useState(prefs.filters);
   // A created-bucket filter measures against "today", so the board must notice a
   // day boundary even while idle — without polling. `dayTick` bumps at the next
   // local midnight (the timer reschedules itself via its own dep) and whenever the
@@ -132,6 +160,17 @@ export function ChangesBoard({ visible = true }) {
     const timer = setTimeout(() => setDayTick(t => t + 1), nextMidnight - now);
     return () => clearTimeout(timer);
   }, [dayTick]);
+  // One writer for the filter surface above. Cheap enough to run on any change (a
+  // handful of strings), and writing on EVERY change is what makes a reload land
+  // on exactly the board you left.
+  useEffect(() => {
+    try {
+      localStorage.setItem(FILTER_KEY, JSON.stringify({
+        fields: serializeFilters(filters), search, open: showFilters, searchOpen,
+      }));
+    } catch { /* private mode */ }
+  }, [filters, search, showFilters, searchOpen]);
+
   const [hidden, setHidden] = useState(() => {
     try { return new Set(JSON.parse(localStorage.getItem('dash-hidden-cols') || '[]')); }
     catch { return new Set(); }
