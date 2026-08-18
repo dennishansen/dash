@@ -200,6 +200,17 @@ async function walkRollouts(onFile) {
   return descend(base);
 }
 
+// Snapshot rollout *identities* before creating a new Codex process. CWD plus
+// recency is not enough: an already-active Codex chat can append to its rollout
+// while the new process is starting, making the existing chat appear newer than
+// the child we are trying to discover. A fresh Codex session always owns a new
+// rollout path, so identity is the deterministic boundary.
+async function rolloutInventory() {
+  const paths = new Set();
+  await walkRollouts((full) => { paths.add(full); return null; });
+  return paths;
+}
+
 // --- codex context-window math (verbatim from codex-rs protocol.rs) ---
 // Codex writes a `token_count` event per turn into its rollout, carrying
 // last_token_usage.total_tokens + model_context_window. Its TUI shows "% context
@@ -335,6 +346,8 @@ const codex = {
     return walkRollouts((full, name) => (re.test(name) ? full : null));
   },
 
+  rolloutInventory,
+
   // Codex records the session's cwd in its session_meta (first line).
   async transcriptCwd(transcriptPath) {
     let raw;
@@ -370,11 +383,12 @@ const codex = {
   // dash chat runs in its own unique worktree and we start one codex per worktree
   // at a time, so cwd + recency is an exact match, not a guess. Polls briefly
   // because the file appears a beat after spawn. Returns the uuid or null.
-  async discoverSessionId({ cwd, sinceMs, timeoutMs = 8000 }) {
+  async discoverSessionId({ cwd, sinceMs, timeoutMs = 8000, excludeRollouts = null }) {
     const deadline = Date.now() + timeoutMs;
     const idFromName = (name) => (name.match(/rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i) || [])[1] || null;
     while (Date.now() < deadline) {
       const hit = await walkRollouts(async (full, name, mtimeMs) => {
+        if (excludeRollouts?.has(full)) return null;
         // Recency guard: skip a rollout older than this spawn — it's a PREVIOUS
         // codex chat in the same worktree, not the one we just started. A hair of
         // slack on sinceMs because fs mtime can round just under a same-instant

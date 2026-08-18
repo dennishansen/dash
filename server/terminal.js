@@ -1496,6 +1496,10 @@ async function spawnCodexNewChat({ issueId, cwd, cols, rows, initialPrompt, mode
   const bin = adapter.bin();
   const isStandIn = bin === process.env.LAB_TERMINAL_CMD || bin === process.env.LAB_CODEX_CMD;
   const args = isStandIn ? [] : adapter.buildArgs({ mode: 'new', initialPrompt, model });
+  // Exclude every rollout that existed before this child. The caller may itself
+  // be a live Codex chat in this same worktree; its rollout can advance during
+  // discovery and must never be adopted as the newly spawned chat.
+  const priorRollouts = await adapter.rolloutInventory();
   const since = Date.now();
 
   let term;
@@ -1506,7 +1510,7 @@ async function spawnCodexNewChat({ issueId, cwd, cols, rows, initialPrompt, mode
     });
   } catch (e) { return { error: `codex spawn failed: ${e.message}` }; }
 
-  const sessionId = await adapter.discoverSessionId({ cwd, sinceMs: since });
+  const sessionId = await adapter.discoverSessionId({ cwd, sinceMs: since, excludeRollouts: priorRollouts });
   if (!sessionId) {
     try { term.kill(); } catch {}
     return { error: 'could not determine codex session id (no rollout written) — is codex installed and authenticated?' };
