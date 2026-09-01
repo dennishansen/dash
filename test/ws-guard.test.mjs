@@ -6,16 +6,27 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   isAllowedWsOrigin,
   isAllowedWsHandshake,
   isAllowedApiRequest,
-  ensureTerminalToken,
+  ensureMachineToken,
   isLoopbackHost,
   terminalToken,
   terminalSubprotocols,
   selectTerminalSubprotocol,
 } from '../server/ws-guard.mjs';
+
+// The machine token persists beside the crash journal; point that at a throwaway
+// dir so tests never read or write the real machine token.
+function withTokenDir(env, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dash-tok-'));
+  try { return withEnv({ ...env, LAB_CHAT_REGISTRY_DIR: dir }, fn); }
+  finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
 
 // `sub` is a Sec-WebSocket-Protocol header value (the token's transport).
 const req = (origin, url = '/api/dash/terminal', sub) => ({
@@ -62,20 +73,19 @@ test('DASH_ALLOWED_ORIGINS extends the allow-list exactly', () => {
   });
 });
 
-test('ensureTerminalToken: none on loopback, minted when exposed', () => {
-  withEnv({ DASH_TERMINAL_TOKEN: undefined }, () => {
-    assert.equal(ensureTerminalToken(false), '');
-    assert.equal(terminalToken(), '');
-    const t = ensureTerminalToken(true);
+test('ensureMachineToken mints and persists a real secret', () => {
+  withTokenDir({ DASH_TERMINAL_TOKEN: undefined }, () => {
+    const t = ensureMachineToken();
     assert.ok(t.length >= 20, 'a real secret is generated');
-    assert.equal(terminalToken(), t, 'installed into process.env');
+    assert.equal(terminalToken(), t, 'persisted so every edge reads the same value');
+    assert.equal(ensureMachineToken(), t, 'idempotent — keeps the existing token');
   });
 });
 
-test('ensureTerminalToken respects an operator-pinned token', () => {
-  withEnv({ DASH_TERMINAL_TOKEN: 'pinned-secret' }, () => {
-    assert.equal(ensureTerminalToken(false), 'pinned-secret'); // required even on loopback
-    assert.equal(ensureTerminalToken(true), 'pinned-secret');
+test('ensureMachineToken respects an operator-pinned token', () => {
+  withTokenDir({ DASH_TERMINAL_TOKEN: 'pinned-secret' }, () => {
+    assert.equal(ensureMachineToken(), 'pinned-secret');
+    assert.equal(terminalToken(), 'pinned-secret');
   });
 });
 
