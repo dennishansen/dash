@@ -20,6 +20,14 @@ const KEY = 'dash_terminal_token';
     const t = params.get('token');
     if (!t) return;
     try { sessionStorage.setItem(KEY, t); } catch { /* private mode — leave it in the URL */ return; }
+    // Every same-origin /api/dash fetch must carry the token on an exposed
+    // edge (the board API mints privileged sessions). A SameSite=Strict cookie
+    // does that for the app's scattered fetch sites with zero call-site
+    // changes, and never travels cross-site.
+    try {
+      const secure = location.protocol === 'https:' ? '; Secure' : '';
+      document.cookie = `dash_token=${encodeURIComponent(t)}; path=/; SameSite=Strict${secure}`;
+    } catch { /* cookie jar unavailable — the WS subprotocol path still works */ }
     params.delete('token');
     const qs = params.toString();
     history.replaceState(history.state, '', location.pathname + (qs ? `?${qs}` : '') + location.hash);

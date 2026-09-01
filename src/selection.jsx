@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { DASH_BASENAME } from './routes.mjs';
 
 // Which board card the keyboard cursor is on, and whether that cursor currently
 // lives on the board or in the chat. Lives above the router so it survives the
@@ -63,25 +64,31 @@ export function SelectionProvider({ children }) {
 
 export function useSelection() { return useContext(SelectionContext); }
 
-// Event-time route predicates (HashRouter). Keyboard scopes use these to check
-// the CURRENT route at keydown rather than React's post-render `visible`/mount
-// state, which lags a frame behind navigation. That frame is the race: the board
-// stays mounted (its listeners still attached) and the detail is mid-unmount just
-// after an Enter/⌘← navigation, so a fast second chord would otherwise fire in
-// the wrong scope — the board reordering a card you just left, or the detail
-// re-navigating from the board. We match the hash PATHNAME only — stripping the
-// query the same way the router derives `pathname` — so a filtered board route
-// like `#/changes?tag=x` (a tag-filter link) still counts as the board, and
-// `#/changes/?tag=x` (trailing slash, no id) is the board, not a detail.
-const hashPath = () => (window.location.hash || '').replace(/^#/, '').split('?')[0];
-export const isBoardRoute = () => /^\/changes\/?$/.test(hashPath());
-// The open issue id from the hash — tolerant of a trailing slash
-// (`/changes/<id>/`, which the router treats as the same route) and, via
-// hashPath, a query. This is the ONE detail-route parser: isDetailRoute and
-// useIssueNav.go both read it, so "is this a detail route" and "which id" can't
-// disagree (they did when go() kept the trailing slash and fell off the rail).
+// Event-time route predicates (BrowserRouter). Keyboard scopes use these to
+// check the CURRENT route at keydown rather than React's post-render
+// `visible`/mount state, which lags a frame behind navigation. That frame is the
+// race: the board stays mounted (its listeners still attached) and the detail is
+// mid-unmount just after an Enter/⌘← navigation, so a fast second chord would
+// otherwise fire in the wrong scope — the board reordering a card you just left,
+// or the detail re-navigating from the board. We read `location.pathname`
+// (basename-stripped, so it matches the router's own `/issues`-relative view)
+// and the query rides `location.search` now, never the path — so a filtered
+// board route like `/dash/issues?tag=x` (a TagPill link) still counts as the
+// board, and `/dash/issues/` (trailing slash, no id) is the board, not a detail.
+const routePath = () => {
+  const p = window.location.pathname || '/';
+  if (p === DASH_BASENAME) return '/';
+  if (p.startsWith(DASH_BASENAME + '/')) return p.slice(DASH_BASENAME.length);
+  return p;
+};
+export const isBoardRoute = () => /^\/issues\/?$/.test(routePath());
+// The open issue id from the path — tolerant of a trailing slash
+// (`/issues/<id>/`, which the router treats as the same route). This is the ONE
+// detail-route parser: isDetailRoute and useIssueNav.go both read it, so "is this
+// a detail route" and "which id" can't disagree (they did when go() kept the
+// trailing slash and fell off the rail).
 export const detailId = () => {
-  const m = hashPath().match(/^\/changes\/(.+?)\/?$/);
+  const m = routePath().match(/^\/issues\/(.+?)\/?$/);
   return m ? decodeURIComponent(m[1]) : null;
 };
 export const isDetailRoute = () => detailId() != null;
@@ -112,14 +119,15 @@ export function useIssueNav(id) {
   const idRef = useRef(id);
   idRef.current = id;
   const go = useCallback((dir) => {
-    // HashRouter: the hash is the route, updated synchronously by navigate(). Read
-    // the id through the shared detailId() parser (query- and trailing-slash-safe)
-    // so `#/changes/<id>?x=1` and `#/changes/<id>/` both yield <id> — not a value
-    // with the query/slash attached, which would fall off the rail (prev/next inert).
+    // BrowserRouter: navigate() updates location.pathname synchronously. Read the
+    // id through the shared detailId() parser (trailing-slash-safe, and the query
+    // rides location.search now) so `/issues/<id>?x=1` and `/issues/<id>/` both
+    // yield <id> — not a value with a slash attached, which would fall off the
+    // rail (prev/next inert).
     const cur = detailId() ?? idRef.current;
     const { prevId, nextId } = neighbors(orderRef.current, cur);
     const to = dir === 'up' ? prevId : nextId;
-    if (to) navigate(`/changes/${encodeURIComponent(to)}`);
+    if (to) navigate(`/issues/${encodeURIComponent(to)}`);
   }, [navigate]);
   return { ...neighbors(order, id), go };
 }

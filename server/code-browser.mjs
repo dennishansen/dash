@@ -4,6 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { run } from './proc.mjs';
+import { OVERSIZE, readObject, warmObjects } from './git-objects.mjs';
 import { MAIN_ENV, workspaceDirForEnv } from './workspace-env.mjs';
 
 const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
@@ -18,6 +19,14 @@ export class CodeBrowserError extends Error {
 async function git(root, args, { binary = false } = {}) {
   const result = await run('git', ['-C', root, ...args], { binary });
   if (result.status !== 0) {
+    // `error` set means the CHILD NEVER RAN — spawn itself failed, typically
+    // EAGAIN/EMFILE when the machine is out of processes or descriptors. Say so.
+    // Falling through to the generic text reports a resource exhaustion as
+    // "git rev-parse failed", which reads as a repository problem and sends the
+    // next reader looking at the wrong thing entirely.
+    if (result.error) {
+      throw new CodeBrowserError(`could not run git (${result.error.code || result.error.message})`, 500);
+    }
     throw new CodeBrowserError(result.stderr.trim() || `git ${args[0]} failed`, 500);
   }
   return result.stdout;
@@ -28,18 +37,22 @@ async function commit(root, ref) {
   return output.trim();
 }
 
+// The checked-out branch and the ref to review against, resolved together —
+// every caller that wants one wants the other, and asking git twice for the
+// current branch is a whole-repo call this path can't afford to spend twice.
 async function repositoryBase(root, explicitRef = null) {
-  if (explicitRef) return { label: explicitRef, sha: await commit(root, explicitRef) };
   const branch = (await git(root, ['branch', '--show-current'])).trim();
-  if (!branch || branch === 'main') return { label: 'HEAD', sha: await commit(root, 'HEAD') };
+  const head = async () => ({ branch, label: 'HEAD', sha: await commit(root, 'HEAD') });
+  if (explicitRef) return { branch, label: explicitRef, sha: await commit(root, explicitRef) };
+  if (!branch || branch === 'main') return head();
 
   for (const label of ['main', 'origin/main']) {
     try {
       const result = await run('git', ['-C', root, 'merge-base', 'HEAD', label]);
-      if (result.status === 0 && result.stdout.trim()) return { label, sha: result.stdout.trim() };
+      if (result.status === 0 && result.stdout.trim()) return { branch, label, sha: result.stdout.trim() };
     } catch { /* try the next conventional main ref */ }
   }
-  return { label: 'HEAD', sha: await commit(root, 'HEAD') };
+  return head();
 }
 
 function parseTracked(raw) {
@@ -138,7 +151,13 @@ function safeRelative(root, relative) {
   return { relative: normalized, full };
 }
 
-async function currentBuffer(root, relative, status) {
+// The working-tree side of the view. The ceiling is enforced by the READ, and
+// only by the read: this is a live working tree, so a size taken from the stat
+// is a guess that a file an agent is writing invalidates between the two calls.
+// Streaming and stopping the moment it passes the ceiling is exact where the
+// stat was approximate, and it is the whole guard rather than a second one —
+// one invariant, one mechanism, and a mechanism a test can actually reach.
+async function currentBuffer(root, relative, status, maxBytes) {
   if (status === 'deleted') return Buffer.alloc(0);
   const { full } = safeRelative(root, relative);
   let stat;
@@ -153,49 +172,96 @@ async function currentBuffer(root, relative, status) {
     fs.promises.realpath(root),
   ]);
   if (!real.startsWith(realRoot + path.sep)) throw new CodeBrowserError('file is outside the workspace', 403);
-  return fs.promises.readFile(real);
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of fs.createReadStream(real)) {
+    total += chunk.length;
+    if (total > maxBytes) return OVERSIZE; // ends the stream
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, total);
 }
 
-async function originalBuffer(root, baseSha, relative, status) {
+// The base version of a changed file — the only git the click path still needs,
+// and it is a lookup rather than a program: `git-objects.mjs` keeps one
+// `cat-file --batch` open per repository so this costs a pipe round-trip instead
+// of a fork+exec. An added file has no base version to fetch and never asks.
+async function originalBuffer(root, baseSha, relative, status, maxBytes) {
   if (status === 'added' || !relative) return Buffer.alloc(0);
-  const result = await run('git', ['-C', root, 'show', `${baseSha}:${relative}`], { binary: true });
-  if (result.status !== 0) return Buffer.alloc(0);
-  return result.stdout;
+  return (await readObject(root, `${baseSha}:${relative}`, { maxBytes })) ?? Buffer.alloc(0);
 }
 
-function unsupported(buffers, maxBytes) {
+// Why the view can't show what it was asked for. Each side is a Buffer, or one
+// of two answers that isn't bytes at all: `null` for a symlink, `OVERSIZE` for
+// something real but too big to have read.
+function unsupported(buffers) {
   if (buffers.some((buffer) => buffer === null)) return 'symlink';
-  if (buffers.some((buffer) => buffer.length > maxBytes)) return 'large';
+  if (buffers.some((buffer) => buffer === OVERSIZE)) return 'large';
   if (buffers.some((buffer) => buffer.includes(0))) return 'binary';
   return null;
 }
 
-// A full snapshot runs 4 whole-repo git calls (ls-files ×2, diff, rev-parse), so
-// recomputing it on EVERY file open — plus the client's 3s poll — was the reason
-// opening a file felt slow: each click re-scanned the entire tree just to look up
-// one entry's status + baseSha. Coalesce with a short TTL keyed by root+baseRef:
-// the poll refreshes it every few seconds and file opens reuse that snapshot,
-// paying only for the one file's own git-show. The cached value is the PROMISE,
-// so a poll and an open firing together share a single computation.
-const SNAPSHOT_TTL_MS = 2000;
-const snapshotCache = new Map(); // `${root}\0${baseRef}` → { at, promise }
+// A snapshot is a whole-repo scan — `ls-files --others` walks every untracked
+// path and `diff --name-status` stats every tracked one — which measures ~1.7s on
+// an idle machine and 10-17s on a loaded one, against a client that polls it
+// every 3s per open pane. The old shape cached the PROMISE under a 2s TTL, which
+// is SHORTER than that poll, so no poll ever hit it; worse, a poll arriving past
+// the TTL started a second whole-repo scan while the first was still running, and
+// under load that settles into several concurrent scans per repo which make the
+// machine they are measuring slower still.
+//
+// The cure isn't a longer lifetime. The pane wants a live tree, and a value held
+// past its own computation is stale for exactly as long as you hold it. It's
+// that READERS COALESCE: a request arriving while a scan is running JOINS that
+// scan instead of starting another. The cache's lifetime is the computation,
+// which is the only lifetime that matches how this is consumed — every response
+// still reflects a scan no older than the one in flight.
+//
+// And A MUTATION SUPERSEDES: something that just changed the repository installs
+// the next scan itself (rescan, below) rather than letting readers join one that
+// started before the change. So a repo CAN be scanned twice at once — briefly,
+// two per key, twice per destructive action. The axis that matters is not
+// "sometimes two" versus "never two"; it is BOUNDED-BY-A-HUMAN-ACTION versus
+// UNBOUNDED-BY-A-POLL-LOOP, and only the second was ever the pathology this
+// replaced.
+//
+// Instant repaint on revisit is the CLIENT's half of this (fetch-cache.js), and
+// it stays honest because the poll behind it refreshes what it painted.
+const scans = new Map(); // `${root}\0${baseRef}` → in-flight Promise<snapshot>
+
+function startScan(root, baseRef) {
+  const key = `${root}\0${baseRef ?? ''}`;
+  // Settled — success or failure — means no scan is in flight, so the next
+  // caller starts a fresh one rather than inheriting an old answer or a
+  // remembered error. The identity check is also what makes superseding safe:
+  // a scan replaced mid-flight will not delete its replacement's entry.
+  const scan = computeSnapshot(root, baseRef)
+    .finally(() => { if (scans.get(key) === scan) scans.delete(key); });
+  scans.set(key, scan);
+  return scan;
+}
+
+// Start a scan that is guaranteed to have begun AFTER this call, and make it the
+// one readers join. For callers that just changed the repository: joining the
+// running scan would hand back a tree computed before the change, which for a
+// destructive action reads as "the button did nothing".
+export function rescan(root, { baseRef = null } = {}) {
+  return startScan(root, baseRef);
+}
 
 export async function repositorySnapshot(root, { baseRef = null } = {}) {
   const key = `${root}\0${baseRef ?? ''}`;
-  const hit = snapshotCache.get(key);
-  const now = Date.now();
-  if (hit && now - hit.at < SNAPSHOT_TTL_MS) return hit.promise;
-  const promise = computeSnapshot(root, baseRef);
-  snapshotCache.set(key, { at: now, promise });
-  // Don't cache a rejection — drop it so the next call retries.
-  promise.catch(() => { if (snapshotCache.get(key)?.promise === promise) snapshotCache.delete(key); });
-  return promise;
+  return scans.get(key) || startScan(root, baseRef);
 }
 
 async function computeSnapshot(root, baseRef) {
+  // Whoever is asking for the tree is about to click something in it, and the
+  // pane re-asks every 3s for as long as it stays open. Opening the object
+  // session here is what makes the FIRST click free too — otherwise it is the
+  // one click that still pays for a process.
+  warmObjects(root);
   const base = await repositoryBase(root, baseRef);
-  const [branch, head, trackedRaw, untrackedRaw, changedRaw] = await Promise.all([
-    git(root, ['branch', '--show-current']),
+  const [head, trackedRaw, untrackedRaw, changedRaw] = await Promise.all([
     commit(root, 'HEAD'),
     git(root, ['ls-files', '--cached', '-s', '-z']),
     git(root, ['ls-files', '--others', '--exclude-standard', '-z']),
@@ -216,8 +282,14 @@ async function computeSnapshot(root, baseRef) {
   const files = [...paths]
     .map((file) => ({ path: file, ...(changes.get(file) || { status: null }) }))
     .sort((a, b) => a.path.localeCompare(b.path));
+  // Again, now that the scan is done. The session ages out on time since it was
+  // last wanted, and this scan is itself slow — on a loaded machine it can take
+  // longer than that window, which would let the session it opened expire before
+  // the tree it belongs to ever reached the client. The click that follows must
+  // find it open, and the click follows THIS moment, not the one above.
+  warmObjects(root);
   return {
-    branch: branch.trim() || '(detached)',
+    branch: base.branch || '(detached)',
     base: base.label,
     baseSha: base.sha,
     head: head.trim(),
@@ -289,12 +361,12 @@ export async function repositoryFile(root, file, { baseRef = null, maxBytes = DE
     baseLabel = snapshot.base;
   }
 
-  const current = await currentBuffer(root, entry.path, entry.status);
+  const current = await currentBuffer(root, entry.path, entry.status, maxBytes);
   const originalPath = entry.oldPath || entry.path;
   const original = entry.status
-    ? await originalBuffer(root, baseSha, originalPath, entry.status)
+    ? await originalBuffer(root, baseSha, originalPath, entry.status, maxBytes)
     : Buffer.alloc(0);
-  const reason = unsupported(entry.status ? [original, current] : [current], maxBytes);
+  const reason = unsupported(entry.status ? [original, current] : [current]);
   const common = {
     path: entry.path,
     oldPath: entry.oldPath || null,
@@ -314,7 +386,7 @@ export async function repositoryFile(root, file, { baseRef = null, maxBytes = DE
   return { ...common, kind: 'source', text: current.toString('utf8') };
 }
 
-function environmentRoot(env) {
+export function environmentRoot(env) {
   const root = workspaceDirForEnv(env);
   if (!root) throw new CodeBrowserError('No workspace is available for this issue.', 404);
   return root;

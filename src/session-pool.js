@@ -2,12 +2,15 @@
 // (one chat legitimately carries work across cards), but the chat pool in
 // main.jsx is keyed by ISSUE — so a session linked to two issues would mount two
 // ChatPanes, whose two WebSockets fight over the server's one-attached-socket-
-// per-session rule (the visible terminal keeps losing its attachment) and whose
-// two detectors clobber each other's activity reports (the flashing dot).
+// per-session rule (the visible terminal keeps losing its attachment). Two
+// panes also used to run two working/idle detectors that clobbered each other
+// (the flashing dot); that half of the problem is gone at the root — detection
+// moved into the supervisor (server/chat-activity.mjs) and no longer belongs to
+// a pane at all. What remains here is the socket.
 //
 // This registry makes the SESSION the unit of mounting: every ChatEnvironment that
 // wants to show a session registers interest, and exactly one — the OWNER —
-// actually mounts the ChatPane (socket + detector). Ownership rules:
+// actually mounts the ChatPane (and its socket). Ownership rules:
 //   1. the ACTIVE (visible) pane always wins — opening a card takes the session
 //      over from a hidden pane, so the terminal you're looking at is the one
 //      attached (the loser unmounts, closing its socket; the server broadcasts
@@ -17,11 +20,11 @@
 //      between hidden hosts;
 //   3. a released session (owner unmounted / switched chats / unlinked) falls to
 //      the earliest remaining registrant, so a session another issue still links
-//      stays mounted and its dot detection never stops.
+//      stays mounted.
 //
-// Activity fan-out is NOT handled here — the one mounted detector reports into
-// activity-store keyed by session, and each card joins through its own
-// conversations[] (see activity-store.issueActivity).
+// Needs-input dots are NOT downstream of any of this: the supervisor publishes a
+// state per live chat and every card joins it through its own selected_session
+// (see activity-store), whether or not a pane exists.
 
 import { useEffect, useSyncExternalStore } from 'react';
 

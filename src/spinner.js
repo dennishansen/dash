@@ -1,5 +1,7 @@
 // Detect whether a Claude Code chat is actively working — read from the RENDERED
-// VIEWPORT (the grid xterm maintains), not the raw PTY stream.
+// VIEWPORT (the grid xterm maintains), not the raw PTY stream. Pure: the
+// supervisor runs it over a headless xterm fed by the PTY it owns
+// (server/chat-activity.mjs), and the browser uses viewportText as a test seam.
 //
 // Why the viewport and not the stream: the stream is an unreliable proxy. During
 // heavy text output Claude stops repainting the spinner for 10-18s (only content
@@ -12,7 +14,7 @@
 // shows the spinner).
 //
 // The signal has two OR'd clauses (computed by the caller, which samples the
-// viewport on a timer and tracks change):
+// viewport on a timer and tracks change — see server/chat-activity.mjs):
 //   1. spinnerState(viewport) === 'live' — a live spinner is the BOTTOMMOST
 //      spinner line on screen. Covers thinking, tool calls, and subagents (the
 //      spinner sits at the bottom, frozen or animating, with no done-summary

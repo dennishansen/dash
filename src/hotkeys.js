@@ -83,8 +83,8 @@ function matches(e, spec) {
 
 // Does keydown `e` match `combo`? Same parse + match logic `useHotkey` uses,
 // exposed for the few LOCAL onKeyDown handlers that own a single field's keys
-// (a modal's own Esc / a second opener) and so can't be global hotkeys — they
-// still source their combo from the registry via `matchesCombo(e, hk('id'))`
+// (the body editor's ⌘↵ save / Esc cancel) and so can't be global hotkeys — they
+// still source their combo from the registry via `matchesCombo(e, hk('bodySave'))`
 // instead of hand-rolling `(e.metaKey||e.ctrlKey) && e.key==='Enter'`.
 export function matchesCombo(e, combo) {
   return matches(e, parseCombo(combo));
@@ -103,8 +103,8 @@ export function matchesCombo(e, combo) {
 //   'input'    — a real text field (input / textarea / select / contenteditable)
 //   'none'     — anything else (buttons, body, the board)
 // A popover that is NOT aria-modal (a status menu, the tag/owner pickers) is
-// deliberately not 'modal' — it owns only its own Escape (a capture-phase local
-// listener), while the rest of the keyboard still works behind it.
+// deliberately not 'modal' — it owns only its own Escape (an allowInInput hotkey),
+// while the rest of the keyboard still works behind it.
 export function focusedFieldKind(target) {
   const t = target;
   if (!t || t.nodeType !== 1) return 'none';

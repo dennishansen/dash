@@ -25,12 +25,16 @@ import { HOTKEYS, SCOPES, comboCaps, hk } from './hotkey-registry.js';
 //     one-binding-per-(combo,phase) invariant in hotkeys.js stays intact.
 
 // Which route surface is active, so the overlay can dim the shortcuts that
-// won't fire here. OSS routing: the board is home ('/'), an issue detail is
-// '/changes/:id' — so anything that isn't a change detail reads as the board.
+// won't fire here. Only board/detail are route-scoped (SCOPES.routeScope);
+// everywhere/panel/text always apply. `pathname` is basename-relative
+// (BrowserRouter strips /dash), so it reads the same "/issues" segments the
+// routes are declared with — and the bare path is the board, since /dash/
+// redirects there.
 function activeRouteScope(pathname) {
   const parts = pathname.split('/').filter(Boolean);
-  if (parts[0] === 'changes' && parts[1]) return 'detail';
-  return 'board';
+  if (parts.length === 0) return 'board';
+  if (parts[0] !== 'issues') return null;
+  return parts[1] ? 'detail' : 'board';
 }
 
 export function ShortcutsOverlay() {
@@ -99,9 +103,9 @@ function ShortcutsModal({ onClose }) {
     // primitive reads 'modal' and yields every background hotkey).
     if (e.key === 'Tab') { e.preventDefault(); return; }
     // BARE Esc and a second `?` (both sourced via matchesCombo, so a MODIFIED
-    // Escape and Meta+? don't spuriously close) close the overlay. Handled
-    // locally so they win over any route-level Escape and never reach the page
-    // behind the modal.
+    // Escape — ⌘Esc is the dismiss-flag command, not a modal-close — and Meta+?
+    // don't spuriously close) close the overlay. Handled locally so they win over
+    // any route-level Escape and never reach the page behind the modal.
     if (matchesCombo(e, 'Escape') || matchesCombo(e, hk('shortcuts'))) {
       e.preventDefault();
       e.stopPropagation();

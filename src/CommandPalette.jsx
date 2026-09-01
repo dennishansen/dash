@@ -6,6 +6,11 @@ import { hk } from './hotkey-registry.js';
 import { useIssues } from './api.js';
 import { listChanges, listBodies } from './board-store.js';
 import { issueHaystack } from './issue-search.js';
+import { searchChats } from '../server/chat-mirror.mjs';
+import { agentById } from './agents.js';
+import { AgentBadge } from './AgentBadge.jsx';
+import { useChatControl } from './chat-control.jsx';
+import { statusLabel } from './board-columns.mjs';
 
 // ⌘K global search for the dash — a centered modal over any route that jumps
 // straight to an issue. It reuses rather than reinvents: the SAME 'changes'
@@ -14,25 +19,33 @@ import { issueHaystack } from './issue-search.js';
 // and detail view use (.pill.bucket-*), and the ONE hotkey primitive so ⌘K
 // fires even over the chat terminal (terminal:'handle').
 //
-// It adds one thing the board can't: it also searches DESCRIPTION text. The
-// board omits body from its list fetch (LIST_COLS) to stay lean, so the palette
-// lazily fetches id+body once opened ('issue-bodies') and matches it on top of
-// the shared matcher — description-search is a palette layer, not a board change.
-// A body hit shows a snippet under the title; matched text is bolded everywhere.
+// It adds two things the board can't. First, DESCRIPTION text: the board omits
+// body from its list fetch (LIST_COLS) to stay lean, so the palette lazily
+// fetches id+body once opened ('issue-bodies') and matches it on top of the
+// shared matcher. A body hit shows a snippet under the title.
+//
+// Second — and this is the point of chat sync — everyone's CHATS. The reasoning
+// behind past work used to be locked to whichever laptop produced it; every
+// chat now mirrors its spoken turns into shared storage, so this box searches
+// the whole team's conversations alongside their issues. That half cannot be
+// client-side (the corpus is far too large to ship to a browser), so it is a
+// database query, debounced as you type. It matches by case-insensitive
+// substring exactly as the issue half does — one box, one mental model, and a
+// trigram index is what makes that affordable.
+//
+// Matched text is bolded everywhere.
 //
 // Keyboard model, split by scope:
-//   • ⌘K is the one GLOBAL command → useHotkey (capture, terminal:'handle', and
-//     allowInInput so it toggles closed while the palette's own input is focused).
-//   • Everything WHILE OPEN — ↑/↓ move the highlight, Enter opens, Esc closes,
-//     Tab is trapped — is palette-internal, a bubble-phase local onKeyDown on the
-//     focused input (the accessible combobox / aria-activedescendant pattern), so
-//     the board's own capture-phase ↑/↓/Enter yield to the focused field and Esc
-//     wins over the detail view's Esc-to-board.
-
-const STATUS_LABEL = {
-  maybe: 'Maybe', future: 'Future', next: 'Next',
-  'in-progress': 'In Progress', done: 'Done', rejected: 'Rejected',
-};
+//   • ⌘K OPENS the palette → useHotkey (capture, terminal:'handle', allowInInput
+//     so it fires while a non-modal field like the board search owns focus). It
+//     never has to close: once open the panel is an aria-modal, so the primitive
+//     yields ⌘K to it (a modal owns the keyboard) — closing is a local key below.
+//   • Everything WHILE OPEN — ↑/↓ move the highlight, Enter opens, Esc AND a
+//     second ⌘K (sourced via matchesCombo) close, Tab is trapped — is
+//     palette-internal, a bubble-phase local onKeyDown on the focused input (the
+//     accessible combobox / aria-activedescendant pattern), so the board's own
+//     capture-phase ↑/↓/Enter yield to the focused field and Esc wins over the
+//     detail view's Esc-to-board.
 
 function SearchIcon() {
   return (
@@ -115,10 +128,57 @@ export function CommandPalette() {
   return createPortal(<PaletteModal onClose={close} />, document.body);
 }
 
+// The team's chats, matching `query`. Debounced because this one is a request
+// per keystroke otherwise, and sequenced by a token so a slow early query can
+// never overwrite the results of a later one you are actually looking at.
+function useChatHits(query) {
+  const [hits, setHits] = useState([]);
+  const seq = useRef(0);
+  useEffect(() => {
+    const q = query.trim();
+    if (q.length < 2) { setHits([]); return undefined; }
+    const mine = ++seq.current;
+    const t = setTimeout(async () => {
+      try {
+        const rows = await searchChats(q, 30);
+        if (seq.current === mine) setHits(rows);
+      } catch { if (seq.current === mine) setHits([]); }
+    }, 160);
+    return () => clearTimeout(t);
+  }, [query]);
+  return hits;
+}
+
+// One thing somebody said, as a search result. The matched line leads — that is
+// what you were looking for — and the row underneath says where it came from:
+// which agent, whose chat, which issue. Without that a hit is a floating
+// sentence with no way back to its context.
+function ChatResult({ hit, snippet, q }) {
+  const agent = agentById(hit.agent);
+  return (
+    <>
+      <div className="cmdk-item-main">
+        <span className="cmdk-item-title">{highlight(snippet, q)}</span>
+        <span className="cmdk-item-sub cmdk-chat-where">
+          <AgentBadge agent={agent.id} size={13} />
+          <span className="cmdk-chat-title">{hit.title || `chat ${hit.session_id.slice(0, 8)}`}</span>
+          <span className="cmdk-chat-sep">·</span>
+          <span className="cmdk-chat-env">{hit.env}</span>
+          {hit.role === 'user' ? <span className="cmdk-chat-role">said</span> : null}
+        </span>
+      </div>
+      <span className="pill cmdk-chat-pill">chat</span>
+    </>
+  );
+}
+
 function PaletteModal({ onClose }) {
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
   const navigate = useNavigate();
+  // The same channel a convo pill uses to open a chat — so a search hit and a
+  // click on the card land in the identical place, with no second mechanism.
+  const requestChat = useChatControl();
   const inputRef = useRef(null);
   const listRef = useRef(null);
 
@@ -134,22 +194,39 @@ function PaletteModal({ onClose }) {
     return m;
   }, [bodyRows]);
 
-  // Each result is { issue, snippet } — snippet is the description window when
-  // the hit is in the body (null otherwise). Base match (id/title/tags) is the
-  // shared matcher; body match is the palette's own layer on top.
+  // The team's chats. Fetched, not filtered client-side: the corpus is every
+  // turn everyone has ever spoken, so it stays in the database.
+  const chatHits = useChatHits(query);
+
+  // ONE list of rows, each tagged with what it is, so ↑/↓ and Enter work the
+  // same whether you land on an issue or on something somebody said. Issues
+  // come first: you usually know the card you want, and a chat hit is the
+  // answer when you don't. Each row is { kind, key } plus its own payload.
   const results = useMemo(() => {
     const issues = (data ?? []).filter(i => i.kind === 'issue');
     const q = query.trim().toLowerCase();
-    if (!q) return issues.map(i => ({ issue: i, snippet: null }));
+    if (!q) return issues.map(i => ({ kind: 'issue', key: i.id, issue: i, snippet: null }));
     const out = [];
     for (const i of issues) {
       const base = issueHaystack(i).includes(q);
       const body = bodies.get(i.id) || '';
       const bi = body.toLowerCase().indexOf(q);
-      if (base || bi >= 0) out.push({ issue: i, snippet: bi >= 0 ? snippetAround(body, bi, q.length) : null });
+      if (base || bi >= 0) {
+        out.push({
+          kind: 'issue', key: i.id, issue: i,
+          snippet: bi >= 0 ? snippetAround(body, bi, q.length) : null,
+        });
+      }
+    }
+    for (const h of chatHits) {
+      const at = h.text.toLowerCase().indexOf(q);
+      out.push({
+        kind: 'chat', key: `${h.session_id}:${h.idx}`, hit: h,
+        snippet: snippetAround(h.text, at < 0 ? 0 : at, q.length),
+      });
     }
     return out;
-  }, [data, bodies, query]);
+  }, [data, bodies, query, chatHits]);
 
   // Keep the highlight in range if the list shrinks (typing, a Realtime removal,
   // or body matches arriving/leaving as the lazy fetch settles).
@@ -165,10 +242,20 @@ function PaletteModal({ onClose }) {
     listRef.current?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' });
   }, [active]);
 
-  const go = useCallback((id) => {
+  // Open a row. An issue goes to its card. A chat hit goes to the card the chat
+  // belongs to AND opens that chat at the matching turn — the search only pays
+  // off if it lands you on the sentence, not merely near it. A `main` chat has
+  // no card, so it opens the chat where it lives without navigating.
+  const go = useCallback((row) => {
     onClose();
-    navigate(`/changes/${encodeURIComponent(id)}`);
-  }, [onClose, navigate]);
+    if (row.kind === 'chat') {
+      const { env, session_id: sid, idx } = row.hit;
+      if (env !== 'main') navigate(`/issues/${encodeURIComponent(env)}`);
+      requestChat?.(env, sid, idx);
+      return;
+    }
+    navigate(`/issues/${encodeURIComponent(row.issue.id)}`);
+  }, [onClose, navigate, requestChat]);
 
   const onKeyDown = (e) => {
     if (e.key === 'ArrowDown') {
@@ -180,11 +267,11 @@ function PaletteModal({ onClose }) {
     } else if (e.key === 'Enter') {
       e.preventDefault(); e.stopPropagation();
       const r = results[active];
-      if (r) go(r.issue.id);
+      if (r) go(r);
     } else if (matchesCombo(e, 'Escape') || matchesCombo(e, hk('search'))) {
       // BARE Esc closes; so does a second ⌘K — both via matchesCombo, so a
-      // MODIFIED Escape doesn't steal it. The modal owns its own keys now that
-      // the primitive yields all hotkeys to it.
+      // MODIFIED Escape (⌘Esc is a command, not a modal-close) doesn't steal it.
+      // The modal owns its own keys now that the primitive yields all hotkeys.
       e.preventDefault(); e.stopPropagation();
       onClose();
     } else if (e.key === 'Tab') {
@@ -195,7 +282,7 @@ function PaletteModal({ onClose }) {
   };
 
   const q = query.trim();
-  const activeId = results[active]?.issue.id;
+  const activeId = results[active]?.key;
   return (
     // Backdrop dismiss on mousedown (not click), so a text-selection drag that
     // starts in the input and releases outside can't close the palette.
@@ -216,7 +303,7 @@ function PaletteModal({ onClose }) {
             value={query}
             onChange={e => { setQuery(e.target.value); setActive(0); }}
             onKeyDown={onKeyDown}
-            placeholder="Search issues by id, title, or description…"
+            placeholder="Search issues and everyone's chats…"
             role="combobox"
             aria-expanded="true"
             aria-controls="cmdk-listbox"
@@ -227,25 +314,29 @@ function PaletteModal({ onClose }) {
         </div>
         <div className="cmdk-results" id="cmdk-listbox" role="listbox" ref={listRef}>
           {results.length === 0 ? (
-            <div className="cmdk-empty">No matching issues</div>
-          ) : results.map(({ issue, snippet }, i) => (
+            <div className="cmdk-empty">No matching issues or chats</div>
+          ) : results.map((row, i) => (
             <div
-              key={issue.id}
-              id={`cmdk-opt-${issue.id}`}
+              key={row.key}
+              id={`cmdk-opt-${row.key}`}
               role="option"
               aria-selected={i === active}
-              className={`cmdk-item${i === active ? ' is-active' : ''}`}
+              className={`cmdk-item${i === active ? ' is-active' : ''}${row.kind === 'chat' ? ' cmdk-item-chat' : ''}`}
               onMouseMove={() => setActive(i)}
               // Keep focus on the input (aria-activedescendant model) — the click
               // still fires and navigates.
               onMouseDown={e => e.preventDefault()}
-              onClick={() => go(issue.id)}
+              onClick={() => go(row)}
             >
-              <div className="cmdk-item-main">
-                <span className="cmdk-item-title">{highlight(issue.title || issue.id, q)}</span>
-                {snippet ? <span className="cmdk-item-sub">{highlight(snippet, q)}</span> : null}
-              </div>
-              <span className={`pill bucket-${issue.status}`}>{STATUS_LABEL[issue.status] || issue.status}</span>
+              {row.kind === 'chat' ? <ChatResult hit={row.hit} snippet={row.snippet} q={q} /> : (
+                <>
+                  <div className="cmdk-item-main">
+                    <span className="cmdk-item-title">{highlight(row.issue.title || row.issue.id, q)}</span>
+                    {row.snippet ? <span className="cmdk-item-sub">{highlight(row.snippet, q)}</span> : null}
+                  </div>
+                  <span className={`pill bucket bucket-${row.issue.status}`}>{statusLabel(row.issue.status)}</span>
+                </>
+              )}
             </div>
           ))}
         </div>

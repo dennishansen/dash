@@ -21,25 +21,30 @@
 import {
   rest, restUrl, publicUrl, putObject, deleteObjects, sha256Hex, ObjectExistsError,
 } from './supabase.mjs';
+import { queryFor, rowFor, stripRunId } from './run-scope.mjs';
 
 const ENV = (typeof process !== 'undefined' && process.env) || {};
 
-// WHICH tables — the same isolation axis as issues/issues_test. Dash tests write
-// real profile rows, so without a clone a fixture person's name and picture
-// would land on the live board. Selected by ARTIFACT_PROFILES_TABLE in node; in
+// WHICH tables — the same isolation axis as issues/dash_test_issues. Dash tests write
+// real run-keyed profile rows, so without that namespace a fixture person's name and picture
+// would land on the live board. Selected by DASH_PROFILES_TABLE in node; in
 // the browser the dev server bakes its selection into the bundle via the
-// __ARTIFACT_PROFILES_TABLE__ define (vite.config.js). The allow-list is NOT
+// __DASH_PROFILES_TABLE__ define (vite.config.js). The allow-list is NOT
 // cloned — membership is real either way, so tests decorate real teammates.
 // The one production profiles table — see issues-store's PROD_TABLE for why the
-// name exists rather than being spelled inline (the reaper's authority check).
+// name exists rather than being spelled inline.
 export const PROD_TABLE = 'dash_profiles';
-export const TABLE = ENV.ARTIFACT_PROFILES_TABLE
-  || (typeof __ARTIFACT_PROFILES_TABLE__ !== 'undefined' ? __ARTIFACT_PROFILES_TABLE__ : null)
+export const TABLE = ENV.DASH_PROFILES_TABLE
+  || (typeof __DASH_PROFILES_TABLE__ !== 'undefined' ? __DASH_PROFILES_TABLE__ : null)
   || PROD_TABLE;
+queryFor(TABLE); // retired shared clones and unowned run stores fail at import
 // The roster view that reads each profiles table — an exact pair, not a derived
 // name, so an unknown table fails loudly here instead of querying a view that
 // doesn't exist.
-const PEOPLE_VIEWS = { dash_profiles: 'dash_people', dash_profiles_test: 'dash_people_test' };
+const PEOPLE_VIEWS = {
+  dash_profiles: 'dash_people',
+  dash_test_profiles: 'dash_test_people',
+};
 export const PEOPLE_VIEW = PEOPLE_VIEWS[TABLE];
 if (!PEOPLE_VIEW) {
   throw new Error(`profiles-store: no roster view for table "${TABLE}" (expected one of ${Object.keys(PEOPLE_VIEWS).join(', ')})`);
@@ -60,12 +65,15 @@ export function normalizeEmail(email) {
 // The whole team, decoration included. The board fetches this ONCE and joins
 // locally — an avatar on a card must never be its own request.
 export async function listPeople() {
-  return (await rest(PEOPLE, 'GET', '?select=email,display_name,avatar_key,avatar_scope,updated_at&order=email.asc')) || [];
+  const rows = (await rest(PEOPLE, 'GET',
+    queryFor(PEOPLE_VIEW, 'select=email,display_name,avatar_key,avatar_scope,selected_chat,updated_at&order=email.asc'))) || [];
+  return rows.map(stripRunId);
 }
 
 export async function get(email) {
-  const rows = await rest(REST, 'GET', `?email=eq.${enc(normalizeEmail(email))}&select=*&limit=1`);
-  return (rows && rows[0]) || null;
+  const rows = await rest(REST, 'GET',
+    queryFor(TABLE, `email=eq.${enc(normalizeEmail(email))}&select=*&limit=1`));
+  return stripRunId((rows && rows[0]) || null);
 }
 
 // Create-or-update one profile. RLS lets a person write only their own row, so
@@ -74,8 +82,9 @@ export async function get(email) {
 export async function upsert(email, fields) {
   const key = normalizeEmail(email);
   if (!key) return { error: 'upsert requires an email' };
-  const row = { email: key, ...fields };
-  await rest(REST, 'POST', '', [row], 'resolution=merge-duplicates,return=minimal');
+  const row = rowFor(TABLE, { email: key, ...fields });
+  const conflict = TABLE === 'dash_test_profiles' ? 'run_id,email' : 'email';
+  await rest(REST, 'POST', `?on_conflict=${conflict}`, [row], 'resolution=merge-duplicates,return=minimal');
   return { ok: true, email: key };
 }
 
@@ -95,7 +104,7 @@ export async function setSelectedChat(email, sessionId) {
 // Every chat currently selected by anyone — the set the reaper skips. Read-all
 // (the reaper carries the service key); one column, so it stays cheap.
 export async function selectedChats() {
-  const rows = await rest(REST, 'GET', '?selected_chat=not.is.null&select=selected_chat');
+  const rows = await rest(REST, 'GET', queryFor(TABLE, 'selected_chat=not.is.null&select=selected_chat'));
   return [...new Set((rows || []).map((r) => r.selected_chat).filter(Boolean))];
 }
 
@@ -203,7 +212,7 @@ export async function setAvatar(email, key) {
 // row constraints see the stored values for anything the payload omits.
 async function update(email, fields) {
   const key = normalizeEmail(email);
-  await rest(REST, 'PATCH', `?email=eq.${enc(key)}`, fields, 'return=minimal');
+  await rest(REST, 'PATCH', queryFor(TABLE, `email=eq.${enc(key)}`), fields, 'return=minimal');
   return { ok: true, email: key };
 }
 
@@ -230,7 +239,7 @@ export function avatarUrl(profile) {
 // from the allow-list, not from the roster), and only the service key can — the
 // table has no delete policy.
 export async function remove(email) {
-  await rest(REST, 'DELETE', `?email=eq.${enc(normalizeEmail(email))}`, null, 'return=minimal');
+  await rest(REST, 'DELETE', queryFor(TABLE, `email=eq.${enc(normalizeEmail(email))}`), null, 'return=minimal');
   return { ok: true, email: normalizeEmail(email) };
 }
 

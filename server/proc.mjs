@@ -10,13 +10,23 @@ import { spawn } from 'child_process';
 // Run `cmd args` to completion without blocking the event loop.
 // Resolves { status, stdout, stderr, error } — never rejects (a spawn failure
 // resolves with status null + error, mirroring spawnSync's shape).
-// `input` is written to stdin (for batch protocols like git cat-file --batch);
-// `binary: true` yields stdout as a Buffer instead of a utf8 string.
-export function run(cmd, args, { input, binary = false } = {}) {
+// `binary: true` yields stdout as a Buffer instead of a utf8 string;
+// `env` overlays variables onto the parent environment (e.g. GIT_INDEX_FILE, to
+// stage a tree without disturbing the real index).
+//
+// One command, one process. A REPEATED question — the same program asked over
+// and over on a request path — should not come here at all: fork+exec is the
+// expensive part (0.8-2.0s on a loaded machine, whatever the program does), so
+// the answer is a process kept open and spoken to, not a faster way to start
+// one. git-objects.mjs is that shape for the object store.
+export function run(cmd, args, { binary = false, env = null } = {}) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(cmd, args, { stdio: [input != null ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
+      child = spawn(cmd, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        ...(env ? { env: { ...process.env, ...env } } : {}),
+      });
     } catch (error) {
       resolve({ status: null, stdout: binary ? Buffer.alloc(0) : '', stderr: '', error });
       return;
@@ -38,9 +48,5 @@ export function run(cmd, args, { input, binary = false } = {}) {
     child.stderr.on('data', (d) => err.push(d));
     child.on('error', (e) => settle(null, e));
     child.on('close', (code) => settle(code));
-    if (input != null) {
-      child.stdin.on('error', () => {}); // child may exit before consuming stdin
-      child.stdin.end(input);
-    }
   });
 }
