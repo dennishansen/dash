@@ -1,29 +1,34 @@
 // Node-only env bootstrap. Imported (for side effect) by node entry points that
-// talk to Supabase — the CLI (bin/dash.mjs) and the Vite dev middleware — BEFORE
-// dash-config reads process.env. It loads the DASH_SUPABASE_* keys from a local
-// .env / .env.local so server-side writers authenticate as the service role and
-// keep working under the tightened `issues` RLS.
+// write to Supabase — board.mjs and the dev middleware — BEFORE issues-store
+// reads process.env. It loads DASH_SUPABASE_SERVICE_KEY (and the project URL/anon
+// overrides) from .env.local so those writers authenticate as the service role
+// and keep working after the `issues` RLS is tightened to authenticated-only.
 //
-// Why a separate module: dash-config.mjs (and issues-store.mjs) are isomorphic
-// and must stay free of fs/child_process so the browser can import them. This
-// file owns the node-only bits. Importing it in the browser never happens.
+// Why a separate module: issues-store.mjs is isomorphic and must stay free of
+// fs/child_process so the browser can import it. This file owns the node-only
+// bits. Importing it in the browser is a no-op-by-omission — nobody does.
 //
-// Precedence: keys already present in the real environment win (never clobber an
-// explicitly-set env var). Otherwise the first readable .env.local, then .env,
-// in the current working directory, supplies them.
+// .env.local lives in the MAIN checkout (gitignored, absent from worktrees), so
+// from a worktree we resolve it via git's common dir — deterministic, not a
+// guess. Keys already present in the environment win — including present-but-
+// empty, which is how a caller deliberately runs keyless (dotenv convention;
+// snapshot.test.js relies on it to simulate a machine without the service key).
 
 import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
 
-const KEYS = ['DASH_SUPABASE_URL', 'DASH_SUPABASE_ANON_KEY', 'DASH_SUPABASE_SERVICE_KEY', 'DASH_ALLOWED_HOSTS', 'DASH_ALLOWED_ORIGINS', 'DASH_TERMINAL_TOKEN', 'DASH_DEV_EMAIL'];
+const KEYS = ['DASH_SUPABASE_SERVICE_KEY', 'DASH_SUPABASE_URL', 'DASH_SUPABASE_ANON_KEY', 'GROQ_API_KEY', 'DASH_ALLOWED_HOSTS', 'DASH_ALLOWED_ORIGINS', 'DASH_TERMINAL_TOKEN', 'DASH_DEV_EMAIL', 'DASH_BIND_HOST', 'DASH_TRUSTED_PEERS', 'DASH_TRUSTED_FRONT', 'DASH_SHELL'];
 
-// Candidate env files, highest precedence first: .env.local then .env, resolved
-// against the process cwd (where the user runs `dash` / `npm run dev`).
+// Candidate .env.local locations: cwd, then the main repo root (git common dir's
+// parent — the same file every worktree shares).
 function candidates() {
-  return [
-    path.resolve(process.cwd(), '.env.local'),
-    path.resolve(process.cwd(), '.env'),
-  ];
+  const out = [path.resolve(process.cwd(), '.env.local')];
+  try {
+    const common = execSync('git rev-parse --path-format=absolute --git-common-dir', { encoding: 'utf8' }).trim();
+    if (common) out.push(path.join(path.dirname(common), '.env.local'));
+  } catch {}
+  return [...new Set(out)];
 }
 
 function parse(text) {
@@ -43,12 +48,12 @@ function parse(text) {
   return env;
 }
 
-if (KEYS.some(k => !process.env[k])) {
+if (KEYS.some(k => process.env[k] === undefined)) {
   for (const file of candidates()) {
     let text;
     try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
     const env = parse(text);
-    for (const k of KEYS) if (!process.env[k] && env[k]) process.env[k] = env[k];
-    // Don't break: let .env fill any key .env.local left unset.
+    for (const k of KEYS) if (process.env[k] === undefined && env[k]) process.env[k] = env[k];
+    break; // first readable .env.local wins
   }
 }

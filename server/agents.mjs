@@ -1,6 +1,6 @@
 // Agent adapters — the per-CLI knowledge the dash needs to launch, resume, watch
 // and read a chat, factored out of terminal.js so a chat is FIRST-CLASS in its
-// agent type rather than hardwired to `claude`. Two agents today:
+// agent type rather than hardwired to `claude`. Three agents today:
 //
 //   claude — Anthropic's `claude` CLI. The dash MINTS the session id (a uuid)
 //            and passes it as `--session-id`; the transcript lands at
@@ -9,6 +9,16 @@
 //            flag to pre-specify one), so a NEW codex chat is spawn-then-
 //            discover: we start it, then read the id back from the fresh rollout
 //            it wrote under ~/.codex/sessions/**. Resume is `codex resume <id>`.
+//   cursor — the Cursor editor. NOT LAUNCHABLE: it is a GUI app, not a CLI the
+//            dash can put behind a PTY, so a Cursor chat is readable and never
+//            runnable. It is also the only agent whose chats are DISCOVERED
+//            rather than linked (see discoverChats) — Cursor records no issue,
+//            but it does record the folder, and a folder IS an environment.
+//
+// `launchable` is the axis that separates them. Everything that spawns, resumes
+// or probes a process reads it, so a non-launchable agent can never reach the
+// picker, the availability probe or the liveness pgrep — while every READ path
+// (turns, cwd, discovery) treats all three identically.
 //
 // A chat's agent rides IN its conversations[] entry as a prefix so it can never
 // drift from the id: a bare uuid is claude (every pre-existing row keeps
@@ -23,7 +33,12 @@ import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import { spawnSync } from 'child_process';
+import { run } from './proc.mjs';
 import { repositoryLoc } from './code-browser.mjs';
+import {
+  cursorPresent, cursorDbPath, isComposerId, listComposers,
+  composerHead, composerBubbles, composerUpdatedAt,
+} from './cursor-db.mjs';
 
 // --- chat-status: live context-window fill + LOC for one chat ---
 // Both agents publish the SAME shape — { used, added, removed, compactAt?,
@@ -34,6 +49,9 @@ import { repositoryLoc } from './code-browser.mjs';
 // `compactExact` marks it as a read-back trigger rather than an estimate. claude
 // forwards whatever its statusline published (the ring falls back to ~83.5% if a
 // field is absent); codex derives its own from the rollout (see each adapter).
+// `added`/`removed` are the lines this chat's BRANCH changed — both agents read
+// them from git in the chat's working directory, so the badge always agrees with
+// the file list next to it and survives the chat's process restarting.
 //
 // Codex auto-compacts at model_auto_compact_token_limit = context_window*9/10
 // (codex-rs protocol.rs). Fed through codex's own display formula, that token
@@ -43,14 +61,108 @@ import { repositoryLoc } from './code-browser.mjs';
 const CODEX_COMPACT_AT = 90;
 
 // --- binary resolution (cached; sh -c, never a login shell — see terminal.js) ---
+//
+// "Not installed" is a REAL state, distinguishable from "resolved fine". This
+// used to fall back to the bare command name on a miss, so a machine without the
+// CLI looked identical to one with it right up until pty.spawn threw ENOENT into
+// the terminal pane. Now a miss is `null`, and every caller has to decide what to
+// do about it — which is what lets the UI say "Claude Code isn't installed on
+// this computer" before the person commits to opening a chat.
+//
+// Two deterministic signals, no string matching: a value containing a slash is a
+// PATH to test with access(X_OK); a bare name is resolved with `command -v`,
+// which is the shell's own answer to "is this installed".
+function executable(p) {
+  try { fs.accessSync(p, fs.constants.X_OK); return true; } catch { return false; }
+}
 
+// Resolved paths are cached (an installed binary doesn't move); MISSES are not,
+// so installing the CLI while the dash is running is picked up on the next look
+// rather than being remembered as absent for the life of the process.
 const _binCache = {};
-function resolveBin(name, fallback = null) {
+function resolveBin(name) {
+  if (!name) return null;
   if (_binCache[name]) return _binCache[name];
-  const r = spawnSync('sh', ['-c', `command -v ${name}`], { encoding: 'utf8' });
-  const p = (r.stdout || '').trim().split('\n')[0];
-  _binCache[name] = p || fallback || name;
-  return _binCache[name];
+  const found = name.includes('/')
+    ? (executable(name) ? name : null)
+    : ((spawnSync('sh', ['-c', `command -v -- "$1"`, 'sh', name], { encoding: 'utf8' }).stdout || '')
+        .trim().split('\n')[0] || null);
+  if (found) _binCache[name] = found;
+  return found;
+}
+
+// --- reading a chat's spoken turns ---
+//
+// `readTurns(sessionId, after)` is the ONE read every agent answers, resolving
+// to { messages:[{ i, role, text, timestamp }], cursor } or null when this agent
+// has no such chat here. It is an ADAPTER method rather than something the
+// caller does around parseTranscript because a transcript is not always a file:
+// claude and codex append jsonl to disk, Cursor keeps rows in SQLite. The shared
+// contract is the turns, not the bytes.
+//
+// `after` is the previous read's cursor, and `i` is a turn's stable position, so
+// an incremental reader never re-receives what it already has.
+
+// The read the two FILE-BACKED agents share: locate the transcript, then read
+// it INCREMENTALLY. A transcript is an append-only jsonl log, and these reads
+// are polled (the 20s mirror sweep over every changed chat, the 4s transcript
+// view) on the same event loop that relays keystrokes — re-reading and
+// re-parsing a multi-MB active transcript on every poll was a recurring
+// hundreds-of-ms block per chat. So each path keeps a cursor: `bytes`/`lines`
+// mark the parsed complete-line boundary, and `messages` accumulates the SPOKEN
+// turns (tiny next to the raw jsonl), so any `after` is served from memory. An
+// unchanged file costs one stat; growth costs only the appended bytes; a file
+// that SHRANK (rewritten — e.g. /clear) resets and re-parses from zero. The
+// boundary is tracked in BYTES on the raw buffer (multibyte-safe: it always
+// lands just past a newline), while `lines`/`i` stay the line-index cursor the
+// contract exposes.
+const _turnsCache = new Map(); // transcript path → { bytes, lines, mtimeMs, size, messages }
+// Two readers advancing one path's cursor concurrently (a transcript-view poll
+// racing the mirror sweep) would each append the same chunk; serialize per path.
+const _turnsInflight = new Map(); // transcript path → tail of the read chain
+
+async function fileBackedTurns(adapter, sessionId, after) {
+  const p = await adapter.findTranscript(sessionId);
+  if (!p) return null;
+  const job = (_turnsInflight.get(p) || Promise.resolve())
+    .then(() => incrementalTurns(adapter, p, after));
+  _turnsInflight.set(p, job.catch(() => {}));
+  return job;
+}
+
+async function incrementalTurns(adapter, p, after) {
+  let st;
+  try { st = await fs.promises.stat(p); } catch { return null; }
+  let c = _turnsCache.get(p);
+  if (!c || st.size < c.bytes) c = { bytes: 0, lines: 0, mtimeMs: -1, size: -1, messages: [] };
+  if (st.size !== c.size || st.mtimeMs !== c.mtimeMs) {
+    let buf;
+    try {
+      const fh = await fs.promises.open(p, 'r');
+      try {
+        buf = Buffer.alloc(st.size - c.bytes);
+        await fh.read(buf, 0, buf.length, c.bytes);
+      } finally { await fh.close(); }
+    } catch { return null; }
+    const nl = buf.lastIndexOf(0x0A);
+    if (nl >= 0) {
+      const chunk = adapter.parseTranscript(buf.subarray(0, nl + 1).toString('utf8'), 0);
+      const base = c.lines;
+      c = {
+        bytes: c.bytes + nl + 1,
+        lines: base + chunk.cursor,
+        mtimeMs: st.mtimeMs,
+        size: st.size,
+        messages: c.messages.concat(chunk.messages.map((m) => ({ ...m, i: m.i + base }))),
+      };
+    } else {
+      // Only a mid-append fragment landed since last read — nothing complete to
+      // consume; remember the stat so an unchanged file stays a single stat.
+      c = { ...c, mtimeMs: st.mtimeMs, size: st.size };
+    }
+    _turnsCache.set(p, c);
+  }
+  return { messages: after > 0 ? c.messages.filter((m) => m.i >= after) : c.messages.slice(), cursor: c.lines };
 }
 
 // --- shared transcript cursor discipline ---
@@ -74,20 +186,178 @@ function parseLines(raw, after, mapLine) {
   return { messages, cursor: lines.length };
 }
 
+// Read the last `maxBytes` of a file (whole file if smaller). `atBOF` marks that
+// the read reached byte 0, so a caller widening the window knows when to stop.
+// Shared: two different tail scans (codex's token_count, both agents' last
+// timestamp) need the same bounded read of a transcript that may be many MB.
+async function readTail(fpath, maxBytes) {
+  const fd = await fs.promises.open(fpath, 'r');
+  try {
+    const { size } = await fd.stat();
+    const start = Math.max(0, size - maxBytes);
+    const buf = Buffer.alloc(size - start);
+    if (buf.length) await fd.read(buf, 0, buf.length, start);
+    return { text: buf.toString('utf8'), atBOF: start === 0 };
+  } finally { await fd.close(); }
+}
+
+// --- when a conversation last MOVED -----------------------------------------
+// The timestamp on the last record that carries one, as epoch ms. Both
+// file-backed agents stamp every jsonl record with a top-level ISO `timestamp`,
+// so this is ONE reader for both — which is the whole reason codex can be dated
+// exactly like claude rather than by a second, parallel rule.
+//
+// It exists because a transcript's MTIME is not the conversation's clock. A file
+// can be rewritten in place — same inode, same size, not one new line — and on
+// this machine that happens in bulk (164 of 273 transcripts had an mtime newer
+// than their last message by over 20 minutes, several by days). Anything reading
+// mtime as "when did this agent last do something" is reading the filesystem's
+// last opinion, not the chat's; the reaper read it, so a fleet that had been
+// silent for days looked freshly active and nothing was ever collected.
+//
+// Scanned BACKWARDS from the tail so the common case is one small read: a tail
+// slice can cut its first line mid-object and the CLI can be mid-append at the
+// end, and both fragments simply fail JSON.parse and are skipped — the same
+// complete-records-only discipline parseLines keeps. The window escalates only
+// when a chunk yields nothing parseable, and stops at BOF, so an unreadable or
+// timestamp-less transcript returns null rather than a guess.
+function lastTimestampIn(text) {
+  const lines = text.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i]) continue;
+    try {
+      const t = Date.parse(JSON.parse(lines[i]).timestamp);
+      if (Number.isFinite(t)) return t;
+    } catch { /* fragment, or a record with no timestamp */ }
+  }
+  return null;
+}
+
+async function lastJsonlTimestamp(fpath) {
+  for (const cap of [64 * 1024, 4 * 1024 * 1024, Infinity]) {
+    let read;
+    try { read = await readTail(fpath, cap); } catch { return null; }
+    const t = lastTimestampIn(read.text);
+    if (t != null || read.atBOF) return t;
+  }
+  return null;
+}
+
 // ==================== claude ====================
 
-const CLAUDE_PROJECTS = () => path.join(os.homedir(), '.claude', 'projects');
+// The transcript tree is mutable global state on a developer machine. Test
+// supervisors point this at their run namespace so transcript fixtures from
+// overlapping runs cannot discover, overwrite, or delete one another.
+export const CLAUDE_PROJECTS = () => process.env.LAB_CLAUDE_PROJECTS_DIR
+  || path.join(os.homedir(), '.claude', 'projects');
+
+// --- session liveness: which processes own a session, right now -------------
+//
+// "Is this session already running somewhere?" is the question that keeps two
+// agents off one transcript, and only the agent itself knows how its answer is
+// provable — so each adapter answers for its own sessions (sessionPids) and the
+// union is sessionPidsAny. Every answer is either PROVEN pids or an admitted
+// `uncertain`; an adapter never guesses, and the caller decides what an
+// unanswerable question means (the dash fails closed and refuses the resume).
+const UNKNOWN = { pids: [], uncertain: true };
+
+const parsePids = (out) => out.split('\n')
+  .map((s) => Number(s.trim()))
+  .filter((p) => Number.isInteger(p) && p > 0);
+
+const mergePids = (...answers) => ({
+  pids: [...new Set(answers.flatMap((a) => a.pids))],
+  uncertain: answers.some((a) => a.uncertain),
+});
+
+// A session id written so a pattern containing it cannot match ITSELF: the
+// first character becomes a one-character class, so `[0]19ff…` matches the real
+// argv `019ff…` while the pattern text does not contain it. Without this a
+// probe finds the OTHER probe — every pgrep carries its pattern in its own
+// command line, so codex's `resume <id>` matched the sibling pgrep running
+// claude's `--resume <id>`, and a session with nothing running read as live
+// whenever the two overlapped. (The `ps | grep [f]oo` idiom, and the reason it
+// exists.)
+const selfExcluding = (sessionId) => `[${sessionId[0]}]${sessionId.slice(1)}`;
+
+// Pids whose full command line matches `pattern` (an extended regex). Excludes
+// bystanders whose argv merely mentions a uuid (activity-monitor hooks, greps)
+// because the patterns carry the flag/verb, not the bare id.
+async function argvPids(pattern) {
+  // '--' ends pgrep's own option parsing — a pattern can start with a dash.
+  const r = await run('pgrep', ['-f', '--', pattern]);
+  // pgrep exits 0 on match, 1 on no-match; anything else means we could not ask.
+  if (r.error || (r.status !== 0 && r.status !== 1)) return UNKNOWN;
+  return { pids: parsePids(r.stdout), uncertain: false };
+}
+
+// The pids holding `file` open FOR WRITING — the kernel's own answer, via lsof
+// (the same instrument the reaper uses to read a process's cwd). Field output
+// is a record stream — `p<pid>` once, then `f<fd>`/`a<mode>` per descriptor —
+// so a pid counts only when one of ITS descriptors carries a write mode (w, or
+// u for read/write). Read-only holders are excluded deliberately: the dash
+// reads transcripts constantly (chat status, turn lists), and a reader caught
+// mid-read is not the thread's writer. lsof reports "nothing holds it" and "I
+// failed" with the same exit 1, so only a failure to run it at all is uncertain.
+async function openWriterPids(file) {
+  const r = await run('lsof', ['-F', 'pfa', '--', file]);
+  if (r.error) return UNKNOWN;
+  const pids = new Set();
+  let pid = null;
+  for (const line of r.stdout.split('\n')) {
+    if (line[0] === 'p') pid = Number(line.slice(1)) || null;
+    else if (line[0] === 'a' && pid && /[wu]/.test(line.slice(1))) pids.add(pid);
+  }
+  return { pids: [...pids], uncertain: false };
+}
+
+// What each pid IS — the basename of the executable it ran, from the kernel's
+// own record (`ps -o comm`), which is the same identity the reaper matches
+// against agentProcNames. Null when the probe could not run at all; a pid the
+// probe simply doesn't name is left out of the map.
+async function execNames(pids) {
+  const r = await run('ps', ['-o', 'pid=', '-o', 'comm=', '-p', pids.join(',')]);
+  if (r.error) return null;
+  const out = new Map();
+  for (const line of (r.stdout || '').split('\n')) {
+    const m = line.match(/^\s*(\d+)\s+(.+?)\s*$/);
+    if (m) out.set(Number(m[1]), path.basename(m[2]));
+  }
+  return out;
+}
 
 const claude = {
   id: 'claude',
   label: 'Claude Code',
+  // basename of the executable, for recognising its processes — see agentProcNames.
+  procName: 'claude',
+  // A CLI the dash can put behind a PTY — so it appears in the new-chat picker,
+  // is probed for availability, and is pgrep-able for liveness.
+  launchable: true,
   // The dash mints the session uuid and hands it to claude via --session-id, so
   // a 'new' chat can be spawned lazily on attach with an id chosen up front.
   dashMintsId: true,
 
+  // The install guidance shown when this CLI isn't on the machine. Guidance
+  // only — the dash never installs anything on someone's computer.
+  install: {
+    name: 'Claude Code',
+    command: 'npm install -g @anthropic-ai/claude-code',
+    url: 'https://docs.claude.com/en/docs/claude-code/setup',
+  },
+
+  // The test stand-in this agent would run instead of the real CLI, or null.
+  // ONE place decides it, so bin() and the "does it take CLI flags?" question
+  // can never disagree about whether we're talking to a stand-in.
+  standInCmd() { return process.env.LAB_TERMINAL_CMD || null; },
+
+  // null when claude isn't installed here. The cmux-bundled copy is a real
+  // second location (not a guess): it's tested with access(X_OK) exactly like
+  // any other path, so it counts only when it genuinely exists.
   bin() {
-    if (process.env.LAB_TERMINAL_CMD) return process.env.LAB_TERMINAL_CMD;
-    return resolveBin('claude', '/Applications/cmux.app/Contents/Resources/bin/claude');
+    const standIn = claude.standInCmd();
+    if (standIn) return resolveBin(standIn);
+    return resolveBin('claude') || resolveBin('/Applications/cmux.app/Contents/Resources/bin/claude');
   },
 
   // Build claude's argv. NEW mints a --session-id; RESUME reopens --resume; both
@@ -104,10 +374,12 @@ const claude = {
     return args;
   },
 
-  // A live claude carries the session uuid in its argv (--session-id / --resume),
-  // so a pgrep on those exact flag+uuid pairs is a deterministic identity check.
-  liveArgvPattern(sessionId) {
-    return `--session-id ${sessionId}|--resume ${sessionId}`;
+  // A live claude carries the session uuid in its argv (--session-id / --resume)
+  // in BOTH spawn modes, so a pgrep on those exact flag+uuid pairs is the whole
+  // answer.
+  sessionPids(sessionId) {
+    const id = selfExcluding(sessionId);
+    return argvPids(`--session-id ${id}|--resume ${id}`);
   },
 
   // ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl — the encode is lossy, so scan
@@ -150,20 +422,46 @@ const claude = {
     });
   },
 
-  // Live context + LOC, published by the Claude Code statusline to
-  // /tmp/claude-ctx-<uuid>.json every render ({ used, added, removed } plus the
-  // live compaction threshold — used% and lines this chat changed, reset on
-  // /clear). We forward the statusline's compactAt/compactExact verbatim (the ring
-  // falls back to ~83.5% if they're absent), so the statusline stays the single
-  // source of truth for claude's real trigger. Missing/partial file → null (the
-  // statusline hasn't run yet, or /tmp was cleared, or this uuid isn't claude's).
-  chatStatus(sessionId) {
-    let j;
-    try { j = JSON.parse(fs.readFileSync(`/tmp/claude-ctx-${sessionId}.json`, 'utf8')); }
-    catch { return null; }
-    if (!j || typeof j.used !== 'number') return null;
-    const s = { used: j.used, added: j.added | 0, removed: j.removed | 0 };
-    if (typeof j.compactAt === 'number') { s.compactAt = j.compactAt; s.compactExact = !!j.compactExact; }
+  readTurns(sessionId, after = 0) { return fileBackedTurns(claude, sessionId, after); },
+
+  // When this chat's conversation last moved — the last stamped record in its
+  // jsonl, never the file's mtime. See lastJsonlTimestamp.
+  lastMessageAt(transcriptPath) { return lastJsonlTimestamp(transcriptPath); },
+
+  // Live context + LOC. Context fill is published by the Claude Code statusline
+  // to /tmp/claude-ctx-<uuid>.json every render; we forward its
+  // compactAt/compactExact verbatim (the ring falls back to ~83.5% if they're
+  // absent), so the statusline stays the single source of truth for claude's
+  // real compaction trigger. Missing/partial file → null (the statusline hasn't
+  // run yet, or /tmp was cleared, or this uuid isn't claude's).
+  //
+  // LOC comes from git, NOT from the statusline, and it means what the code pane
+  // beside it means: the lines this BRANCH changed. The statusline could only
+  // report what the current claude PROCESS had edited, which is a different
+  // question and a fragile one — the counter restarts with the process while the
+  // baseline subtracted from it persisted on disk, so a reattached chat reported
+  // 0 lines against a branch full of work, or went negative once the baseline
+  // outlived the count it was baselining. Same derivation as codex now, so both
+  // agents' badges answer one question.
+  // Owning a transcript is what makes a session claude's — not owning a file in
+  // /tmp. Keying on the transcript is what lets the LOC badge appear for a chat
+  // whose statusline never ran, which is the whole point of taking the number
+  // from git: it describes the branch, so it should not need the agent's process
+  // to have published anything.
+  async chatStatus(sessionId) {
+    const transcript = await claude.findTranscript(sessionId);
+    if (!transcript) return null;
+    let added = 0;
+    let removed = 0;
+    const cwd = await claude.transcriptCwd(transcript);
+    if (cwd) {
+      try { ({ added, removed } = await repositoryLoc(cwd)); } catch { /* cwd not a git worktree */ }
+    }
+    let j = null;
+    const contextDir = process.env.LAB_CLAUDE_CONTEXT_DIR || '/tmp';
+    try { j = JSON.parse(fs.readFileSync(path.join(contextDir, `claude-ctx-${sessionId}.json`), 'utf8')); } catch { /* no fill published */ }
+    const s = { used: typeof j?.used === 'number' ? j.used : null, added, removed };
+    if (typeof j?.compactAt === 'number') { s.compactAt = j.compactAt; s.compactExact = !!j.compactExact; }
     return s;
   },
 };
@@ -172,7 +470,10 @@ const claude = {
 
 // LAB_CODEX_SESSIONS_DIR overrides the rollout store (same test-seam pattern as
 // LAB_CHAT_REGISTRY_DIR) so id-discovery/transcript tests never touch the real one.
-const CODEX_SESSIONS = () => process.env.LAB_CODEX_SESSIONS_DIR || path.join(os.homedir(), '.codex', 'sessions');
+// Exported because a harness that SEEDS a codex chat must write into the very
+// tree this server reads — it asks via /api/dash/store rather than guessing a
+// path, the same way it asks which issues table the server serves.
+export const CODEX_SESSIONS = () => process.env.LAB_CODEX_SESSIONS_DIR || path.join(os.homedir(), '.codex', 'sessions');
 const ROLLOUT_RE = (id) => new RegExp(`^rollout-.*-${id}\\.jsonl$`, 'i');
 
 // Walk ~/.codex/sessions/YYYY/MM/DD, newest day first, yielding rollout files.
@@ -227,19 +528,6 @@ function codexPercentRemaining(totalTokens, window) {
   const used = Math.max(0, totalTokens - CODEX_BASELINE_TOKENS);
   const remaining = Math.max(0, effective - used);
   return Math.round(Math.min(100, Math.max(0, (remaining / effective) * 100)));
-}
-
-// Read the last `maxBytes` of a file (whole file if smaller). `atBOF` marks that
-// the read reached byte 0, so a caller widening the window knows when to stop.
-async function readTail(fpath, maxBytes) {
-  const fd = await fs.promises.open(fpath, 'r');
-  try {
-    const { size } = await fd.stat();
-    const start = Math.max(0, size - maxBytes);
-    const buf = Buffer.alloc(size - start);
-    if (buf.length) await fd.read(buf, 0, buf.length, start);
-    return { text: buf.toString('utf8'), atBOF: start === 0 };
-  } finally { await fd.close(); }
 }
 
 // The most-recent COMPLETE token_count event in a chunk of rollout text. Jump
@@ -304,17 +592,28 @@ async function codexHeadCwd(fpath) {
 const codex = {
   id: 'codex',
   label: 'Codex',
+  launchable: true,
+  // basename of the executable, for recognising its processes — see agentProcNames.
+  procName: 'codex',
   // Codex mints its OWN session id (no flag to pre-specify one), so the dash
   // spawns first and discovers the id from the fresh rollout — see the eager
   // spawn in the /chat POST and discoverSessionId below.
   dashMintsId: false,
 
+  install: {
+    name: 'Codex',
+    command: 'npm install -g @openai/codex',
+    url: 'https://github.com/openai/codex',
+  },
+
+  // LAB_CODEX_CMD is the codex-specific stand-in; LAB_TERMINAL_CMD is the
+  // generic one the whole test suite sets (so a codex chat spawned under test
+  // also gets the harmless echo process, not real codex).
+  standInCmd() { return process.env.LAB_CODEX_CMD || process.env.LAB_TERMINAL_CMD || null; },
+
   bin() {
-    // LAB_CODEX_CMD is the codex-specific stand-in; LAB_TERMINAL_CMD is the
-    // generic one the whole test suite sets (so a codex chat spawned under test
-    // also gets the harmless echo process, not real codex).
-    if (process.env.LAB_CODEX_CMD) return process.env.LAB_CODEX_CMD;
-    if (process.env.LAB_TERMINAL_CMD) return process.env.LAB_TERMINAL_CMD;
+    const standIn = codex.standInCmd();
+    if (standIn) return resolveBin(standIn);
     return resolveBin('codex');
   },
 
@@ -323,20 +622,53 @@ const codex = {
   // chat runs inside an isolated worktree) and carry an initial prompt as a
   // positional arg when given — `codex … "<prompt>"` / `codex resume <id>
   // "<prompt>"` stay interactive AND submit that first turn.
+  //
+  // Hook trust is bypassed for the same reason approvals are. Codex blocks
+  // startup on a modal ("N hooks are new or changed") whenever the repo's
+  // .codex/hooks.json hasn't been trusted from THIS directory — and every
+  // worktree is a new directory, so every dash-spawned codex hit it. Nothing
+  // answers a modal behind a PTY: codex never mints an id, never writes a
+  // rollout, and discoverSessionId times out into "could not determine codex
+  // session id". The dash spawns codex on hooks it owns, in a worktree of this
+  // repo, which is exactly the vetted-source automation the flag is for.
   buildArgs({ mode, sessionId, initialPrompt, model }) {
     const args = mode === 'resume'
-      ? ['resume', sessionId, '--dangerously-bypass-approvals-and-sandbox']
-      : ['--dangerously-bypass-approvals-and-sandbox'];
+      ? ['resume', sessionId, '--dangerously-bypass-approvals-and-sandbox', '--dangerously-bypass-hook-trust']
+      : ['--dangerously-bypass-approvals-and-sandbox', '--dangerously-bypass-hook-trust'];
     if (model) args.push('-m', model);
     if (initialPrompt) args.push(initialPrompt);
     return args;
   },
 
-  // A resumed codex carries `resume <id>` in its argv. A brand-new codex has NO
-  // id in its argv (it hasn't minted one yet), so this only matches resumes —
-  // which is exactly the double-resume case the liveness gate must catch.
-  liveArgvPattern(sessionId) {
-    return `resume ${sessionId}`;
+  // Codex is the case argv ALONE cannot answer. A resumed codex carries
+  // `resume <id>`, but a chat the dash started fresh carries no id at all (it
+  // hadn't minted one yet) — so an argv-only check is blind to most of the codex
+  // processes the dash itself spawns, and card-open cold-resumes over a stranded
+  // one straight into codex's `already has an active writer` refusal
+  // (i-codex-resume-collision). The refusal names the answer: a thread has ONE
+  // writer, and a live codex holds its thread's rollout open for writing for
+  // the whole session — verified against the journal's stamped pids, both spawn
+  // modes, days apart. So ask the kernel who holds it; that is an OS fact about
+  // the exact file, not an inference from a name or a command line.
+  async sessionPids(sessionId) {
+    const argv = await argvPids(`resume ${selfExcluding(sessionId)}`);
+    const rollout = await codex.findTranscript(sessionId);
+    if (!rollout) return argv;
+    const held = await openWriterPids(rollout);
+    if (!held.pids.length) return mergePids(argv, held);
+    // Holding the file open makes you A writer; being CODEX makes you the
+    // thread's writer. Anything else with a rollout open for append — an
+    // editor, a sync tool, a test stand-in — is a bystander, and callers act on
+    // this answer by ending processes, so "it had my file open" is not enough.
+    // Unnameable pids keep the session marked held AND uncertain: refuse the
+    // resume, refuse the kill.
+    const names = await execNames(held.pids);
+    if (!names) return mergePids(argv, { pids: held.pids, uncertain: true });
+    const named = held.pids.filter((pid) => names.has(pid));
+    return mergePids(argv, {
+      pids: named.filter((pid) => names.get(pid) === codex.procName),
+      uncertain: held.uncertain || named.length !== held.pids.length,
+    });
   },
 
   // Codex stores rollouts at ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl.
@@ -376,6 +708,14 @@ const codex = {
       return null;
     });
   },
+
+  readTurns(sessionId, after = 0) { return fileBackedTurns(codex, sessionId, after); },
+
+  // Identical to claude's: a rollout stamps every record with the same top-level
+  // ISO `timestamp`, so one reader dates both agents. This is what lets the
+  // reaper hold codex to exactly the claude rule instead of keeping it forever
+  // for want of a clock.
+  lastMessageAt(transcriptPath) { return lastJsonlTimestamp(transcriptPath); },
 
   // Discover the id codex minted for a session it just started in `cwd`. Codex
   // writes the rollout (with session_meta.cwd) at session start, so the newest
@@ -446,19 +786,165 @@ const codex = {
   },
 };
 
+// ==================== cursor ====================
+
+// Cursor is an editor, not a CLI: there is no binary the dash can put behind a
+// PTY, no session id to mint, no argv to pgrep. So this adapter implements
+// exactly the READ half of the contract — turns, cwd, discovery — and the
+// `launchable: false` flag keeps it out of every path that would try to run it.
+//
+// It is also the only agent whose chats are DISCOVERED. claude and codex chats
+// are linked explicitly (the dash created them, so it recorded them); Cursor
+// records nothing about issues, so a Cursor chat's environment is derived from
+// the folder it ran in — an exact structural fact from its workspace record, not
+// a guess. See cursor-db.mjs for the store's shape and why reading it is a
+// deliberately-accepted dependency on an internal format.
+const cursor = {
+  id: 'cursor',
+  label: 'Cursor',
+  launchable: false,
+  dashMintsId: false,
+
+  // No install guidance: the dash cannot make a Cursor chat, so "not installed"
+  // is never a state anyone needs to act on. A machine without Cursor simply
+  // contributes no Cursor chats.
+  install: null,
+
+  standInCmd() { return null; },
+  bin() { return null; },
+
+  // Every Cursor chat lives in ONE shared database, so a "transcript path" is
+  // the same file for all of them. Returned so resolveChat and the liveness
+  // gates get a truthful answer to "does this chat exist here?", and null when
+  // the conversation isn't in this machine's store.
+  async findTranscript(sessionId) {
+    if (!isComposerId(sessionId)) return null;
+    return (await composerHead(sessionId)) ? cursorDbPath() : null;
+  },
+
+  // The folder the chat ran in — from its workspace record, not from the
+  // database path (which is shared). Takes a sessionId rather than the path for
+  // that reason: the path identifies the store, the id identifies the chat.
+  async transcriptCwd(_transcriptPath, sessionId) {
+    if (!isComposerId(sessionId)) return null;
+    const all = await listComposers();
+    return all.find(c => c.composerId === sessionId)?.dir || null;
+  },
+
+  // Spoken turns: a bubble's `type` is 1 for the person and 2 for the agent, and
+  // its `text` is what was said. Bubbles with empty text are the agent's tool
+  // steps — skipped, exactly as claude's tool-call lines are.
+  async readTurns(sessionId, after = 0) {
+    const head = await composerHead(sessionId);
+    if (!head) return null;
+    const bubbles = await composerBubbles(sessionId);
+    const messages = [];
+    head.bubbleIds.forEach((id, i) => {
+      if (i < after) return;
+      const b = bubbles.get(id);
+      const text = b && typeof b.text === 'string' ? b.text : '';
+      if (!text.trim()) return;
+      const role = b.type === 1 ? 'user' : b.type === 2 ? 'assistant' : null;
+      if (!role) return;
+      messages.push({ i, role, text, timestamp: b.createdAt ? new Date(b.createdAt).toISOString() : null });
+    });
+    return { messages, cursor: head.bubbleIds.length };
+  },
+
+  // Every Cursor chat on this machine, as [{ sessionId, dir, title, updatedAt }].
+  // The dash maps `dir` onto an environment (a worktree is an issue, the repo
+  // root is main) — which is the whole reason a teammate working in Cursor shows
+  // up on the board at all.
+  //
+  // `updatedAt` is the mirror's "has this moved?" stamp, and every entry gets
+  // one: a conversation Cursor left unstamped falls back to the store's own
+  // mtime, which is truthful (something in Cursor changed) and merely
+  // conservative — it re-reads a few unchanged chats rather than missing a
+  // changed one. One stat for the whole list, not one per chat.
+  async discoverChats() {
+    if (!cursorPresent()) return [];
+    let storeMtime = 0;
+    try { storeMtime = fs.statSync(cursorDbPath()).mtimeMs; } catch {}
+    return (await listComposers()).map(c => ({
+      sessionId: c.composerId, dir: c.dir, title: c.title, updatedAt: c.updatedAt || storeMtime,
+    }));
+  },
+
+  // When one chat last changed, epoch ms — the same fact as discoverChats'
+  // stamp, for a caller holding a single id.
+  changedAt(sessionId) { return composerUpdatedAt(sessionId); },
+
+  // The same question the file-backed agents answer by tailing their jsonl.
+  // Cursor's store is a shared database, so the ID is what identifies the
+  // conversation and the path says nothing — hence the second argument.
+  lastMessageAt(_transcriptPath, sessionId) { return composerUpdatedAt(sessionId); },
+
+  // No context ring: Cursor publishes no token accounting the dash can read.
+  async chatStatus() { return null; },
+};
+
 // ==================== registry + handle codec ====================
 
-const AGENTS = { claude, codex };
+const AGENTS = { claude, codex, cursor };
 export const DEFAULT_AGENT = 'claude';
+
+// The agents the dash can actually START. Every spawn/resume/probe/liveness path
+// reads this list rather than the full registry, so a read-only agent can never
+// leak into a launch surface.
+const LAUNCHABLE = () => Object.values(AGENTS).filter(a => a.launchable);
 
 // The agent adapter for an id, or the claude default for an unknown/blank one.
 export function agentById(id) {
   return AGENTS[id] || AGENTS[DEFAULT_AGENT];
 }
 
-// Public list for the UI's picker: [{ id, label }, …].
+// Public list for the UI's picker: [{ id, label }, …]. LAUNCHABLE agents only —
+// the picker's job is "start a chat with…", and Cursor cannot be started.
 export function agentChoices() {
-  return Object.values(AGENTS).map(a => ({ id: a.id, label: a.label }));
+  return LAUNCHABLE().map(a => ({ id: a.id, label: a.label }));
+}
+
+// The basename of each launchable agent's EXECUTABLE — how you recognise one of
+// its processes in `ps` without knowing any session id. `sessionPids` above
+// answers "is THIS session live"; this answers the prior question, "is that a
+// chat at all", which the reaper needs to sweep the machine (idle-reaper's
+// parseAgentLine). Basename, because bin() resolves an absolute path — from PATH
+// or an app bundle — so the argv never carries the bare name. Launchable only:
+// a read-only agent (Cursor) has no process of its own to find.
+export function agentProcNames() {
+  return LAUNCHABLE().map(a => a.procName).filter(Boolean);
+}
+
+// Thrown when a chat can't start because its CLI isn't installed here. A TYPE,
+// not a message to pattern-match: the attach boundary tests `instanceof` and
+// turns it into install guidance, so the person never sees a raw
+// `spawn claude ENOENT`. Carries the agent id so the UI can name the right one.
+export class AgentMissingError extends Error {
+  constructor(agentId) {
+    const a = agentById(agentId);
+    super(`${a.label} is not installed on this computer`);
+    this.name = 'AgentMissingError';
+    this.agent = a.id;
+    this.install = a.install;
+  }
+}
+
+// Which agents this computer can actually run, with the install guidance for the
+// ones it can't: [{ id, label, available, bin, install:{ name, command, url } }].
+// The picker reads this so an uninstalled CLI is visibly unavailable BEFORE the
+// person clicks, instead of failing at spawn — and the chat pane reads it to
+// explain a failed attach. `available` is the binary resolving, nothing softer.
+export function agentAvailability() {
+  return LAUNCHABLE().map((a) => {
+    const bin = a.bin();
+    return { id: a.id, label: a.label, available: !!bin, bin: bin || null, install: a.install };
+  });
+}
+
+// Can the dash START a chat of this agent? The one question every spawn/resume
+// path asks before it does anything process-shaped.
+export function isLaunchable(agentId) {
+  return !!agentById(agentId).launchable;
 }
 
 // Roles a chat can carry BEYOND its agent. A `reviewer` is a chat spawned to
@@ -504,16 +990,50 @@ export function formatHandle(agent, sessionId, role = null) {
   return parts.join(':');
 }
 
-// Read paths (readTranscript, resolveChat, liveness) are reached by bare uuid
+// Read paths (readTurnsAny, resolveChat, liveness) are reached by bare uuid
 // with no agent in hand — a given uuid belongs to exactly ONE agent's on-disk
 // store, so trying each finder in turn is deterministic, not a guess. Returns
-// { agent, transcriptPath } or null.
+// { agent, transcriptPath, launchable } or null.
 export async function findTranscriptAny(sessionId) {
   for (const a of Object.values(AGENTS)) {
     const p = await a.findTranscript(sessionId);
-    if (p) return { agent: a.id, transcriptPath: p };
+    if (p) return { agent: a.id, transcriptPath: p, launchable: !!a.launchable };
   }
   return null;
+}
+
+// The cwd a chat ran in, by bare uuid. Same dispatch as findTranscriptAny; the
+// sessionId rides along because a database-backed agent's chats all share one
+// store path and only the id distinguishes them.
+export async function transcriptCwdAny(sessionId) {
+  const found = await findTranscriptAny(sessionId);
+  if (!found) return null;
+  return agentById(found.agent).transcriptCwd(found.transcriptPath, sessionId);
+}
+
+// A chat's spoken turns, by bare uuid — the one read every consumer (the HTTP
+// transcript endpoint, agent-to-agent dialog, the mirror) goes through. Returns
+// { agent, messages, cursor } or null when no agent on this machine has the chat.
+export async function readTurnsAny(sessionId, after = 0) {
+  for (const a of Object.values(AGENTS)) {
+    const t = await a.readTurns(sessionId, after);
+    if (t) return { agent: a.id, ...t };
+  }
+  return null;
+}
+
+// Chats an agent can find on disk that NOTHING linked — [{ agent, sessionId,
+// dir, title, updatedAt }]. Only Cursor has any (it records no issue, so its
+// chats reach the board through their folder alone); claude and codex chats are
+// always explicitly linked, and inferring membership for them is exactly the
+// guess main-chats-store refuses to make.
+export async function discoverChatsAny() {
+  const out = [];
+  for (const a of Object.values(AGENTS)) {
+    if (!a.discoverChats) continue;
+    for (const c of await a.discoverChats()) out.push({ agent: a.id, ...c });
+  }
+  return out;
 }
 
 // Live context + LOC for a chat, dispatched by BARE uuid exactly like
@@ -529,8 +1049,34 @@ export async function chatStatusAny(sessionId) {
   return null;
 }
 
-// The pgrep alternation that matches a live process of ANY agent for this
-// session — the union of every adapter's argv pattern.
-export function liveArgvPatternAny(sessionId) {
-  return Object.values(AGENTS).map(a => a.liveArgvPattern(sessionId)).join('|');
+// WHEN a chat last did anything, with the evidence for it:
+//   { transcript, lastMessageMs, fileMs }
+// or null when this agent has no such chat on this machine. `lastMessageMs` is
+// the conversation's own clock (the last stamped record); `fileMs` is the
+// transcript's mtime, carried alongside NOT because anything decides on it but
+// because the gap between the two is the bug — the reaper prints both so a
+// transcript being rewritten without gaining a line is visible rather than
+// silently resetting the fleet's idle clock.
+//
+// Dispatched by the agent id the caller already holds, rather than by trying
+// every store like findTranscriptAny: the reaper knows which CLI a process is
+// (it matched its executable), so guessing would only add work and ambiguity.
+export async function chatActivity(agentId, sessionId) {
+  if (!sessionId) return null;
+  const a = agentById(agentId);
+  if (!a.lastMessageAt) return null;
+  const transcript = await a.findTranscript(sessionId);
+  if (!transcript) return null;
+  let fileMs = null;
+  try { fileMs = (await fs.promises.stat(transcript)).mtimeMs; } catch { /* raced a delete */ }
+  return { transcript, lastMessageMs: await a.lastMessageAt(transcript, sessionId), fileMs };
+}
+
+// Every process that provably owns this session, whichever agent it belongs to
+// — each adapter answering however IT can prove it (see sessionPids above).
+// `uncertain` means a probe could not run at all; callers fail closed on it.
+// Restricted to LAUNCHABLE agents deliberately: a read-only agent (a Cursor
+// conversation) has no process of its own to find.
+export async function sessionPidsAny(sessionId) {
+  return mergePids(...await Promise.all(LAUNCHABLE().map(a => a.sessionPids(sessionId))));
 }

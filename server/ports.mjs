@@ -19,11 +19,12 @@ import net from 'node:net';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { get, update, reservedPorts } from './issues-store.mjs';
+import { DEV_PORT_MIN, DEV_PORT_MAX } from './supervisor-contract.mjs';
 
 const pExecFile = promisify(execFile);
 
-const PORT_MIN = 5200;
-const PORT_MAX = 5299;
+const PORT_MIN = DEV_PORT_MIN;
+const PORT_MAX = DEV_PORT_MAX;
 
 // Can we bind the port on one loopback host right now? Host matters: vite dev
 // servers land on ::1 on macOS, and a 127.0.0.1 probe does not collide with a

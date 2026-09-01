@@ -3,34 +3,55 @@ import './terminal-token.js';
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import {
-  HashRouter, Routes, Route, NavLink, Link, useLocation,
+  BrowserRouter, Routes, Route, NavLink, Link, Navigate, useLocation,
 } from 'react-router-dom';
+import { Metrics } from './views/Metrics.jsx';
 import { ChangesBoard } from './views/ChangesBoard.jsx';
 import { ChangeDetail } from './views/ChangeDetail.jsx';
-import { IssueTerminal, MainTerminal } from './views/Terminal.jsx';
+import { TestsList } from './views/TestsList.jsx';
+import { TestDetail } from './views/TestDetail.jsx';
+import { Recordings } from './views/Recordings.jsx';
+import { RecordingDetail } from './views/RecordingDetail.jsx';
+import { ChatEnvironment } from './views/Terminal.jsx';
 import { SignIn } from './views/SignIn.jsx';
-import { SelectionProvider } from './selection.jsx';
+import { SelectionProvider, useIssueNav, isBoardRoute } from './selection.jsx';
 import { ChatControlContext } from './chat-control.jsx';
 import { WorkspacePanel } from './WorkspacePanel.jsx';
 import { CommandPalette } from './CommandPalette.jsx';
 import { ShortcutsOverlay } from './ShortcutsOverlay.jsx';
-import { hk, hkCaps } from './hotkey-registry.js';
+import { hk, hkCaps, hkTitle } from './hotkey-registry.js';
+import { copyText, copyFailureHint } from './clipboard.js';
+import { DockPanel } from './dock.jsx';
+import { useControlPlane, staleNotice } from './control-plane.js';
 import {
-  DockPanel, startDockResize, loadW,
+  startDockResize, loadW,
   CHAT_DEFAULT_W, APP_DEFAULT_W, DOCK_MIN_W, MAIN_MIN_W, LEFT_W,
-} from './dock.jsx';
+} from './dock-geometry.js';
 import { useLocalBackend } from './capabilities.js';
-import { appPortForEnv } from './app-env.js';
-import { ArrowUpRight, WorkspacePanelIcon, Search, Keyboard } from './icons.jsx';
-import { useFetch, useAsync } from './api.js';
-import { stateCounts, listChanges } from './board-store.js';
+import { useHotkey } from './hotkeys.js';
+import { ArrowUpRight, WorkspacePanelIcon, ChevronUp, ChevronDown, Search, Keyboard, NAV_ICON, NAV_CARET } from './icons.jsx';
+import { useFetch, useIssues } from './api.js';
+import { DiscardChanges } from './DiscardChanges.jsx';
+import { listChanges, updateChangeFields } from './board-store.js';
+import { emitIssuesChange } from './realtime.js';
+import { normalizeAppPath, appLinkList, isBaseAppPath } from './app-env.mjs';
+import { loadMainPath, saveMainPath, loadMainLinks, saveMainLinks } from './app-links.js';
+import { DASH_BASENAME } from './routes.mjs';
 import { onAuth, ensureFreshToken, ensureDevSession, signOut } from './auth.js';
 import {
   Avatar, PersonLabel, useMyProfile, useDismiss, displayName,
   saveDisplayName, saveAvatar, clearAvatar, AVATAR_TYPES,
 } from './profiles.jsx';
 import { getTheme, getMode, setMode, onThemeChange } from './theme.js';
-import { useHotkey } from './hotkeys.js';
+import {
+  shellLabel, shellDetail, skewNotice, useShellSkew, useNewerDeploy,
+} from './shell-build.js';
+import { installGuestNav } from './embed.js';
+
+// A dash embedded in the App pane (issue app_path = /dash/) honors the host's
+// refresh and back/forward: acting in-place keeps the current route; a src
+// remount would reset it.
+installGuestNav();
 
 // Sun / moon glyphs for the theme toggle, matched to the nav icon weight.
 function SunIcon() {
@@ -49,8 +70,8 @@ function MoonIcon() {
   );
 }
 
-// Theme picker — an icon whose dropdown offers the three modes; 'auto' (the
-// default) follows the OS.
+// Theme picker — an icon in the sidebar's brand row whose dropdown offers the
+// three modes; 'auto' (the default) follows the OS.
 const THEME_MODES = [
   { mode: 'light', label: 'light' },
   { mode: 'dark', label: 'dark' },
@@ -169,14 +190,20 @@ function ProfileCard() {
 }
 
 function Sidebar({ onCollapse }) {
-  // `state` is local-only (branch) — null remotely. The Issues count comes from
-  // Supabase directly so it's correct everywhere.
-  const { data: state } = useFetch('/api/dash/state');
-  const { data: counts } = useAsync('state-counts', stateCounts, { pollMs: 60000 });
+  // `state` is local-only (branch, in-flight, corpus counts) — null remotely.
+  // The Issues count comes from Supabase directly so it's correct everywhere.
+  // Fetched ONCE on load (pollMs:0), not on a timer: these git-derived counts
+  // change rarely, and a recurring poll would spawn git every 15s for a header
+  // stat. It refreshes on navigation (a fresh mount refetches).
+  const { data: state } = useFetch('/api/dash/state', { pollMs: 0 });
+  // Issues count derives from the same 'changes' cache the board paints — one
+  // truth, so the badge moves in the same breath as any write-through edit.
+  const { data: allChanges } = useIssues('changes', listChanges, { pollMs: 0 });
   return (
     <aside className="sidebar">
       <div className="brand">
         <h1>Dash</h1>
+        <ThemeMenu />
         <button className="topbar-btn sidebar-collapse" title="Close sidebar"
           aria-label="Close sidebar" onClick={onCollapse}>
           <PanelIcon />
@@ -187,34 +214,101 @@ function Sidebar({ onCollapse }) {
       </div>
 
       <nav>
-        <NavLink to="/" end>
-          <span>Board</span>
-          <span className="ct">{counts?.change_count ?? state?.change_count ?? ''}</span>
+        <NavLink to="/metrics">
+          <span>Metrics</span>
+          <span className="ct">{state?.in_flight_count ?? ''}</span>
+        </NavLink>
+        <NavLink to="/issues">
+          <span>Issues</span>
+          <span className="ct">{allChanges?.length ?? state?.change_count ?? ''}</span>
+        </NavLink>
+        {/* No count: recordings are a bucket listing, and a badge here would
+            mean a storage read on every page of the Dash to say a number
+            nobody acts on. */}
+        <NavLink to="/recordings">
+          <span>Recordings</span>
+          <span className="ct" />
+        </NavLink>
+        <NavLink to="/tests">
+          <span>Tests</span>
+          <span className="ct">{state?.corpus_count ?? ''}</span>
         </NavLink>
       </nav>
 
       <div className="sidebar-footer">
         <a className="ext-link" href="/"><ArrowUpRight size={14} /><span>open canvas</span></a>
-        <ThemeMenu />
         <ProfileCard />
+        <ShellBadge />
       </div>
     </aside>
   );
 }
 
-// Derive breadcrumb segments from the current hash route. Each segment is a
+// WHICH BUILD IS THIS. On a box the shell is a deployed release
+// (dash/server/shell-release.mjs), so the page in front of you is whatever was
+// last deployed — not whatever main is at this second. A worktree preview is a
+// dev shell from that checkout. One muted line in the footer answers which one
+// is on screen without opening devtools.
+function ShellBadge() {
+  return <div className="shell-badge" title={shellDetail()}>{shellLabel()}</div>;
+}
+
+// ONE strip for the one condition a page can never work out from its own
+// contents: the control plane behind it and this bundle do not match. It is a
+// fact about the MACHINE, not about whatever route you are on, so it sits above
+// the app chrome — and there is one of it, because two stacked warnings saying
+// "the dash and its server disagree" would be the disagreement.
+//
+// Two independent ways to learn it, and neither subsumes the other:
+//
+//   DECLARED — the bundle and the supervisor announce different /api/dash
+//   protocols (shell-build.js). Sharp, but it only fires when somebody bumped
+//   the constant.
+//
+//   OBSERVED — a route this board needs 404s on a supervisor that is otherwise
+//   up (control-plane.js), which is proof rather than a declaration and is what
+//   actually caught needs-input dots vanishing for a day.
+//
+// Declared first when both hold: a protocol disagreement is the larger fact,
+// and its remedy comes first anyway.
+function ControlPlaneBanner() {
+  const skew = useShellSkew();
+  const stale = staleNotice(useControlPlane());
+  const notice = skewNotice(skew) || stale;
+  if (!notice) return null;
+  return (
+    <div className="skew-banner" role="status">
+      <strong>{notice.headline}</strong>
+      <span>{` ${notice.detail} ${notice.remedyLead} `}<code>{notice.remedy}</code></span>
+    </div>
+  );
+}
+
+// Derive breadcrumb segments from the current route. Each segment is a
 // { label, to? } — the last has no link (it's the current page). This is the
 // single source of truth for crumbs across all routes (lifted out of views).
+// `pathname` is basename-relative (BrowserRouter strips /dash), so parts read
+// the same "/issues"-relative segments the routes are declared with.
 function useCrumbs() {
   const { pathname } = useLocation();
-  const parts = pathname.split('/').filter(Boolean); // e.g. ['changes', 'abc1']
-  if (parts.length === 0) return [{ label: 'board' }];
-  const SECTION = { changes: 'board' };
+  const parts = pathname.split('/').filter(Boolean); // e.g. ['issues', 'abc1']
+  // Bare /dash/ redirects to the board, so an empty path is just the transient
+  // pre-Navigate frame — label it for the destination (issues), never a stale
+  // "dashboard".
+  if (parts.length === 0) return [{ label: 'issues' }];
+  const SECTION = { issues: 'issues', tests: 'tests', recordings: 'recordings' };
   const crumbs = [];
   const section = SECTION[parts[0]];
   if (section) {
-    crumbs.push({ label: section, to: '/' });
-    if (parts[1]) crumbs.push({ id: decodeURIComponent(parts[1]), copy: true, section: parts[0] });
+    // On an issue detail, the parent "issues" crumb is the pointer twin of ⌘←
+    // (back to the list) — carry the hint so its hover names the chord.
+    const parentHint = parts[1] && parts[0] === 'issues' ? 'detailBack' : undefined;
+    crumbs.push({ label: section, to: `/${parts[0]}`, hint: parentHint });
+    // The id is EVERYTHING after the section, not the next segment: a recording
+    // in the tests namespace is `tests/agent-foo`, one id with a slash in it,
+    // and a crumb reading "tests" would name something that doesn't exist.
+    const id = parts.slice(1).map(decodeURIComponent).join('/');
+    if (id) crumbs.push({ id, copy: true, section: parts[0] });
   } else {
     crumbs.push({ label: decodeURIComponent(parts[0]) });
   }
@@ -224,9 +318,34 @@ function useCrumbs() {
 // Chat / terminal glyph for the right-sidebar toggle.
 function ChatIcon() {
   return (
-    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <svg width={NAV_ICON} height={NAV_ICON} viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <rect x="1.5" y="2.5" width="13" height="9" rx="2" stroke="currentColor" strokeWidth="1.3" />
       <path d="M4 5.5l2 1.6L4 8.7M7.5 9h4.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+// Two-arrow circle — the "sync" glyph (lucide refresh-cw), for the board's
+// git-sync button. Spins via CSS while a sync is in flight.
+function SyncIcon() {
+  return (
+    <svg width={NAV_ICON} height={NAV_ICON} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M21 2v6h-6M3 12a9 9 0 0 1 15-6.7L21 8M3 22v-6h6M21 12a9 9 0 0 1-15 6.7L3 16" />
+    </svg>
+  );
+}
+
+// Single circular arrow — the browser's "reload this page" mark, for the newer-
+// deploy button. Deliberately NOT SyncIcon: that one sits immediately to its
+// right, and two identical two-arrow circles side by side would read as one
+// control rendered twice. Reloading a page and reconciling a branch with its
+// remote are different acts and get different glyphs.
+function ReloadIcon() {
+  return (
+    <svg width={NAV_ICON} height={NAV_ICON} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" />
     </svg>
   );
 }
@@ -235,7 +354,7 @@ function ChatIcon() {
 // column, mirroring ChatIcon's weight so the two navbar toggles read as a pair.
 function PanelIcon() {
   return (
-    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <svg width={NAV_ICON} height={NAV_ICON} viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <rect x="1.5" y="2.5" width="13" height="11" rx="2" stroke="currentColor" strokeWidth="1.3" />
       <rect x="1.5" y="2.5" width="4.5" height="11" rx="2" fill="currentColor" opacity="0.55" />
     </svg>
@@ -244,50 +363,251 @@ function PanelIcon() {
 
 // The leaf crumb on a detail route SHOWS the issue title but COPIES the id — the
 // title reads better in the bar, the id is what you paste. Falls back to the id
-// as the label until the issue list resolves. Long titles ellipse at a max width
-// (CSS). Flashes "copied" for ~1s; clipboard blocked → silent no-op.
+// as the label until the issue list resolves (or on tests routes,
+// which have no title here). Long titles ellipse at a max width (CSS).
+//
+// "copied ✓" means the id is ON THE CLIPBOARD. It used to mean the click
+// happened — a blocked clipboard was a silent no-op followed by the same cheery
+// flash, which on the box meant pasting the PREVIOUS id into a commit message
+// (issue i-tailnet-secure-context). This crumb is the one copy control whose
+// value is not already on screen — it shows the title — so a failure here also
+// reveals the id and selects it, which is the manual copy this button was
+// standing in for.
 function CrumbCopy({ id, section }) {
-  const [copied, setCopied] = React.useState(false);
+  const [state, setState] = React.useState('idle');   // idle | copied | failed
   const timer = React.useRef(null);
-  const { data } = useAsync('changes', listChanges, { pollMs: 0 });
-  const title = section === 'changes' ? (data?.find(i => i.id === id)?.title || null) : null;
-  const label = title || id;
+  const btn = React.useRef(null);
+  const { data } = useIssues('changes', listChanges, { pollMs: 0 });
+  const title = section === 'issues' ? (data?.find(i => i.id === id)?.title || null) : null;
+  const copied = state === 'copied';
+  const failed = state === 'failed';
+  const label = failed ? id : (title || id);
   const onCopy = async () => {
-    try { await navigator.clipboard.writeText(id); } catch { /* blocked */ }
-    setCopied(true);
+    const ok = await copyText(id);
+    setState(ok ? 'copied' : 'failed');
     clearTimeout(timer.current);
-    timer.current = setTimeout(() => setCopied(false), 1000);
+    timer.current = setTimeout(() => setState('idle'), ok ? 1000 : 6000);
+    // Put the id under a selection so ⌘C finishes the job by hand. After the
+    // re-render, or the node still holds the title.
+    if (!ok) requestAnimationFrame(() => {
+      const node = btn.current;
+      if (!node || typeof window.getSelection !== 'function') return;
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    });
   };
   // ⌘S copies the open id — same action + "copied ✓" flash as clicking the crumb.
   // CrumbCopy only mounts on a detail route, so this never fires on the board
   // (where ⌘S copies the selected card). terminal:'handle' so it works over chat.
   useHotkey(hk('detailCopyId'), () => { onCopy(); }, { terminal: 'handle', repeat: false });
+  // The tooltip names the chord AND that the same chord copies the selected
+  // card's id on the board — so the board-scoped twin (overlay-only) is findable
+  // from the one control it mirrors.
+  const copyHint = `${label} — click to copy id (${id}) · ${hkCaps('detailCopyId')} (also copies the selected card on the board)`;
   return (
-    <button type="button" className={`crumb-cur crumb-copy${copied ? ' copied' : ''}`}
-      onClick={onCopy} title={copied ? 'Copied!' : `${label} — click to copy id (${id}) · ${hkCaps('detailCopyId')}`}>
+    <button ref={btn} type="button"
+      className={`crumb-cur crumb-copy${copied ? ' copied' : ''}${failed ? ' copy-failed' : ''}`}
+      onClick={onCopy} title={copied ? 'Copied!' : failed ? copyFailureHint() : copyHint}>
       {copied ? 'copied ✓' : label}
     </button>
   );
 }
 
-// The "view app" toggle in the topbar — opens the in-dash app panel. Gated like
-// the panel itself: only shows with a local backend AND an env that has a running
-// app (an issue with no reserved port has nothing to view). Hidden while the
-// panel is open (its own ✕ closes it), so the topbar never duplicates the panel.
-function AppToggle({ env, port, onToggle }) {
+// Prev/next chevrons beside the issue crumb — the pointer twin of ⌘↑/⌘↓ on the
+// detail view. Both ride the board's published rail (selection.jsx), so they
+// walk the exact visible board order and disable at either end (no wrap) or
+// when the open issue isn't on the board (filtered out / hidden column).
+function CrumbIssueNav() {
+  const { pathname } = useLocation();
+  const parts = pathname.split('/').filter(Boolean);
+  // Same id derivation as Shell's issueId — ids may carry slashes (branch names).
+  const id = parts[0] === 'issues' && parts[1] ? decodeURIComponent(parts.slice(1).join('/')) : null;
+  // prevId/nextId are render-time (disabled states); go() re-aims from the live
+  // location at click time so a fast second click can't fire on stale neighbors.
+  const { prevId, nextId, go } = useIssueNav(id);
+  if (!id) return null;
+  return (
+    <span className="crumb-nav">
+      <button type="button" className="crumb-nav-btn" title={hkTitle('issuePrev')}
+        aria-label="Previous issue" disabled={!prevId} onClick={() => go('up')}>
+        <ChevronUp size={NAV_ICON} />
+      </button>
+      <button type="button" className="crumb-nav-btn" title={hkTitle('issueNext')}
+        aria-label="Next issue" disabled={!nextId} onClick={() => go('down')}>
+        <ChevronDown size={NAV_ICON} />
+      </button>
+    </span>
+  );
+}
+
+// The workspace toggle opens the rightmost App/Code inspector. Code browsing is
+// useful even when an issue has no running dev server, so availability is gated
+// only on the local repository backend; App mode carries its own empty state.
+function WorkspaceToggle({ onToggle }) {
   const local = useLocalBackend();
   if (local !== true) return null;
-  if (!appPortForEnv(env, port)) return null;
   return (
     <button type="button" className="topbar-btn app-toggle"
-      title="View the running app" onClick={onToggle}>
-      <WorkspacePanelIcon />
+      title="Open App and Code view" onClick={onToggle}>
+      <WorkspacePanelIcon size={NAV_ICON} />
     </button>
   );
 }
 
-function TopBar({ leftCollapsed, onToggleLeft, chatOpen, onToggleChat, appOpen, onToggleApp, appEnv, appPort }) {
+// The board's git-sync button — GitHub-Desktop-style. Shows main's ahead/behind
+// vs origin/main; one click fetches, fast-forwards main if behind, then pushes
+// if ahead. A divergence it can't fast-forward is NOT auto-resolved: the server
+// drops a note into the main chat and reports back, and the button flags it.
+// Gated like the app toggle — git runs server-side, so it needs a local backend
+// — and rendered only on the board nav (never issue detail).
+// Last git-status, cached in module scope so the button repaints INSTANTLY from
+// last-known state on every board revisit — the component remounts each time the
+// board mounts (it's gated on `onBoard`), and without this it would start blank
+// and only appear after the fetch round-trip, so a quick in/out never showed it.
+// Stale-while-revalidate: paint the cache, refresh in the background.
+const gitStatusCache = new Map(); // env → last status
+
+function SyncButton({ env = MAIN_ENV }) {
+  const local = useLocalBackend();
+  const [status, setStatus] = React.useState(() => gitStatusCache.get(env) || null);
+  const [syncing, setSyncing] = React.useState(false);
+  const [menuOpen, setMenuOpen] = React.useState(false);
+  const menuRef = React.useRef(null);
+  // How much this branch has, for the confirm to name. The code pane counts the
+  // same delta; this asks the same endpoint rather than inventing a second count.
+  const { data: tree } = useFetch(local ? `/api/dash/code/${encodeURIComponent(env)}` : null, { pollMs: menuOpen ? 5000 : 0 });
+  const changedCount = tree?.files?.filter((f) => f.status).length || 0;
+  React.useEffect(() => {
+    if (!menuOpen) return undefined;
+    const away = (event) => { if (!menuRef.current?.contains(event.target)) setMenuOpen(false); };
+    const esc = (event) => { if (event.key === 'Escape') setMenuOpen(false); };
+    window.addEventListener('pointerdown', away);
+    window.addEventListener('keydown', esc);
+    return () => { window.removeEventListener('pointerdown', away); window.removeEventListener('keydown', esc); };
+  }, [menuOpen]);
+  const [conflict, setConflict] = React.useState(false);
+  const isMain = env === MAIN_ENV;
+
+  const applyStatus = React.useCallback((s) => { gitStatusCache.set(env, s); setStatus(s); }, [env]);
+  const refresh = React.useCallback(async () => {
+    try {
+      const r = await fetch(`/api/dash/terminal/git-status?env=${encodeURIComponent(env)}`);
+      if (r.ok) applyStatus(await r.json());
+    } catch { /* offline — keep last known counts */ }
+  }, [applyStatus, env]);
+
+  // Repaint from THIS env's cache the instant the env changes, so moving between
+  // cards never shows the previous card's counts.
+  React.useEffect(() => { setStatus(gitStatusCache.get(env) || null); setConflict(false); }, [env]);
+
+  React.useEffect(() => {
+    if (local !== true) return undefined;
+    refresh();
+    const t = setInterval(refresh, 15000);
+    return () => clearInterval(t);
+  }, [local, refresh]);
+
+  // An issue with no worktree on this machine has nothing to sync — the server
+  // says so and the button simply isn't there. Main additionally hides until a
+  // remote exists; an ISSUE branch that has never been pushed is the normal
+  // first-push case, so it stays visible when there is something to publish.
+  if (local !== true || !status || !status.ok) return null;
+  if (isMain && !status.hasRemote) return null;
+  if (!isMain && !status.hasRemote && !status.publishable) return null;
+
+  const { ahead = 0, behind = 0, branch, publishable } = status;
+  const inSync = ahead === 0 && behind === 0 && (!isMain || branch === 'main');
+
+  const onSync = async () => {
+    if (syncing) return;
+    setSyncing(true); setConflict(false);
+    try {
+      const r = await fetch('/api/dash/terminal/git-sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ env }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (data.conflict) setConflict(true);
+      if (data.branch) applyStatus(data); else await refresh();
+    } catch { /* leave state; next poll reconciles */ }
+    finally { setSyncing(false); }
+  };
+
+  const what = isMain ? 'main' : branch;
+  const title = conflict
+    ? `Sync hit a conflict — check the ${isMain ? 'main' : 'issue'} chat to resolve`
+    : isMain && branch !== 'main' ? `Primary checkout is on ${branch}, not main`
+    : syncing ? 'Syncing…'
+    : publishable ? `Publish ${what} to origin — ${ahead} commit${ahead === 1 ? '' : 's'}, never pushed`
+    : inSync ? `In sync with origin/${what}`
+    : `Sync ${what} with origin${behind ? ` · ${behind} to pull` : ''}${ahead ? ` · ${ahead} to push` : ''}`;
+
+  return (
+    <span className="sync-split" ref={menuRef}>
+      <button type="button"
+        className={`topbar-btn sync-btn${syncing ? ' is-syncing' : ''}${conflict ? ' is-conflict' : ''}`}
+        title={title} onClick={onSync} disabled={syncing}>
+        <SyncIcon />
+        {!inSync && !syncing ? (
+          <span className="sync-counts">
+            {behind ? <span className="sync-behind">↓{behind}</span> : null}
+            {ahead ? <span className="sync-ahead">↑{ahead}</span> : null}
+          </span>
+        ) : null}
+      </button>
+      {/* The chevron, the same shape the app pane's refresh already uses: the
+          button does the ordinary thing, the menu holds the rest of what can be
+          done to this branch as a whole. Discarding lives here rather than in
+          the file tree, where a destructive button sat one slip away from a
+          tree you were only tidying. */}
+      <button type="button" className="topbar-btn sync-caret"
+        onClick={() => setMenuOpen((value) => !value)}
+        title="Branch actions" aria-label="Branch actions"
+        aria-haspopup="menu" aria-expanded={menuOpen}>
+        <ChevronDown size={NAV_CARET} />
+      </button>
+      {menuOpen ? (
+        <div className="sync-menu" role="menu">
+          <DiscardChanges env={env} count={changedCount} onDone={() => setMenuOpen(false)} />
+        </div>
+      ) : null}
+    </span>
+  );
+}
+
+// A NEWER DEPLOY IS LIVE AND THIS TAB IS NOT ON IT. The deployed shell only
+// changes on refresh, so the fix has always been available and never announced;
+// the footer badge could say "refresh to pick up a newer deploy" while being
+// entirely up to date, because it had no way to know.
+//
+// Present ONLY when there is something to get (shell-build.js compares two
+// release ids, so its absence is as meaningful as its presence), and it does
+// exactly the one thing that resolves the condition it reports. Green, not the
+// warning colour: nothing is broken, there is simply something newer one click
+// away — an invitation rather than an alarm.
+function DeployRefreshButton() {
+  const newer = useNewerDeploy();
+  if (!newer) return null;
+  return (
+    <button type="button" className="topbar-btn deploy-refresh"
+      title={`A newer dash deploy is live (${newer}).\nRefresh to pick it up.`}
+      aria-label="Refresh to load the newer deploy"
+      onClick={() => window.location.reload()}>
+      <ReloadIcon />
+    </button>
+  );
+}
+
+function TopBar({ leftCollapsed, onToggleLeft, onBoard, chatOpen, onToggleChat, appOpen, onToggleApp }) {
   const crumbs = useCrumbs();
+  const { pathname } = useLocation();
+  const parts = pathname.split('/').filter(Boolean);
+  // Same id derivation as Shell's issueId — ids may carry slashes (branch names).
+  const issueId = parts[0] === 'issues' && parts[1] ? decodeURIComponent(parts.slice(1).join('/')) : null;
   return (
     <header className="topbar">
       {leftCollapsed ? (
@@ -302,27 +622,33 @@ function TopBar({ leftCollapsed, onToggleLeft, chatOpen, onToggleChat, appOpen, 
       <nav className="topbar-crumbs" aria-label="Breadcrumb">
         {crumbs.map((c, i) => (
           <span key={i} className="crumb">
-            {c.to ? <Link to={c.to}>{c.label}</Link>
+            {c.to ? <Link to={c.to} title={c.hint ? hkTitle(c.hint) : undefined}>{c.label}</Link>
               : c.copy ? <CrumbCopy id={c.id} section={c.section} />
               : <span className="crumb-cur">{c.label}</span>}
             {i < crumbs.length - 1 ? <span className="crumb-sep">/</span> : null}
           </span>
         ))}
+        <CrumbIssueNav />
       </nav>
       {/* The trailing action buttons are one cluster — a tight internal gap so
           they read as a set, kept separate from the wide crumbs↔actions gap the
           topbar's own flex gap gives. */}
       <div className="topbar-actions">
+      {/* Git sync, left of the search icon. ONE control, two places: the board
+          syncs the trunk, an issue detail syncs that issue's own branch — so a
+          teammate can push and pull the branch for a card from the card. */}
+      <DeployRefreshButton />
+      {onBoard ? <SyncButton /> : issueId ? <SyncButton env={issueId} /> : null}
       {/* Search opens the ⌘K palette by pointer — present on every route's nav,
           the mouse twin of the global chord. */}
       <button
         type="button"
         className="topbar-btn search-open"
-        title={`Search issues (${hkCaps('search')})`}
+        title={hkTitle('search')}
         aria-label="Search issues"
         onClick={() => window.dispatchEvent(new CustomEvent('dash:open-palette'))}
       >
-        <Search size={15} />
+        <Search size={NAV_ICON} />
       </button>
       {/* Keyboard shortcuts overlay opener, beside search — the pointer twin of
           the `?` chord, and the way in while a field or the terminal owns focus
@@ -330,16 +656,16 @@ function TopBar({ leftCollapsed, onToggleLeft, chatOpen, onToggleChat, appOpen, 
       <button
         type="button"
         className="topbar-btn shortcuts-open"
-        title={`Keyboard shortcuts (${hkCaps('shortcuts')})`}
+        title={hkTitle('shortcuts')}
         aria-label="Keyboard shortcuts"
         onClick={() => window.dispatchEvent(new CustomEvent('dash:open-shortcuts'))}
       >
-        <Keyboard size={15} />
+        <Keyboard size={NAV_ICON} />
       </button>
       {/* Two panel toggles, each shown only while its panel is CLOSED — once open,
           the panel's own ✕ (top-left of its navbar) is how you close it. Ordered
           to mirror the columns: chat (inner) then app (outer, hugs the edge). */}
-      {!chatOpen ? (
+      {!EMBEDDED && !chatOpen ? (
         <button
           className="topbar-btn chat-toggle"
           title="Open AI chat"
@@ -348,7 +674,7 @@ function TopBar({ leftCollapsed, onToggleLeft, chatOpen, onToggleChat, appOpen, 
           <ChatIcon />
         </button>
       ) : null}
-      {!appOpen ? <AppToggle env={appEnv} port={appPort} onToggle={onToggleApp} /> : null}
+      {!appOpen ? <WorkspaceToggle onToggle={onToggleApp} /> : null}
       </div>
     </header>
   );
@@ -366,6 +692,14 @@ function TopBar({ leftCollapsed, onToggleLeft, chatOpen, onToggleChat, appOpen, 
 // canvas off the detail.
 const MAIN_ENV = 'main';
 
+// Is this dash running INSIDE the App-pane iframe (a dash pointed at /dash/, for
+// dash-in-dash testing)? Deterministic — a framed window's `top` is a different
+// window object than its `self`. When embedded we mount NO chats: the guest is a
+// passive view of the board/detail, and spinning up its chat pool would launch
+// nested agent sessions the host already owns. (Reading window.top is always
+// permitted cross-origin; only the framed document's location is walled off.)
+const EMBEDDED = typeof window !== 'undefined' && window.self !== window.top;
+
 function useViewportW() {
   const [w, setW] = React.useState(() => window.innerWidth);
   React.useEffect(() => {
@@ -376,10 +710,10 @@ function useViewportW() {
   return w;
 }
 
-// The right chat panel hosts one dev environment. For an issue it's that issue's
-// worktree + chats (a switcher); for the MAIN env it's the single persistent
-// root thread. The panel exists on every route — the active env (issue on a
-// detail route, else main) drives which one is visible. Docked mode carries a
+// The right chat panel hosts one dev environment via the shared ChatEnvironment
+// component — an issue's worktree chats or the MAIN env's repo-root chats, both a
+// switcher. The panel exists on every route — the active env (issue on a detail
+// route, else main) drives which one is visible. Docked mode carries a
 // drag handle on its left edge for resizing. ONE stable element per env: `mode`
 // (docked vs overlay) and `open` (visible vs hidden) are class swaps only — the
 // <aside> and the terminal inside it never unmount, so resizing across the
@@ -398,9 +732,7 @@ function ChatPanel({ envId, mode, open, onClose, onResizeStart, requestSession }
       closeLabel="Close AI chat"
       env={envId}
     >
-      {envId === MAIN_ENV
-        ? <MainTerminal active={open} />
-        : <IssueTerminal key={envId} issueId={envId} active={open} requestSession={requestSession} />}
+      <ChatEnvironment key={envId} issueId={envId} active={open} requestSession={requestSession} />
     </DockPanel>
   );
 }
@@ -412,17 +744,33 @@ function ChatPanel({ envId, mode, open, onClose, onResizeStart, requestSession }
 function Shell() {
   const { pathname } = useLocation();
   const parts = pathname.split('/').filter(Boolean);
-  const issueId = parts[0] === 'changes' && parts[1] ? decodeURIComponent(parts.slice(1).join('/')) : null;
+  const issueId = parts[0] === 'issues' && parts[1] ? decodeURIComponent(parts.slice(1).join('/')) : null;
   // The chat is universal: an issue detail shows that issue's chat; every other
   // page shows the persistent main thread. Both stay mounted in the pool below.
   const activeEnv = issueId ?? MAIN_ENV;
-  const onBoard = parts.length === 0;
+  const onBoard = parts.length === 1 && parts[0] === 'issues';
 
   // The active issue's reserved dev-server port, read from the board's cache
   // (shared key — no extra fetch). null for the main env, where the app panel
   // falls back to this origin's port (the canvas).
-  const { data: changes } = useAsync('changes', listChanges, { pollMs: 60000 });
-  const activePort = issueId ? (changes?.find((c) => c.id === issueId)?.port ?? null) : null;
+  // Shares the 'changes' cache with the always-mounted board, which Realtime
+  // keeps fresh — so no timer poll here either.
+  const { data: changes } = useIssues('changes', listChanges, { pollMs: 0 });
+  const activeChange = issueId ? changes?.find((c) => c.id === issueId) : null;
+  const activePort = issueId ? (activeChange?.port ?? null) : null;
+  // The App pane's links for whichever env is active. Two facts, one model: the
+  // SELECTED route and the extra saved routes. An issue keeps both on its row
+  // (read from the same board cache as the port, so no extra fetch); MAIN — this
+  // origin, with no row — keeps both in the browser. The list itself is always
+  // the base set every dev server serves plus those extras, so an issue that has
+  // never been edited still opens with the canvas / dash / graph to hop between.
+  const [mainAppPath, setMainAppPath] = React.useState(loadMainPath);
+  const [mainAppPaths, setMainAppPaths] = React.useState(loadMainLinks);
+  const activeAppPath = normalizeAppPath(issueId ? activeChange?.app_path : mainAppPath);
+  const activeAppLinks = React.useMemo(
+    () => appLinkList(issueId ? activeChange?.app_paths : mainAppPaths, activeAppPath),
+    [issueId, activeChange?.app_paths, mainAppPaths, activeAppPath],
+  );
 
   const [collapsed, setCollapsed] = React.useState(
     () => localStorage.getItem('dash-sidebar-collapsed') === '1'
@@ -442,11 +790,14 @@ function Shell() {
   // One resizing flag for both columns: it kills width transitions and shields
   // the app iframe from swallowing the drag's pointer moves.
   const [resizing, setResizing] = React.useState(false);
-  // A pending "open this chat" request from a convo pill. The nonce makes
-  // re-clicking the same session re-fire the selection in IssueTerminal.
+  // A pending "open this chat" request from a convo pill or a ⌘K chat hit. The
+  // nonce makes re-clicking the same session re-fire the selection in
+  // ChatEnvironment; `turnIdx` (a search hit) opens the transcript AT that turn
+  // rather than at the end, which is what makes a search result land on the
+  // thing you searched for.
   const [reqChat, setReqChat] = React.useState(null);
-  const requestChat = React.useCallback((reqIssueId, sessionId) => {
-    setReqChat((prev) => ({ issueId: reqIssueId, sessionId, nonce: (prev?.nonce ?? 0) + 1 }));
+  const requestChat = React.useCallback((reqIssueId, sessionId, turnIdx = null) => {
+    setReqChat((prev) => ({ issueId: reqIssueId, sessionId, turnIdx, nonce: (prev?.nonce ?? 0) + 1 }));
     // Force the panel visible (docked pref or thin overlay) so the chat shows.
     setChatPref(true);
     localStorage.setItem('dash-chat-open', '1');
@@ -457,10 +808,116 @@ function Shell() {
   const [chatOverlayOpen, setChatOverlayOpen] = React.useState(false);
   const [appOverlayOpen, setAppOverlayOpen] = React.useState(false);
   React.useEffect(() => { setChatOverlayOpen(false); setAppOverlayOpen(false); }, [pathname]);
-  // Bumped by ↻ to remount the app iframe; `appReloading` spins the navbar ↻
-  // while a server-side restart is in flight.
-  const [appReloadKey, setAppReloadKey] = React.useState(0);
-  const [appReloading, setAppReloading] = React.useState(false);
+  // Per-env App-pane remount nonces (env → count) and which env (if any) is
+  // mid dev-server restart. BOTH are per-env so a slow action on issue A — a
+  // route commit OR a server restart — can never remount issue B's pane or spin
+  // B's ↻ after you've navigated there. `bumpReload(env)` is the single "remount
+  // this pane" primitive (re-hits /open); `reloadingEnvs` drives the ↻ spinner.
+  const [appReloads, setAppReloads] = React.useState({});
+  // A SET of envs mid-restart, not a scalar: restarting A then B leaves BOTH
+  // spinning until each finishes, instead of B's restart erasing A's spinner.
+  const [reloadingEnvs, setReloadingEnvs] = React.useState(() => new Set());
+  const bumpReload = React.useCallback((env) => {
+    setAppReloads((m) => ({ ...m, [env]: (m[env] || 0) + 1 }));
+  }, []);
+  // Select an App-pane route, then remount THIS env's iframe so /open
+  // re-redirects onto it. A route the env has never been sent to is SAVED in the
+  // same write — that's how the list grows: you type an address, and it joins the
+  // links. Base routes need no saving (every list already has them).
+  //
+  // Two guards make the issue write correct: (1) inspect the write — a rejected
+  // write rolls the optimistic cache back, so the pane must stay put, not remount
+  // onto the reverted path; (2) the AWAITED write means the remount's /open reads
+  // the freshly-committed path, never the optimistic overlay the read could beat
+  // to the server. The navbar updates instantly (optimistic), so only the iframe
+  // waits on durability. '/' stores as null (canvas default). MAIN has no row:
+  // its two facts land in the browser and the iframe follows its src.
+  const setActiveAppPath = React.useCallback(async (raw) => {
+    const path = normalizeAppPath(raw);
+    const custom = (issueId ? activeChange?.app_paths : mainAppPaths) || [];
+    const isNew = !isBaseAppPath(path) && !custom.includes(path);
+    if (!issueId) {
+      setMainAppPath(path);
+      saveMainPath(path);
+      if (isNew) { const next = [...custom, path]; setMainAppPaths(next); saveMainLinks(next); }
+      return;
+    }
+    const fields = { app_path: path === '/' ? null : path };
+    if (isNew) fields.app_paths = [...custom, path];
+    const r = await updateChangeFields(issueId, fields);
+    if (r?.error) return;
+    bumpReload(issueId);
+  }, [issueId, activeChange?.app_paths, mainAppPaths, bumpReload]);
+
+  // Forget a saved route. Base routes have no × (they're the floor of every
+  // list), so only a custom one gets here. Dropping the route you're ON moves
+  // the pane to the link above it — the pane is never left pointing at a link the
+  // list no longer offers.
+  const removeActiveAppPath = React.useCallback(async (raw) => {
+    const path = normalizeAppPath(raw);
+    if (isBaseAppPath(path)) return;
+    const custom = (issueId ? activeChange?.app_paths : mainAppPaths) || [];
+    const next = custom.filter((p) => normalizeAppPath(p) !== path);
+    const fallback = path === activeAppPath
+      ? activeAppLinks[Math.max(0, activeAppLinks.indexOf(path) - 1)]
+      : null;
+    // A route can be in the list WITHOUT being saved — the selected one always
+    // shows, whoever wrote it (a `board.mjs app-path`, a spawn). Then "remove" is
+    // purely the move off it, and the list write is the no-op.
+    if (next.length === custom.length && !fallback) return;
+    if (!issueId) {
+      setMainAppPaths(next);
+      saveMainLinks(next);
+      if (fallback) { setMainAppPath(fallback); saveMainPath(fallback); }
+      return;
+    }
+    const fields = { app_paths: next };
+    if (fallback) fields.app_path = fallback === '/' ? null : fallback;
+    const r = await updateChangeFields(issueId, fields);
+    if (r?.error || !fallback) return;
+    bumpReload(issueId);
+  }, [issueId, activeChange?.app_paths, mainAppPaths, activeAppPath, activeAppLinks, bumpReload]);
+
+  // The .main scroller is SHARED by every route (the board and the chat pool
+  // stay mounted beneath it), so scroll position is per-route state the element
+  // itself can't keep: navigating board → detail collapses the scroller to the
+  // detail's content and clamps scroll on BOTH axes — a too-wide board scrolls
+  // horizontally on .main too (overflow-y:auto ⇒ overflow-x used-value auto), so
+  // the detail (which fits) clamps scrollLeft to 0 just as it clamps scrollTop.
+  // Remember each route's position (both axes) as the user scrolls, and restore
+  // it when the route becomes active again — a route never visited opens at the
+  // origin. The clamp fires its scroll event only after the commit, so it lands
+  // under the NEW route's key and never corrupts the position being left
+  // behind. Restoring in a layout effect runs after the DOM flip but before
+  // paint: the board (always fully rendered, only display-flipped) comes back
+  // exactly where it was, with no flash.
+  const mainRef = React.useRef(null);
+  const scrollMem = React.useRef(new Map());
+  const onMainScroll = (e) => scrollMem.current.set(pathname, { left: e.currentTarget.scrollLeft, top: e.currentTarget.scrollTop });
+  React.useLayoutEffect(() => {
+    const el = mainRef.current;
+    if (!el) return;
+    const pos = scrollMem.current.get(pathname);
+    el.scrollLeft = pos?.left ?? 0;
+    el.scrollTop = pos?.top ?? 0;
+  }, [pathname]);
+  // ⌘-wheel scrolls the .main scroller horizontally — the natural gesture for the
+  // wide kanban when a mouse (or trackpad) only sends a vertical delta. Gated on
+  // there actually being horizontal room to scroll (the board; not a detail
+  // page), so ⌘-wheel keeps its native browser zoom everywhere else. Non-passive
+  // so preventDefault takes.
+  React.useEffect(() => {
+    const el = mainRef.current;
+    if (!el) return undefined;
+    const onWheel = (e) => {
+      if (!e.metaKey || !e.deltaY) return;
+      if (el.scrollWidth <= el.clientWidth) return; // no horizontal overflow → leave ⌘-wheel to the browser
+      el.scrollLeft += e.deltaY;
+      e.preventDefault();
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, []);
 
   const viewportW = useViewportW();
   const sidebarW = collapsed ? 0 : LEFT_W;
@@ -479,12 +936,21 @@ function Shell() {
   const chatDockW = Math.max(chatW, DOCK_MIN_W);
   const appDockW = Math.max(appW, DOCK_MIN_W);
   const chatThin = viewportW < sidebarW + chatDockW + MAIN_MIN_W;
-  const chatRoomW = chatPref && !chatThin ? chatDockW : 0; // chat's claim on the row
+  // Embedded, chat is an unavailable capability — the ONE gate that drives every
+  // chat-derived thing: its claim on the row (geometry), whether it's open, and
+  // the convo-pill affordance (context). Without gating chatRoomW here, a phantom
+  // chat width would wrongly shove the nested App pane into overlay mode.
+  const chatAvailable = !EMBEDDED;
+  const chatRoomW = chatAvailable && chatPref && !chatThin ? chatDockW : 0; // chat's claim on the row
   const appThin = viewportW < sidebarW + chatRoomW + appDockW + MAIN_MIN_W;
 
   // Open = the user's pref when there's room to dock; the transient overlay flag
   // when the viewport is thin. Docked = open and roomy (drives the grid track).
-  const chatOpen = chatThin ? chatOverlayOpen : chatPref;
+  // Embedded (dash-in-dash), chat is an UNAVAILABLE capability, not just an
+  // unmounted pool: forcing chatOpen false here cascades to chatDocked — so the
+  // guest reserves no empty chat column — and the TopBar hides its toggle. The
+  // guest is a passive view of the board/detail.
+  const chatOpen = chatAvailable && (chatThin ? chatOverlayOpen : chatPref);
   const appOpen = appThin ? appOverlayOpen : appPref;
   const chatDocked = chatOpen && !chatThin;
   const appDocked = appOpen && !appThin;
@@ -499,6 +965,7 @@ function Shell() {
   // first load → its /main bootstrap), and an issue never viewed spins up nothing.
   const [openedEnvs, setOpenedEnvs] = React.useState([]);
   React.useLayoutEffect(() => {
+    if (EMBEDDED) return; // dash-in-dash: no chats (see EMBEDDED)
     if (chatOpen && activeEnv) {
       setOpenedEnvs((prev) => (prev.includes(activeEnv) ? prev : [...prev, activeEnv]));
     }
@@ -507,13 +974,18 @@ function Shell() {
   // Seed the pool from the LIVE server-side chats (the `/terminal/live` pairs)
   // that each issue has EXPLICITLY selected — its `selected_session`. At most one
   // pane per issue, and only when that chat is already live, so the board still
-  // never cold-spawns on load AND a reviewer / a second work chat never warms or
-  // dots a card (they're never an issue's selected_session). The env is the
-  // SELECTING issue; however many pooled issues later want the same session, only
-  // the ownership winner mounts its ChatPane (see session-pool.js). Mounting the
-  // (hidden) ChatPane REATTACHES to the running PTY (cheap — no claude spawn, no
-  // transcript scan) and starts reporting working/idle, so the selected chat's
-  // "needs input" dot populates without a manual card open.
+  // never cold-spawns on load. The env is the SELECTING issue; however many
+  // pooled issues later want the same session, only the ownership winner mounts
+  // its ChatPane (see session-pool.js). Mounting the (hidden) ChatPane REATTACHES
+  // to the running PTY (cheap — no claude spawn, no transcript scan), so opening
+  // that card later shows a warm terminal with its scrollback already there.
+  //
+  // PRE-WARM IS ALL THIS DOES NOW. It was built to make the "needs input" dot
+  // populate without a card open, and that reason is gone — the supervisor
+  // publishes a state for every live chat and the board reads it directly
+  // (activity-store.js), pane or no pane. What is left is a latency trade
+  // (N hidden WebSockets and N scrollback replays per board load, against an
+  // instant first card open) that should be decided on its own merits.
   //
   // Background work yields to the foreground: the initial seed is DEFERRED to
   // browser idle (first paint + any immediate card-open win) and THROTTLED a
@@ -521,16 +993,17 @@ function Shell() {
   // later (e.g. an autonomously-spawned issue). A ref tracks which SESSIONS have
   // been queued so re-seeds and openedEnvs changes don't double-mount.
   const seededRef = React.useRef(new Set());
-  // Latest board rows for selected_session resolution — a ref so the mount-once
-  // seed effect below reads fresh data without re-running.
+  // Latest board rows for link resolution — a ref so the mount-once seed effect
+  // below reads fresh data without re-running.
   const changesRef = React.useRef(null);
   changesRef.current = changes;
   React.useEffect(() => {
+    if (EMBEDDED) return undefined; // dash-in-dash: never seed/reattach chats
     let cancelled = false;
     let pumpTimer = null;
     const trickleIn = (pairs) => {
-      // Resolution needs the board rows; until they land, defer the whole batch
-      // (nothing is marked seeded) and retry shortly.
+      // Link resolution needs the board rows; until they land, defer the whole
+      // batch (nothing is marked seeded) and retry shortly.
       const rows = changesRef.current;
       if (!rows) { pumpTimer = setTimeout(seed, 1000); return; }
       // Warm EXACTLY the chat each issue points its explicit selected_session at —
@@ -614,44 +1087,63 @@ function Shell() {
   const reloadApp = async () => {
     if (appThin) setAppOverlayOpen(true);
     else { setAppPref(true); localStorage.setItem('dash-app-open', '1'); }
-    if (activeEnv !== MAIN_ENV) {
-      setAppReloading(true);
-      try { await fetch(`/api/dash/terminal/${encodeURIComponent(activeEnv)}/restart`, { method: 'POST' }); } catch { /* show fresh anyway */ }
-      setAppReloading(false);
+    // Capture the env NOW: navigating away mid-restart must leave the spinner and
+    // the eventual remount on the env we actually restarted, not wherever we land.
+    const env = activeEnv;
+    if (env !== MAIN_ENV) {
+      setReloadingEnvs((s) => new Set(s).add(env));
+      try { await fetch(`/api/dash/terminal/${encodeURIComponent(env)}/restart`, { method: 'POST' }); } catch { /* show fresh anyway */ }
+      setReloadingEnvs((s) => { const n = new Set(s); n.delete(env); return n; });
     }
-    setAppReloadKey((k) => k + 1);
+    bumpReload(env);
   };
+
+  // Make the issue's dev environment from the App pane. Until now the ONLY thing
+  // that created a worktree and reserved a port was launching a chat — so anyone
+  // working in their own editor instead of the dash chat could never get an app
+  // preview at all, and the pane just said "no dev environment" forever. This is
+  // the same server action the chat empty state performs, minus the chat: it
+  // ensures the worktree and reserves the port. Once the port lands on the row,
+  // the pane's existing lazy-start path (/open) brings vite up on its own.
+  const createEnv = React.useCallback(async (env) => {
+    const r = await fetch('/api/dash/terminal/worktree', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ issue: env }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.error) throw new Error(data.error || 'could not create the dev environment');
+    // The server just wrote this issue's row (port, branch, status) — announce it
+    // like any other write so the board cache refetches and `activePort` lands.
+    emitIssuesChange('UPDATE', { id: env });
+    return data;
+  }, []);
 
   // Board focus toggle: on the Issues board, ⌘← parks the keyboard on the kanban
   // (so arrows move the card cursor) and ⌘→ drops it into the chat (so you can
-  // type). A capture-phase listener is what makes this work when the chat owns
-  // focus — xterm's textarea swallows keystrokes, so we intercept on the way
-  // DOWN (preventing native Back/Forward and stopping the event before the
-  // terminal or the board's own arrow-nav sees it) and steer focus by event.
-  React.useEffect(() => {
-    if (!onBoard) return undefined;
-    const onKey = (e) => {
-      if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
-      if (e.key === 'ArrowRight') {
-        e.preventDefault();
-        e.stopPropagation();
-        if (!chatOpen) { if (chatThin) setChatOverlayOpen(true); else { setChatPref(true); localStorage.setItem('dash-chat-open', '1'); } }
-        // Two frames: if the chat was just opened, its pane needs a beat to mount
-        // before it can take focus; if already open, the extra frame is harmless.
-        requestAnimationFrame(() => requestAnimationFrame(() => window.dispatchEvent(new CustomEvent('dash:focus-chat'))));
-      } else if (e.key === 'ArrowLeft') {
-        e.preventDefault();
-        e.stopPropagation();
-        window.dispatchEvent(new CustomEvent('dash:focus-board'));
-      }
-    };
-    window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
-  }, [onBoard, chatOpen, chatThin]);
+  // type). These are modifier chords, so the shared primitive fires them over
+  // the chat terminal too — steering focus back out of xterm, which is the whole
+  // point — while keeping them off the browser's native Back/Forward. Disabled
+  // when embedded (dash-in-app-pane): there's no chat to focus into.
+  useHotkey(hk('focusChat'), () => {
+    if (!chatOpen) { if (chatThin) setChatOverlayOpen(true); else { setChatPref(true); localStorage.setItem('dash-chat-open', '1'); } }
+    // Two frames: if the chat was just opened, its pane needs a beat to mount
+    // before it can take focus; if already open, the extra frame is harmless.
+    requestAnimationFrame(() => requestAnimationFrame(() => window.dispatchEvent(new CustomEvent('dash:focus-chat'))));
+  }, { enabled: onBoard && !EMBEDDED, terminal: 'handle', when: isBoardRoute });
+  useHotkey(hk('focusBoard'), () => window.dispatchEvent(new CustomEvent('dash:focus-board')), { enabled: onBoard && !EMBEDDED, terminal: 'handle', when: isBoardRoute });
 
   // Drag a docked column's left edge. Width tracks live (the grid var follows
   // state) and persists on release; clamping keeps MAIN_MIN_W of content room
   // given the OTHER docked column's width (so two open panels can't scrunch it).
+  // A pane width changed (user dragging a divider) → tell every mounted terminal
+  // to refit. This is the ONLY app-driven resize signal besides the browser's own
+  // window-resize; terminals no longer watch their own host element, so incidental
+  // reflows (a board re-render, a pool show/hide) never reach the PTY.
+  React.useEffect(() => {
+    window.dispatchEvent(new Event('dash:refit'));
+  }, [chatDockW, appDockW]);
+
   const onChatResizeStart = (e) => startDockResize(e, {
     startW: chatDockW, sidebarW, otherW: appDocked ? appDockW : 0,
     onWidth: setChatW, onEnd: (w) => localStorage.setItem('dash-chat-width', String(w)), setResizing,
@@ -662,41 +1154,61 @@ function Shell() {
   });
 
   return (
-    <ChatControlContext.Provider value={requestChat}>
+    <ChatControlContext.Provider value={chatAvailable ? requestChat : null}>
     <div
       className={`app${collapsed ? ' collapsed' : ''}${chatDocked ? ' chat-open' : ''}${appDocked ? ' app-open' : ''}${resizing ? ' dock-resizing' : ''}`}
       style={{ '--chat-w': `${chatDockW}px`, '--app-w': `${appDockW}px` }}
     >
       <Sidebar onCollapse={toggleLeft} />
       <div className="content">
+        <ControlPlaneBanner />
         <TopBar
           leftCollapsed={collapsed}
           onToggleLeft={toggleLeft}
+          onBoard={onBoard}
           chatOpen={chatOpen}
           onToggleChat={toggleChat}
           appOpen={appOpen}
           onToggleApp={toggleApp}
-          appEnv={activeEnv}
-          appPort={activePort}
         />
-        <div className="main">
-          {/* The board is home: it mounts ONCE for the whole session and is only
-              hidden when you're off the home route (a change detail) — never
-              unmounted. Its realtime stream stays connected the entire time, so a
-              card that moved while you were elsewhere is already in place on
-              return: instant, no stale-paint flash. Same persistent-mount pattern
-              as the chat panels below. `display:contents` makes the wrapper vanish
-              from layout when shown, so the board lays out exactly as a direct
-              .main child would. */}
+        <div className="main" ref={mainRef} onScroll={onMainScroll}>
+          {/* The board mounts ONCE for the whole session and is only hidden when
+              you're off the Issues route — never unmounted. Its realtime stream
+              stays connected the entire time, so a card that moved while you were
+              elsewhere is already in place on return: instant, no stale-paint
+              flash. Same persistent-mount pattern as the chat panels below.
+              `display:contents` makes the wrapper vanish from layout when shown,
+              so the board lays out exactly as a direct .main child would. */}
           <div className="board-mount" style={{ display: onBoard ? 'contents' : 'none' }}>
             <ChangesBoard visible={onBoard} />
           </div>
           <Routes>
-            <Route path="/changes/:id" element={<ChangeDetail />} />
+            {/* Bare /dash/ lands on the board — the primary surface. Metrics is
+                secondary analytics at its own path. `replace` so the redirect
+                isn't a back-button trap. */}
+            <Route path="/" element={<Navigate to="/issues" replace />} />
+            <Route path="/metrics" element={<Metrics />} />
+            {/* Keyed by the open issue: prev/next nav changes only the :id
+                param, which re-renders but never remounts an unkeyed element —
+                so issue-local state (an open body editor, a delete confirm,
+                useAsync's cache identity and in-flight refreshes) would leak
+                from one issue onto the next and a stale save/confirm/fetch
+                would hit the wrong issue. The key remounts the whole detail,
+                keeping every closure self-consistent with one issue. */}
+            <Route path="/issues/:id" element={<ChangeDetail key={issueId} />} />
+            <Route path="/tests" element={<TestsList />} />
+            <Route path="/tests/:name" element={<TestDetail />} />
+            <Route path="/recordings" element={<Recordings />} />
+            {/* `tests/<name>` ids carry a slash, so the id is a splat rather
+                than a single param — one route for both namespaces. */}
+            <Route path="/recordings/*" element={<RecordingDetail />} />
           </Routes>
         </div>
       </div>
-      {openedEnvs.map((id) => (
+      {/* Chat pool — mounted only in a top-level dash. An embedded dash (App
+          pane pointed at /dash/) shows the board/detail but spins up no chats,
+          so dash-in-dash never launches nested agent sessions (see EMBEDDED). */}
+      {!EMBEDDED && openedEnvs.map((id) => (
         <ChatPanel
           key={id}
           envId={id}
@@ -715,12 +1227,17 @@ function Shell() {
         <WorkspacePanel
           env={activeEnv}
           port={activePort}
-          reloadKey={appReloadKey}
-          reloading={appReloading}
+          appPath={activeAppPath}
+          appLinks={activeAppLinks}
+          reloadKey={appReloads[activeEnv] || 0}
+          reloading={reloadingEnvs.has(activeEnv)}
           mode={appThin ? 'overlay' : 'docked'}
           open
           onClose={toggleApp}
           onReload={reloadApp}
+          onCreateEnv={createEnv}
+          onSetAppPath={setActiveAppPath}
+          onRemoveAppPath={removeActiveAppPath}
           onResizeStart={onAppResizeStart}
         />
       )}
@@ -763,11 +1280,11 @@ function App() {
   if (!session) return <SignIn />;
 
   return (
-    <HashRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+    <BrowserRouter basename={DASH_BASENAME} future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <SelectionProvider>
         <Shell />
       </SelectionProvider>
-    </HashRouter>
+    </BrowserRouter>
   );
 }
 

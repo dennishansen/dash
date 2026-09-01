@@ -43,25 +43,32 @@
 //   { type: 'redirect', port }               chat is live in ANOTHER dash server
 //                                            on this machine — reconnect there
 
-import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { spawnSync, spawn } from 'child_process';
+import { spawn } from 'child_process';
 import net from 'net';
 import { run } from './proc.mjs';
+import { journalOpen, journalStamp, journalClose, journalBlock, journalEnd, journalImportBlocked, reconcile, importLegacyRegistry } from './chat-journal.mjs';
+import { registryDir, pidStartTime, signalTree, terminateVerified } from './proc-identity.mjs';
 import {
   agentById, agentChoices, parseHandle, formatHandle,
-  findTranscriptAny, liveArgvPatternAny, DEFAULT_AGENT,
+  findTranscriptAny, readTurnsAny, discoverChatsAny, sessionPidsAny, DEFAULT_AGENT,
+  agentAvailability, AgentMissingError, isLaunchable,
 } from './agents.mjs';
 import { createRequire } from 'module';
 import {
-  MAIN_ENV, MAIN_REPO, resolveWorktreeDir, worktreeDir,
+  MAIN_ENV, MAIN_REPO, resolveWorktreeDir, worktreeDir, workspaceForDir, workspaceIssueMap,
 } from './workspace-env.mjs';
 import {
-  mainChatsList, linkMainChat, unlinkMainChat, mainChatNames, setMainChatName,
+  mainChatsList, linkMainChat, unlinkMainChat, mainChatMeta, setMainChatName,
+  forgetMainChatMeta,
 } from './main-chats-store.mjs';
+import { openSession, feedSession, resizeSession, closeSession, activitySnapshot, subscribeActivity } from './chat-activity.mjs';
 import { normalizeAppPath } from '../src/app-env.mjs';
+import { sameHostOriginFor } from '../src/same-host-origin.mjs';
+import { git, hasWorktree, branchExists, ensureWorktree, restorableWorkspace, restoreCwdInside } from './worktree.mjs';
+import { resolveViteBin } from '../scripts/lib/vite-bin.mjs';
 
 const require = createRequire(import.meta.url);
 const pty = require('node-pty');
@@ -76,16 +83,6 @@ const pty = require('node-pty');
 // special singleton path.
 export { MAIN_ENV };
 
-// Run git from the MAIN repo. ASYNC: even "deliberate one-click" actions like
-// worktree create run on the same event loop that relays terminal keystrokes —
-// a synchronous `git worktree add` measured ~5s of loop block, freezing every
-// attached terminal for its duration. Awaiting keeps typing responsive while
-// git churns.
-async function git(args) {
-  const r = await run('git', ['-C', MAIN_REPO, ...args]);
-  return { ok: r.status === 0, out: r.stdout.trim(), err: r.stderr.trim() };
-}
-
 // Locating a chat's transcript and reading the cwd it ran in is now agent-
 // specific (claude scans ~/.claude/projects, codex scans ~/.codex/sessions) —
 // see findTranscriptAny + each adapter in agents.mjs. Both are ASYNC by design:
@@ -93,47 +90,60 @@ async function git(args) {
 // once, so awaiting fs.promises lets those interleave with live requests instead
 // of freezing the single dev-server event loop.
 
-// The cwd a transcript ran in, read from the first transcript line that records
 // Resolve a chat session to its on-disk reality:
-//   { resumable, cwd, agent } — resumable iff a transcript exists locally AND
-//   the cwd it ran in still exists on disk. `agent` is whichever adapter's store
-//   the transcript was found in (a uuid lives in exactly one). If the transcript
-//   is gone (created on another machine) OR its cwd was removed (worktree
-//   merged/rejected) the chat is present-but-unresumable: shown, disabled,
-//   never spawned.
+//   { resumable, restorable, cwd, agent } — resumable iff this machine HAS the
+//   chat, its agent is one the dash can START, and the cwd it ran in still
+//   exists. `agent` is whichever adapter's store the chat was found in (a uuid
+//   lives in exactly one). If the chat is absent (created on another machine) or
+//   its agent is read-only (a Cursor chat — the dash cannot drive an editor), it
+//   is present-but-unresumable: shown, never spawned. Whether it can be READ is
+//   a separate question, and the mirror answers it.
+//
+// A chat whose CWD is gone is a third thing, and calling it unresumable was the
+// lie this split removes: its workspace was a git worktree, which is derived
+// state the dash knows how to rebuild (worktree.mjs), so the chat is dormant
+// rather than dead. `restorable` says exactly that — the directory can be made
+// again, at the path this chat recorded — and it is deliberately NOT `resumable`:
+// rebuilding a workspace is a real act with real cost, so someone asks for it
+// (the card's "Create dev env & reopen chat"), and nothing does it behind them.
 async function resolveChat(sessionId) {
+  const dormant = (fields) => ({ resumable: false, restorable: false, ...fields });
   const found = await findTranscriptAny(sessionId);
-  if (!found) return { resumable: false, cwd: null, agent: DEFAULT_AGENT, reason: 'no-transcript' };
-  const { agent, transcriptPath } = found;
-  const cwd = await agentById(agent).transcriptCwd(transcriptPath);
-  if (!cwd) return { resumable: false, cwd: null, agent, reason: 'no-cwd' };
-  try { if (!(await fs.promises.stat(cwd)).isDirectory()) return { resumable: false, cwd, agent, reason: 'cwd-gone' }; }
-  catch { return { resumable: false, cwd, agent, reason: 'cwd-gone' }; }
-  return { resumable: true, cwd, agent, reason: null };
+  if (!found) return dormant({ cwd: null, agent: DEFAULT_AGENT, reason: 'no-transcript', updated: 0 });
+  const { agent, transcriptPath, launchable } = found;
+  // When the chat last SAID anything. The transcript's mtime is the same ground
+  // truth the idle reaper trusts, and the path is already resolved here, so this
+  // is one stat rather than a second scan.
+  const updated = await fs.promises.stat(transcriptPath).then(st => st.mtimeMs).catch(() => 0);
+  const cwd = await agentById(agent).transcriptCwd(transcriptPath, sessionId);
+  if (!launchable) return dormant({ cwd, agent, reason: 'not-launchable', updated });
+  if (!cwd) return dormant({ cwd: null, agent, reason: 'no-cwd', updated });
+  const live = await fs.promises.stat(cwd).then(st => st.isDirectory()).catch(() => false);
+  if (!live) {
+    return dormant({ cwd, agent, reason: 'cwd-gone', updated, restorable: !!restorableWorkspace(cwd) });
+  }
+  return { resumable: true, restorable: false, cwd, agent, reason: null, updated };
 }
 
 // Parse a claude transcript's jsonl into spoken turns. Re-exported from the
 // claude adapter so the standalone arg/parse tests keep a stable import; the
-// live read path (readTranscript) parses with whichever agent actually owns the
-// transcript.
+// live read path (readTranscript) reads through whichever agent actually owns
+// the chat.
 export function parseTranscriptMessages(raw, after = 0) {
   return agentById('claude').parseTranscript(raw, after);
 }
 
-// Read a session's transcript as parsed spoken turns. `after` is the previous
-// read's cursor (0 = from the start). Works for ANY session ANY agent ran on
-// this machine — the transcript is found across every adapter's store and
-// parsed with that agent's schema. Reading is deliberately unrestricted
-// (transcripts are world-visible context for agents); only WRITING is gated on
-// the issue link.
+// Read a session's spoken turns. `after` is the previous read's cursor (0 = from
+// the start). Works for ANY session ANY agent has on this machine — each adapter
+// owns how it gets its own turns (a jsonl file for the CLIs, a database row for
+// Cursor), so this is one call rather than a find-then-read the caller assembles.
+// Reading is deliberately unrestricted (transcripts are world-visible context
+// for agents); only WRITING is gated on the issue link.
 export async function readTranscript(sessionId, after = 0) {
-  const found = await findTranscriptAny(sessionId);
-  if (!found) return null;
-  let raw;
-  try { raw = await fs.promises.readFile(found.transcriptPath, 'utf8'); } catch { return null; }
+  const t = await readTurnsAny(sessionId, after);
+  if (!t) return null;
   const live = globalThis.__labChats.get(sessionId);
-  const parsed = agentById(found.agent).parseTranscript(raw, after);
-  return { sessionId, agent: found.agent, live: !!live && !live.exited, ...parsed };
+  return { sessionId, live: !!live && !live.exited, ...t };
 }
 
 // Deliver a message INTO a chat — the write half of agent-to-agent dialog.
@@ -153,6 +163,54 @@ export async function readTranscript(sessionId, after = 0) {
 // keystroke. Correctness (no interleaving, no double-spawn) comes from the
 // per-session delivery chain below, not from this number.
 const PASTE_SETTLE_MS = 300;
+
+// Does this issue OWN this chat? The one definition of membership, because every
+// act that writes through an issue on a chat's behalf — delivering a message,
+// rebuilding the chat's workspace — has to ask the same question, or one of them
+// becomes a way around the other.
+//
+// conversations[] entries carry an agent prefix (formatHandle), so the match is
+// on the PARSED session id, not the raw entry: a codex chat (`codex:<uuid>`) is
+// addressable by its bare uuid exactly like a claude one.
+function linkedTo(row, sessionId) {
+  return Array.isArray(row?.conversations)
+    && row.conversations.some(h => parseHandle(h).sessionId === sessionId);
+}
+
+async function chatLinkedTo(issueId, sessionId) {
+  try {
+    const { get } = await import('./issues-store.mjs');
+    return linkedTo(await get(issueId), sessionId);
+  } catch { return false; }
+}
+
+// WHICH issues claim a workspace folder — the ones whose id IS that folder, or
+// whose recorded branches include it. EVERY claimant, not the first: a branch is
+// often linked to a long-lived umbrella issue as well as the attempt on it (the
+// same reason worktreeVerdicts counts them all), and first-match would refuse a
+// legitimate card because someone else's row happened to sort earlier.
+//
+// Asked of the whole board, because "does anyone else own this directory" is
+// exactly the question one row cannot answer. A board we cannot read is a claim
+// we cannot disprove, so a failure is reported, never softened into "unclaimed".
+// ensureWorktree's typed refusals → HTTP. One table, so a new reason is a line
+// here rather than a condition somewhere in the handler; anything unmapped is
+// ours to answer for (500).
+const WORKTREE_STATUS = {
+  'ambiguous-branch': 409,   // which branch this workspace held is not recorded
+  'branch-checked-out': 409, // another worktree holds it; close that one
+  'board-unreadable': 503,   // we could not ask, so we did not guess
+};
+
+async function workspaceClaimants(workspace) {
+  try {
+    const { listAll } = await import('./issues-store.mjs');
+    const rows = await listAll();
+    return { ids: rows.filter(r => r.id === workspace || (r.branches || []).includes(workspace)).map(r => r.id) };
+  } catch (e) {
+    return { error: `could not read the board to see who owns "${workspace}": ${e.message}` };
+  }
+}
 
 // In-flight delivery chains, per session. Delivery serializes ROUTE SELECTION
 // and the write together: without this, two concurrent sends to a dead chat
@@ -175,12 +233,7 @@ export async function deliverMessage({ issueId, sessionId, text }) {
     row = await get(issueId);
   } catch (e) { return { ok: false, status: 500, error: `issue lookup failed: ${e.message}` }; }
   if (!row) return { ok: false, status: 404, error: `no such issue "${issueId}"` };
-  // conversations[] entries carry an agent prefix (formatHandle) — match on the
-  // parsed session id, not the raw entry, so a codex chat (`codex:<uuid>`) is
-  // addressable by its bare uuid exactly like a claude one.
-  const linked = Array.isArray(row.conversations)
-    && row.conversations.some(h => parseHandle(h).sessionId === sessionId);
-  if (!linked) return { ok: false, status: 404, error: `session not linked to issue "${issueId}"` };
+  if (!linkedTo(row, sessionId)) return { ok: false, status: 404, error: `session not linked to issue "${issueId}"` };
 
   const tail = deliveries.get(sessionId) || Promise.resolve();
   const run = tail.then(() => routeAndDeliver({ issueId, sessionId, text }));
@@ -209,14 +262,25 @@ async function routeAndDeliver({ issueId, sessionId, text }) {
   }
 
   const r = await resolveChat(sessionId);
+  // A dormant chat whose workspace was collected is not undeliverable forever —
+  // it is one deliberate act away. Delivery is not that act (a sender wants to
+  // TALK to a chat, not spend seconds of git rebuilding a checkout on its
+  // behalf), so this names the door rather than opening it.
+  if (r.restorable) {
+    return { ok: false, status: 409, reason: 'cwd-gone', error: 'that chat\'s dev environment was collected — reopen it from its card ("Create dev env & reopen chat") and send again' };
+  }
   if (!r.resumable) return { ok: false, status: 409, error: `chat not deliverable (${r.reason})` };
-  // An agent already running on this session ANYWHERE on this machine — most
-  // often inside ANOTHER dev server's PTY map, invisible to ours — makes a
+  // An agent already running on this session ANYWHERE on this machine makes a
   // resume-spawn a FORK: two processes appending to one transcript. Refuse and
-  // name the condition; the sender must route through the owning server. (The
-  // single-broker redesign that removes this class entirely is i-chat-collision.)
+  // name the condition.
+  //
+  // Card-open RECLAIMS such a process instead (reclaimSession): opening a card
+  // is a request for that chat to live HERE, and a refusal leaves a dead pane
+  // nothing but a hand-run `kill` can fix. A message is not that request — the
+  // sender wants to TALK to the chat, not take it over — so delivery stays a
+  // refusal the sender can act on, and no send can cost someone a running agent.
   if (await sessionProcessAlive(sessionId)) {
-    return { ok: false, status: 409, error: 'session is live in another server process — send via the server that owns it' };
+    return { ok: false, status: 409, error: 'session is live in an agent process this server does not own — send via the server that owns it, or wait for it to exit' };
   }
   const cursor = (await readTranscript(sessionId))?.cursor ?? 0;
   // Resume under the agent whose store the transcript was found in — a claude
@@ -226,31 +290,26 @@ async function routeAndDeliver({ issueId, sessionId, text }) {
 }
 
 // --- Git sync (the board's GitHub-Desktop-style sync button) ---
-// All sync git runs against the MAIN checkout (never a worktree) — the board
-// represents main, and the primary checkout always sits on it. LAB_MAIN_REPO
-// (set by tests) already redirects MAIN_REPO at module load, so these hit the
-// hermetic scratch repo under test.
-function gitMain(args) {
-  return run('git', ['-C', MAIN_REPO, ...args]);
-}
+// LAB_MAIN_REPO (set by tests) already redirects MAIN_REPO at module load, so
+// these hit the hermetic scratch repo under test.
 
-// The most-recently-spawned live main-chat PTY, or null. Main chats are uuid-
-// keyed like any other now (no single MAIN_ENV key), so find the newest live
-// session whose env is main — that's the one the human is most likely looking at.
-function liveMainSession() {
+// The most-recently-spawned live PTY for an env, or null. Chats are uuid-keyed,
+// so find the newest live session belonging to that env — the one the human is
+// most likely looking at.
+function liveEnvSession(env) {
   let found = null;
   for (const s of chats.values()) {
-    if (liveSession(s) && s.issueId === MAIN_ENV) found = s; // last wins = newest
+    if (liveSession(s) && s.issueId === env) found = s; // last wins = newest
   }
   return found;
 }
 
-// Paste a message into the live main chat PTY, exactly like typed input (the
-// same bracketed-paste + Enter deliverMessage uses). No-op if no main chat has a
-// live process — the board still surfaces the conflict, so a dormant main chat
-// never blocks a sync. Returns whether it landed.
-async function deliverToMainChat(text) {
-  const session = liveMainSession();
+// Paste a message into an env's live chat PTY, exactly like typed input (the
+// same bracketed-paste + Enter deliverMessage uses). No-op if that env has no
+// live chat — the button still surfaces the conflict, so a dormant chat never
+// blocks a sync. Returns whether it landed.
+async function deliverToEnvChat(env, text) {
+  const session = liveEnvSession(env);
   if (!session) return false;
   session.pty.write(`\x1b[200~${text}\x1b[201~`);
   await new Promise(r => setTimeout(r, PASTE_SETTLE_MS));
@@ -258,90 +317,193 @@ async function deliverToMainChat(text) {
   return true;
 }
 
-// main vs origin/main after a fetch: how many commits each is ahead of the
-// other, plus whether the tree is dirty. `rev-list --left-right --count
-// origin/main...HEAD` → [behind, ahead] (left = origin-only, right = HEAD-only).
-export async function gitSyncStatus({ fetch = true } = {}) {
-  if (fetch) await gitMain(['fetch', 'origin', '--quiet']);
-  const branch = (await gitMain(['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim();
-  const hasRemote = (await gitMain(['rev-parse', '--verify', '--quiet', 'origin/main'])).status === 0;
-  let ahead = 0, behind = 0;
-  if (hasRemote) {
-    const counts = (await gitMain(['rev-list', '--left-right', '--count', 'origin/main...HEAD'])).stdout.trim();
-    const m = counts.split(/\s+/).map(n => parseInt(n, 10) || 0);
-    behind = m[0] || 0; ahead = m[1] || 0;
-  }
-  const dirty = (await gitMain(['status', '--porcelain'])).stdout.trim().length > 0;
-  return { ok: true, branch, ahead, behind, dirty, hasRemote };
+// --- git sync, for ANY environment ---
+//
+// One mechanism, two places it surfaces. `main` syncs the primary checkout; an
+// ISSUE syncs its own worktree branch, so a teammate can push and pull the
+// branch for a card straight from the card. The board's button is this with
+// env='main' — it is not a separate path with its own bugs.
+//
+// Resolving an env to (working dir, branch) is the whole generalization: main is
+// the repo root on `main`, an issue is its worktree on whatever branch is
+// checked out there. Everything downstream — the ahead/behind count, the
+// fast-forward, the push — is branch-relative and identical for both.
+async function syncTargetFor(env) {
+  if (!env || env === MAIN_ENV) return { dir: MAIN_REPO, env: MAIN_ENV };
+  const dir = resolveWorktreeDir(env);
+  if (!dir) return { error: `no worktree for "${env}" on this machine` };
+  return { dir, env };
 }
 
-// One-click sync: fast-forward main to origin/main if behind, then push if
-// ahead. A divergence that can't fast-forward (or a push rejected because the
-// remote moved mid-sync) is NOT auto-resolved — it drops a note into the main
-// chat and reports { conflict:true } so the board flags it and the human (or the
-// main-chat agent) resolves it. Never touches a worktree; refuses if the primary
-// isn't on main.
-export async function gitSync() {
-  const st = await gitSyncStatus();
-  if (st.branch !== 'main') {
+// Run git in a specific working directory (main repo or a worktree).
+async function gitIn(dir, args) {
+  return run('git', ['-C', dir, ...args]);
+}
+
+// A branch vs its origin counterpart after a fetch: how many commits each is
+// ahead of the other, plus whether the tree is dirty. `rev-list --left-right
+// --count <upstream>...HEAD` → [behind, ahead] (left = remote-only, right =
+// local-only). `hasRemote` false means the branch has never been pushed — that
+// is a normal state for a fresh issue branch, and PUSHABLE, not an error.
+export async function gitSyncStatus({ fetch = true, env = MAIN_ENV } = {}) {
+  const target = await syncTargetFor(env);
+  if (target.error) return { ok: false, error: target.error, env };
+  const { dir } = target;
+  if (fetch) await gitIn(dir, ['fetch', 'origin', '--quiet']);
+  const branch = (await gitIn(dir, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim();
+  const remote = `origin/${branch}`;
+  const hasRemote = (await gitIn(dir, ['rev-parse', '--verify', '--quiet', remote])).status === 0;
+  let ahead = 0, behind = 0;
+  if (hasRemote) {
+    const counts = (await gitIn(dir, ['rev-list', '--left-right', '--count', `${remote}...HEAD`])).stdout.trim();
+    const m = counts.split(/\s+/).map(n => parseInt(n, 10) || 0);
+    behind = m[0] || 0; ahead = m[1] || 0;
+  } else {
+    // Never pushed: everything this branch has past main is what a push would
+    // publish, so the button can honestly offer "push" rather than reading as
+    // in-sync with a remote that doesn't exist.
+    const base = (await gitIn(dir, ['rev-parse', '--verify', '--quiet', 'main'])).status === 0 ? 'main' : null;
+    if (base) ahead = parseInt((await gitIn(dir, ['rev-list', '--count', `${base}..HEAD`])).stdout.trim(), 10) || 0;
+  }
+  const dirty = (await gitIn(dir, ['status', '--porcelain'])).stdout.trim().length > 0;
+  return { ok: true, env, branch, ahead, behind, dirty, hasRemote, publishable: !hasRemote && ahead > 0 };
+}
+
+// One-click sync: fast-forward the branch to its origin counterpart if behind,
+// then push if ahead. A divergence that can't fast-forward (or a push rejected
+// because the remote moved mid-sync) is NOT auto-resolved — it drops a note into
+// the env's chat and reports { conflict:true } so the button flags it and the
+// human (or the agent in that chat) resolves it.
+//
+// The main env additionally refuses when the primary checkout isn't on main:
+// there, "the branch" is whatever someone left checked out, and syncing it under
+// the label "sync main" would be a lie. An issue has no such ambiguity — its
+// worktree is on its own branch by construction.
+export async function gitSync({ env = MAIN_ENV } = {}) {
+  const target = await syncTargetFor(env);
+  if (target.error) return { ok: false, conflict: false, error: target.error, env };
+  const { dir } = target;
+  const st = await gitSyncStatus({ env });
+  if (!st.ok) return st;
+  if (env === MAIN_ENV && st.branch !== 'main') {
     return { ...st, ok: false, conflict: false, error: `primary checkout is on '${st.branch}', not main` };
   }
-  if (!st.hasRemote) return { ...st, ok: false, conflict: false, error: 'no origin/main to sync against' };
+  const remote = `origin/${st.branch}`;
 
   let pulled = 0, pushed = 0;
   if (st.behind > 0) {
-    const pull = await gitMain(['merge', '--ff-only', 'origin/main']);
+    const pull = await gitIn(dir, ['merge', '--ff-only', remote]);
     if (pull.status !== 0) {
-      const msg = `⚠️ Git sync couldn't fast-forward: main and origin/main have diverged (${st.ahead} ahead, ${st.behind} behind). Pull origin/main, resolve the conflicts, and push — then the board's sync will be clean again.`;
-      const delivered = await deliverToMainChat(msg);
+      const msg = `⚠️ Git sync couldn't fast-forward: ${st.branch} and ${remote} have diverged (${st.ahead} ahead, ${st.behind} behind). Pull ${remote}, resolve the conflicts, and push — then the board's sync will be clean again.`;
+      const delivered = await deliverToEnvChat(env, msg);
       return { ...st, ok: false, conflict: true, delivered, pulled, pushed };
     }
     pulled = st.behind;
   }
 
-  const mid = await gitSyncStatus({ fetch: false });
+  const mid = await gitSyncStatus({ fetch: false, env });
   if (mid.ahead > 0) {
-    const push = await gitMain(['push', 'origin', 'main']);
+    // -u on a branch with no upstream yet: publishing an issue branch for the
+    // first time is the common case here, and it must set tracking so the next
+    // sync has a remote to compare against.
+    const args = mid.hasRemote ? ['push', 'origin', mid.branch] : ['push', '-u', 'origin', mid.branch];
+    const push = await gitIn(dir, args);
     if (push.status !== 0) {
       // A push rejected here means origin moved between our fetch and push — a
       // race, not a merge conflict. Surface it the same way: note + report.
-      const msg = `⚠️ Git sync push was rejected — origin/main moved. Pull, resolve if needed, and push again.`;
-      const delivered = await deliverToMainChat(msg);
+      const msg = `⚠️ Git sync push was rejected — ${remote} moved. Pull, resolve if needed, and push again.`;
+      const delivered = await deliverToEnvChat(env, msg);
       return { ...mid, ok: false, conflict: true, delivered, pulled, pushed, error: push.stderr.trim() };
     }
     pushed = mid.ahead;
   }
 
-  const final = await gitSyncStatus({ fetch: false });
+  const final = await gitSyncStatus({ fetch: false, env });
   return { ...final, ok: true, pulled, pushed };
 }
 
-// Is an agent process for this session running anywhere on this machine? The
-// session uuid appears in the CLI's argv (claude: `--session-id <uuid>` /
-// `--resume <uuid>`; codex: `resume <uuid>`), so a process-table match on those
-// exact patterns is a deterministic identity check — not a name heuristic.
-// Excludes bystanders whose argv merely mentions the uuid (activity-monitor
-// hooks, greps). The pattern is the UNION across agents (liveArgvPatternAny) so
-// one check covers whichever CLI owns the session.
+// Is an agent process for this session running anywhere on this machine? Each
+// agent proves it its own way (agents.mjs sessionPids — argv for claude, argv
+// plus the rollout's writer lock for codex); this is the union.
+// FAIL CLOSED: a probe that could not run at all reads as alive, so an
+// unanswerable question refuses the resume rather than risking a forked
+// transcript.
 export async function sessionProcessAlive(sessionId) {
-  // '--' ends pgrep's own option parsing — the pattern starts with a dash.
-  const r = await run('pgrep', ['-f', '--', liveArgvPatternAny(sessionId)]);
-  // FAIL CLOSED: pgrep exits 0 on match, 1 on no-match; anything else (or a
-  // spawn error) means we could not verify — treat as alive and refuse the
-  // resume rather than risk forking a session we couldn't see.
-  if (r.error || (r.status !== 0 && r.status !== 1)) return true;
-  return r.status === 0;
+  const { pids, uncertain } = await sessionPidsAny(sessionId);
+  return uncertain || pids.length > 0;
 }
+
+// Is this session free for this supervisor to resume — and if a process it does
+// not own is holding it, RECLAIM it: end the verified holder(s) and confirm.
+// True also when nothing held it, which is the ordinary case.
+//
+// This is boot reconciliation's rule — "child provably ALIVE → terminate the
+// verified child, await its death, then RESUME" — applied at the OTHER place a
+// chat comes back to life. Card-open used to refuse instead, and the asymmetry
+// was the bug: a chat whose supervisor died leaving no journal record to act on
+// dead-ended forever (nothing would ever clear the holder), and for codex the
+// refusal never even fired — a fresh codex carries no id in its argv, so the
+// cold resume went ahead and codex answered `already has an active writer
+// (-32600)` (i-codex-resume-collision).
+//
+// Two things are never reclaimed. A session we could not PROVE is held stays
+// fail-closed — we do not kill on a guess. And a session this environment does
+// not LIST is not ours to end: the link (an issue's conversations[], main's
+// local list) is the dash's ownership record, so it is what separates
+// reclaiming our own chat from killing a stranger's process.
+export async function reclaimSession(env, sessionId) {
+  const held = await sessionPidsAny(sessionId);
+  if (held.uncertain) return false;
+  // A PTY this supervisor is hosting is not stranded — and between a caller's
+  // "not in my map" read and this probe, a concurrent attach may have spawned
+  // exactly that. Killing it would be the reclaim eating its own chats; the
+  // spawn downstream is idempotent on the map, so leaving it alone lands on the
+  // live session instead.
+  const hosted = ownPtyPids();
+  const stranded = held.pids.filter((pid) => !hosted.has(pid));
+  if (!stranded.length) return true;
+  // Identity is stamped HERE, next to the detection that named these pids —
+  // not later, next to the kill. terminateVerified re-checks it immediately
+  // before signalling, so a holder that exits while we look up the link cannot
+  // hand its pid to a bystander we then kill.
+  //
+  // A holder whose start time we cannot READ has no identity to re-check, and a
+  // kill we cannot verify is exactly what this function must not do: refuse the
+  // whole reclaim. (Elsewhere a null start time is fine — abortSpawnedChild is
+  // ending a child THIS process spawned and holds the handle to. Only here is
+  // the target a process we merely found.)
+  const holders = await Promise.all(stranded.map(async (pid) => ({ pid, startTime: await pidStartTime(pid) })));
+  if (holders.some((h) => !h.startTime)) return false;
+  const handles = await chatHandlesFor(env);
+  if (!handles.some((h) => parseHandle(h).sessionId === sessionId)) return false;
+  for (const { pid, startTime } of holders) {
+    // Each proven death IS the proof the session is free — re-probing after the
+    // loop would only add a second way for a loaded machine to fail to answer.
+    if (!(await terminateVerified(pid, startTime))) return false;
+    console.log(`[dash-terminal] reclaimed ${sessionId.slice(0, 8)} from stranded process ${pid}`);
+  }
+  return true;
+}
+
+// The pids of the PTYs this supervisor is currently hosting — its in-process
+// ownership record, and the one thing that separates a chat of ours from a
+// process nobody owns.
+const ownPtyPids = () => new Set([...chats.values()]
+  .filter((s) => liveSession(s) && Number.isInteger(s.pty?.pid))
+  .map((s) => s.pty.pid));
 
 // The tracked chat handles for an environment. An issue reads its shared
 // Supabase conversations[]; MAIN reads the machine-local main-chats store. Both
 // return the same agent-prefixed handle format (formatHandle), so every caller
 // downstream treats an issue and main identically.
-async function chatHandlesFor(env) {
+// `row` lets a caller that already holds the env's snapshot pass it in (issueChats
+// reads the row ONCE and derives handles, meta, and branch resolution from it);
+// omit it and the row is fetched. `undefined` means "not passed" — a passed `null`
+// (a failed snapshot) is honored as an empty list, not re-fetched.
+async function chatHandlesFor(env, row) {
   if (env === MAIN_ENV) return mainChatsList();
-  const { get } = await import('./issues-store.mjs');
-  const row = await get(env).catch(() => null);
-  return Array.isArray(row?.conversations) ? row.conversations : [];
+  const r = row !== undefined ? row : await (await import('./issues-store.mjs')).get(env).catch(() => null);
+  return Array.isArray(r?.conversations) ? r.conversations : [];
 }
 
 // Link a chat to an environment, encoding its agent AND role in the handle (bare
@@ -351,26 +513,70 @@ async function chatHandlesFor(env) {
 // de-dupe).
 async function linkChat(env, sessionId, agent = DEFAULT_AGENT, role = null) {
   const handle = formatHandle(agent, sessionId, role);
-  if (env === MAIN_ENV) return linkMainChat(handle);
-  const { appendToArray } = await import('./issues-store.mjs');
-  return appendToArray(env, 'conversations', [handle]);
+  // Register the chat's existence in the shared corpus the moment it is born,
+  // so every open board — the owner's and every teammate's — lists it via
+  // realtime immediately instead of after the next mirror sweep. Fire-and-
+  // forget: a corpus hiccup must never cost the chat itself, and the sweep
+  // registers whatever this misses.
+  const register = async () => {
+    const { registerChat } = await import('./chat-mirror.mjs');
+    const { operatorEmail, machineName } = await import('./operator.mjs');
+    await registerChat({ sessionId, env, agent, owner: await operatorEmail(), host: machineName() });
+  };
+  if (env === MAIN_ENV) {
+    // Main's chats are numbered by the same rule as an issue's, out of the
+    // machine-local store that stands in for the row — and by the same one call,
+    // so a listed chat always has a number.
+    const r = linkMainChat(handle);
+    register().catch(() => {});
+    return r;
+  }
+  // The facts this chat is BORN with — its number in the env, and whose computer
+  // it lives on — go down WITH the link, in one write. The issue row already
+  // recorded WHICH chats exist; without these it could say neither whose nor
+  // which one this is, so a teammate's chat showed up as an unexplained dead
+  // entry and every chat's number was re-counted off whatever order the list
+  // happened to be in. Both are properties of the CHAT, not of the pane rendering
+  // it, which is why they are stored rather than inferred from whoever is looking.
+  //
+  // Resolving WHO is best-effort and happens first: a git/hostname hiccup must
+  // degrade to "no owner shown", which is honest, and must never cost the chat
+  // its link — or, now that the two are one write, its number.
+  let origin = {};
+  try {
+    const { operatorEmail, machineName } = await import('./operator.mjs');
+    origin = { owner: await operatorEmail(), host: machineName() };
+  } catch (e) {
+    console.error(`[dash-terminal] could not resolve the owner of chat ${sessionId}:`, e.message);
+  }
+  const { addChat } = await import('./issues-store.mjs');
+  const r = await addChat(env, handle, sessionId, origin);
+  if (!r?.error) register().catch(() => {});
+  return r;
 }
 
-// The custom display names for an environment's chats, sessionId → name. Same
-// env split as chatHandlesFor: an issue's names live on the shared row
-// (chat_names), MAIN's in the machine-local store. {} = every chat falls back to
-// its derived default. Keyed by the FULL session uuid, never the 8-char display
-// prefix, so the key is an identity rather than a truncation.
-async function chatNamesFor(env) {
-  if (env === MAIN_ENV) return mainChatNames();
-  const { get, readChatNames } = await import('./issues-store.mjs');
-  const row = await get(env).catch(() => null);
-  return readChatNames(row);
+// Everything an environment's ROW knows about its chats, sessionId →
+// { name?, ordinal?, owner?, host? }. Same env split as chatHandlesFor: an
+// issue's meta lives on the shared row (chat_meta), MAIN's in the machine-local
+// store. {} = nothing recorded. Keyed by the FULL session uuid, never the 8-char
+// display prefix, so the key is an identity rather than a truncation.
+//
+// ONE read for name, number AND ownership: the list needs all of them on every
+// build, and separate reads would be separate round-trips and chances to
+// disagree.
+async function chatMetaFor(env, row) {
+  // Every main chat runs in THIS repo root, so its owner is by definition the
+  // person at this machine — there is no cross-machine case to record, and the
+  // machine-local store carries the same { name, ordinal } entries as the row.
+  if (env === MAIN_ENV) return mainChatMeta();
+  const { get, readChatMeta } = await import('./issues-store.mjs');
+  const r = row !== undefined ? row : await get(env).catch(() => null);
+  return readChatMeta(r);
 }
 
 // Name (or un-name) one chat within an environment — the twin of linkChat, and
 // the ONLY write path for a chat name (HTTP, CLI and UI all land here or on the
-// store function it calls). A blank name clears back to the derived default.
+// store function it calls). A blank name clears back to the chat's number.
 // Resolves to { ok, names } with the whole updated map, so a caller repaints
 // without a second read.
 async function setChatName(env, sessionId, name) {
@@ -378,10 +584,23 @@ async function setChatName(env, sessionId, name) {
   if (env === MAIN_ENV) return setMainChatName(sessionId, name);
   const { setChatName: setRowChatName } = await import('./issues-store.mjs');
   const r = await setRowChatName(env, sessionId, name);
-  return r.error ? r : { ok: true, names: r.chat_names };
+  if (r.error) return r;
+  const names = {};
+  for (const [sid, m] of Object.entries(r.chat_meta || {})) if (m.name) names[sid] = m.name;
+  return { ok: true, names };
 }
 
-// Drop the dash API's memoized issue list after a chat write. Both `chat_names`
+// Forget everything the env's row knows about a chat — used when the chat is
+// UNLINKED. The metadata belongs to the LINK, not the transcript: name, number
+// and the ownership stamp go together, so an unlinked-then-relinked chat starts
+// clean and the map can't accumulate entries for chats the env no longer has.
+async function forgetChatMeta(env, sessionId) {
+  if (env === MAIN_ENV) return forgetMainChatMeta(sessionId);
+  const { clearChatMeta } = await import('./issues-store.mjs');
+  return clearChatMeta(env, sessionId);
+}
+
+// Drop the dash API's memoized issue list after a chat write. Both `chat_meta`
 // and `conversations` ride in the board's LIST_COLS, so a chat rename or unlink
 // makes that cached feed stale for the rest of its TTL. Lazy import: dash-api is
 // already loaded in this process (vite mounts both), so it's a cache hit, and
@@ -433,64 +652,6 @@ async function issueExists(issueId) {
   } catch { return true; }
 }
 
-// --- worktree lifecycle ---
-
-function hasWorktree(issueId) {
-  const dir = worktreeDir(issueId);
-  try { return fs.statSync(dir).isDirectory(); } catch { return false; }
-}
-
-async function branchExists(issueId) {
-  return (await git(['show-ref', '--verify', '--quiet', `refs/heads/${issueId}`])).ok;
-}
-
-// Create the issue's worktree if absent, reusing whatever already exists:
-//   - dir present                 → reuse (no-op)
-//   - branch present, no worktree  → `git worktree add <dir> <issueId>`
-//   - neither                      → `git worktree add <dir> -b <issueId>` off main
-// After creating a NEW branch we make an initial empty commit so the branch tip
-// DIVERGES from main. Without it, a fresh branch's tip == main's tip, which reads
-// as "already merged" — so /merge's `git branch -d` would happily delete a branch
-// that never landed any work. The empty commit is the day-one guard that keeps a
-// brand-new issue worktree distinct from main.
-export async function ensureWorktree(issueId) {
-  const dir = worktreeDir(issueId);
-  if (hasWorktree(issueId)) return { ok: true, dir, created: false };
-
-  await fs.promises.mkdir(path.dirname(dir), { recursive: true });
-
-  let res;
-  let madeNewBranch = false;
-  if (await branchExists(issueId)) {
-    res = await git(['worktree', 'add', dir, issueId]);
-  } else {
-    // Branch from local main/master, falling back to the origin refs.
-    let base = 'HEAD';
-    for (const ref of ['main', 'master', 'origin/main', 'origin/master']) {
-      if ((await git(['rev-parse', '--verify', '--quiet', ref])).ok) { base = ref; break; }
-    }
-    res = await git(['worktree', 'add', dir, '-b', issueId, base]);
-    madeNewBranch = res.ok;
-  }
-
-  if (!res.ok) {
-    // Don't leave a half-made worktree: prune any registration git may have
-    // recorded before failing, and remove a stray dir.
-    await git(['worktree', 'prune']);
-    try { if (hasWorktree(issueId)) await fs.promises.rm(dir, { recursive: true, force: true }); } catch {}
-    return { ok: false, error: res.err || 'git worktree add failed' };
-  }
-
-  if (madeNewBranch) {
-    const c = await run('git', ['-C', dir, 'commit', '--allow-empty', '-m', `wip: open issue ${issueId}`]);
-    if (c.status !== 0) {
-      return { ok: false, error: `worktree created but initial commit failed: ${c.stderr.trim()}` };
-    }
-  }
-
-  return { ok: true, dir, created: true };
-}
-
 // --- per-issue dev server (lazy-start) ---
 //
 // Each issue's worktree has a STABLE dev-server port reserved at worktree-
@@ -520,23 +681,37 @@ function portInUse(port) {
 }
 
 // Spawn the detached, long-lived dev-server child bound to the worktree. Real
-// runs get `npx vite --port <port> --strictPort`; the test suite swaps in a
+// runs get `pnpm exec vite --port <port> --strictPort`; the test suite swaps in a
 // deterministic stand-in via LAB_DEV_SERVER_CMD (the same trick LAB_TERMINAL_CMD
 // plays for the claude PTY) — run through `sh -c` with PORT in the env so the
 // stand-in needs no vite-specific argv. Detached + unref so it survives this
 // request and never blocks the event loop.
 function spawnDevServer(dir, port) {
   const cmd = process.env.LAB_DEV_SERVER_CMD;
-  return cmd
-    ? spawn('sh', ['-c', cmd], { cwd: dir, detached: true, stdio: 'ignore', env: { ...process.env, PORT: String(port) } })
-    : spawn('npx', ['vite', '--port', String(port), '--strictPort'], { cwd: dir, detached: true, stdio: 'ignore', env: { ...process.env } });
+  if (cmd) {
+    return spawn('sh', ['-c', cmd], { cwd: dir, detached: true, stdio: 'ignore', env: { ...process.env, PORT: String(port) } });
+  }
+  // The canonical launcher: the worktree is served through MAIN's host config
+  // and MAIN's vite binary (absolute paths — the old `pnpm exec vite` only
+  // resolved through a pnpm-run PATH the supervisor doesn't carry), so a
+  // historical checkout's own vite.config.js — possibly still carrying the old
+  // in-process control plane — never registers. The worktree's branch-owned
+  // app-dev module (dev/app-server.mjs) is composed by the host config.
+  const hostConfig = path.join(MAIN_REPO, 'vite.host.config.js');
+  const viteBin = resolveViteBin(MAIN_REPO);
+  // No --host here: WHERE it listens is DASH_BIND_HOST, read by the host config
+  // itself (vite.host.config.js) alongside allowedHosts, so the edge and every
+  // worktree server answer to one setting in one place.
+  return spawn(viteBin, ['--config', hostConfig, '--port', String(port), '--strictPort'],
+    { cwd: dir, detached: true, stdio: 'ignore', env: { ...process.env } });
 }
 
 // Ensure a vite dev server is running on `port` with cwd = the issue's worktree.
 // Reuses one we already spawned (live child) or any server already answering on
 // the port (e.g. survived a Dash-server restart). Otherwise spawns a detached,
-// long-lived child bound to the worktree. /merge (and /reject) SIGTERM it when
-// they tear the worktree down.
+// long-lived child bound to the worktree. Nothing kills it at merge time any
+// more: the reaper collects it with the rest of the workspace once the issue has
+// retired AND every chat in that worktree has gone quiet (worktree-reaper.mjs).
 export async function ensureDevServer(issueId, port) {
   const dir = worktreeDir(issueId);
   const tracked = devServers.get(issueId);
@@ -551,6 +726,14 @@ export async function ensureDevServer(issueId, port) {
   let proc;
   try {
     proc = spawnDevServer(dir, port);
+  } catch (e) {
+    return { ok: false, error: `spawn dev server failed: ${e.message}` };
+  }
+  try {
+    await new Promise((resolve, reject) => {
+      proc.once('spawn', resolve);
+      proc.once('error', reject);
+    });
   } catch (e) {
     return { ok: false, error: `spawn dev server failed: ${e.message}` };
   }
@@ -622,6 +805,39 @@ export async function restartDevServer(issueId, port) {
     : { ok: false, port, error: 'dev server did not answer after restart' };
 }
 
+// What has actually landed on an issue's branch, DERIVED from the branch rather
+// than stored. There used to be a `commits` column appended by hand, which meant
+// it was right only on the runs where someone remembered — and nothing rendered
+// it, so it was write-only besides. Reading it from git instead cannot drift.
+//
+// Deliberately NOT part of the board list: this is one git call, and doing it
+// per card on every board render is the repository scan that used to freeze the
+// dash terminal. It is fetched by the OPEN issue only, on demand.
+//
+// The states are distinct on purpose — "no branch", "branch not on this
+// machine", and "branch with nothing past main" are three different facts, and
+// collapsing them into an empty list would report unseen work as no work.
+export async function issueCommits(issueId) {
+  const { get } = await import('./issues-store.mjs');
+  const row = await get(issueId).catch(() => null);
+  if (!row) return { state: 'unknown-issue', commits: [] };
+  const branch = Array.isArray(row.branches) ? row.branches.find(Boolean) : null;
+  if (!branch) return { state: 'no-branch', branch: null, commits: [] };
+  if (!(await branchExists(branch))) return { state: 'branch-absent', branch, commits: [] };
+
+  // Commits on the branch that aren't on main — the work this issue added. A
+  // repo with no main to compare against lists the branch's own recent history.
+  const base = (await git(['rev-parse', '--verify', '--quiet', 'main'])).ok ? 'main' : null;
+  const range = base ? `${base}..${branch}` : branch;
+  const r = await git(['log', range, '--no-merges', '--format=%H%x1f%h%x1f%s%x1f%aI', '--max-count=50']);
+  if (!r.ok) return { state: 'branch-absent', branch, commits: [] };
+  const commits = r.out.split('\n').filter(Boolean).map((line) => {
+    const [sha, short, subject, date] = line.split('\x1f');
+    return { sha, short, subject, date };
+  });
+  return { state: commits.length ? 'ok' : 'no-commits', branch, merged: !!base, commits };
+}
+
 // Poll until the dev server answers (or timeout). vite takes ~1-2s to bind on a
 // cold start; the open endpoint waits briefly so the redirect lands on a live
 // server instead of a connection-refused.
@@ -632,6 +848,47 @@ async function waitForPort(port, timeoutMs = 12000) {
     await new Promise(r => setTimeout(r, 200));
   }
   return false;
+}
+
+// Whether a linked chat can run on this machine, and where. A live PTY — in this
+// process OR in another dash server on this machine — answers without touching
+// disk; the attach path redirects to that owner, so reporting it resumable+live
+// is honest, and reporting it dormant would invite a duplicate cold resume.
+// Otherwise its transcript decides (resolveChat).
+//
+// The ONE reading of runnability: the env list renders it per chat, and the
+// main-thread invariant (ensureMainChat) decides on it. Two readings would be
+// two chances to disagree about whether a chat exists.
+//
+// `updated` — when the chat last SAID anything — is the switcher's whole sort
+// key, so it has to be true for a LIVE chat too. It used to be hard-coded 0 for
+// them ("it's writing now, it needs no timestamp") and the list compensated by
+// floating live chats above every timestamp, which is exactly how a chat left
+// open since yesterday outranked the one you spoke in a minute ago. A live chat
+// pays the same transcript resolve as any other; that costs one directory scan
+// (~3ms across 230 project dirs here) and there are at most a couple of live
+// chats per environment.
+//
+// A chat whose PTY is up but whose agent has not written a transcript line yet —
+// the first seconds of a freshly spawned one — has no mtime to read, so it falls
+// back to when its PTY started. That IS the last thing it did, and without it a
+// brand-new chat would sort to the bottom of the list that just made it.
+//
+// The fallback FILLS a gap; it does not compete. Taking the later of the two
+// would make merely RESUMING an old chat — which stamps a PTY start of "now" —
+// outrank the chat you actually spoke in, and a restart resumes every chat the
+// journal left behind at once, which would reshuffle the whole list by boot
+// order. A chat that has a transcript is judged on it, always; the resume writes
+// to that transcript within seconds anyway, and then it has earned the top spot.
+//
+// The supervisor holds every PTY in one process, so its live map is the whole
+// answer — there is no other server on this machine to ask.
+async function chatRunState(sessionId) {
+  const session = globalThis.__labChats?.get(sessionId);
+  const live = liveSession(session) ? session : null;
+  const { resumable, restorable, cwd, updated } = await resolveChat(sessionId);
+  if (!live) return { resumable, restorable, live: false, cwd, updated };
+  return { resumable: true, restorable: false, live: true, cwd: null, updated: updated || live.startedAt || 0 };
 }
 
 // Report an environment's workspace + chats for the client, reflecting its REAL
@@ -652,35 +909,73 @@ export async function issueChats(env) {
   // uuid is what the PTY map, registry and transcript stores key on, and `agent`
   // rides through to the client for the per-chat type badge. Handles come from
   // the shared issue row for an issue, or the machine-local store for MAIN.
-  const conversations = (await chatHandlesFor(env)).map(parseHandle);
-  // Custom names ride along with the list so the switcher renders its label from
-  // ONE response — no second fetch, and no window where the trigger shows the
-  // derived default before the name lands.
-  const names = await chatNamesFor(env);
+  const isMain = env === MAIN_ENV;
+  // ONE snapshot of the issue's shared row (null for MAIN, which reads its
+  // machine-local stores instead): the conversations list, the chat_meta, and the
+  // branch→issue resolution for derived Cursor chats all come off this single
+  // read. Three separate reads of the same row would be three round-trips and
+  // three chances to disagree.
+  const row = isMain ? null : await (await import('./issues-store.mjs')).get(env).catch(() => null);
+  const conversations = (await chatHandlesFor(env, row)).map(parseHandle);
+  // Names, numbers AND ownership ride along with the list so the switcher renders
+  // from ONE response — no second fetch, and no window where the trigger shows a
+  // chat's number before its name lands.
+  const meta = await chatMetaFor(env, row);
   // MAIN's workspace is the repo root — always present; an issue's is its
   // worktree dir (null until created).
-  const isMain = env === MAIN_ENV;
   const dir = isMain ? MAIN_REPO : resolveWorktreeDir(env);
   // Resolve conversations SEQUENTIALLY, not via Promise.all: board-load already
   // mounts in-progress issues a couple at a time, and each unresolved transcript
   // is a full transcript-store scan. Resolving an issue's convos one-by-one
   // keeps the in-flight scan count bounded by the issue throttle (≈2) rather than
   // 2 × convos-per-issue. A live PTY short-circuits the scan entirely.
-  const live = globalThis.__labChats;
   const chats = [];
   for (const { sessionId, agent, role } of conversations) {
-    const name = names[sessionId] || null; // null = show the derived default
-    const session = live?.get(sessionId);
-    if (liveSession(session)) { chats.push({ sessionId, agent, name, role, resumable: true, live: true, cwd: null }); continue; }
-    // Live in ANOTHER dash server on this machine counts as live too — the
-    // attach path redirects there, so reporting it resumable+live is honest,
-    // and reporting it dormant would invite the duplicate cold resume.
-    const owner = await liveChatOwner(sessionId);
-    if (owner && owner.pid !== process.pid) { chats.push({ sessionId, agent, name, role, resumable: true, live: true, cwd: null }); continue; }
-    const { resumable, cwd } = await resolveChat(sessionId);
-    chats.push({ sessionId, agent, name, role, resumable, live: false, cwd });
+    const m = meta[sessionId] || {};
+    // `name` null = the chat goes by its `ordinal` ("chat 2"), stamped when it
+    // was linked and never recomputed. `owner`/`host` say whose computer it was
+    // created on, so a chat that can't run here can still say who it belongs to
+    // instead of reading as broken.
+    const base = {
+      sessionId, agent, role,
+      name: m.name || null, ordinal: Number.isInteger(m.ordinal) ? m.ordinal : null,
+      owner: m.owner || null, host: m.host || null,
+    };
+    chats.push({ ...base, ...(await chatRunState(sessionId)) });
   }
-  return { worktree: !!dir, dir, chats };
+  // WHICH computer this is, so the client can tell "lives on someone else's
+  // machine" from "was created here but its transcript is gone" — two different
+  // sentences, and only the row's recorded host can separate them.
+  const { machineName } = await import('./operator.mjs');
+  const host = machineName();
+
+  // Chats nothing LINKED but that plainly belong here — a Cursor conversation,
+  // whose editor records the folder it ran in and nothing about issues. The
+  // folder places it, so these are derived rather than stored: no write to the
+  // shared row, no membership anyone has to curate, and unlinking one would be
+  // meaningless because it was never linked. They can never run here (Cursor is
+  // not a CLI), so they arrive read-only and stay that way.
+  //
+  // A folder resolves to its issue by id OR branch — a branch-named worktree's
+  // folder is its branch, not the issue id — so match through the SAME
+  // workspaceIssueMap the mirror uses, or those chats vanish from their own issue.
+  // Built from the single row snapshot above: we only ask whether a folder
+  // resolves to THIS env, and that env's own row carries every branch it could.
+  const issueOf = workspaceIssueMap(row ? [row] : []);
+  const linked = new Set(chats.map(c => c.sessionId));
+  for (const c of await discoverChatsAny()) {
+    if (linked.has(c.sessionId) || issueOf.get(workspaceForDir(c.dir)) !== env) continue;
+    // No `ordinal`: nothing linked these, so nothing ever numbered them. They go
+    // by the title their editor gave them, or by their handle — never by a
+    // position, which is the one thing a name must not be.
+    chats.push({
+      sessionId: c.sessionId, agent: c.agent, name: c.title || null, ordinal: null,
+      owner: null, host, role: null,
+      resumable: false, restorable: false, live: false, cwd: c.dir,
+      updated: c.updatedAt ? Date.parse(c.updatedAt) || 0 : 0,
+    });
+  }
+  return { worktree: !!dir, dir, chats, machine: host };
 }
 
 // The LIVE (non-exited) PTYs in this process as { issue, session } pairs — read
@@ -698,579 +993,224 @@ async function liveSessionChats() {
   if (live) for (const s of live.values()) {
     if (liveSession(s) && s.issueId && s.issueId !== MAIN_ENV) out.push({ issue: s.issueId, session: s.sessionId });
   }
-  // Merge chats hosted by OTHER live dash servers on this machine (the
-  // registry), as the same { issue, session } pairs — the board must see
-  // machine-wide liveness, or its auto-attach skips a chat that is very much
-  // running (on another dev server) and later cold-resumes a duplicate. The
-  // client re-resolves each pair's issue against the rows that link the session,
-  // exactly as it does for local pairs, so a foreign entry needs no special
-  // handling downstream. Dedupe by session so a chat that is somehow both local
-  // and registry-listed isn't emitted twice.
-  const seen = new Set(out.map((p) => p.session));
-  let files = [];
-  try { files = await fs.promises.readdir(registryDir()); } catch {}
-  for (const f of files) {
-    if (!f.endsWith('.json')) continue;
-    const owner = await liveChatOwner(f.slice(0, -5));
-    if (owner && owner.pid !== process.pid && owner.issueId && owner.issueId !== MAIN_ENV
-        && owner.sessionId && !seen.has(owner.sessionId)) {
-      seen.add(owner.sessionId);
-      out.push({ issue: owner.issueId, session: owner.sessionId });
-    }
-  }
+  // The supervisor is the only PTY host on this machine, so the in-memory map
+  // IS machine-wide liveness — the cross-server registry scan this used to do
+  // died with the multi-dash model.
   return out;
 }
 
 // --- live PTYs, keyed by SESSION ID ---
 
-// Each session: { pty, issueId, buffer:[], cols, rows, attached:Set<ws>,
-// geomOwner:ws|null, exited, shape }. Any number of sockets may attach (output
-// is broadcast); the PTY grid belongs to the socket that last asserted one
-// (sent a resize) — never to a socket merely for attaching.
-// Lives on globalThis so Vite HMR re-evaluating this module doesn't orphan
-// running PTYs (they'd leak / double-spawn).
+// Each session: { pty, issueId, journal, buffer:[], cols, rows,
+// attached:Set<ws>, geomOwner:ws|null, exited, shape }. Any number of sockets
+// may attach (output is broadcast); the PTY grid belongs to the socket that
+// last asserted one (sent a resize) — never to a socket merely for attaching.
+// On globalThis so the test host's fresh module imports share one map; the
+// supervisor itself never re-evaluates this module (no HMR), which is what
+// retired the old shape-stamp/retirement machinery.
 if (!globalThis.__labChats) globalThis.__labChats = new Map();
 const chats = globalThis.__labChats;
 
-// Because the map survives module re-evaluation, its entries may have been
-// created by a PREVIOUS VERSION of this module — session objects shaped for
-// contracts this version no longer honors. That is how the dash died twice on
-// 2026-07-09 (issue i-chat-attach-crash): post-multi-attach code called .add
-// on a pre-multi-attach survivor's `attached: null`. Every session therefore
-// carries this shape stamp — bump it whenever the session object's contract OR
-// its KEYING changes — and module evaluation retires survivors whose stamp
-// differs (see the retirement sweep by the shutdown path below). Exported for
-// tests. Bumped to 3 for the main-chat unification: main used to be keyed by the
-// MAIN_ENV sentinel and this version keys it by session uuid, so a live pre-
-// unification main singleton (a shape-2 survivor the new code can no longer
-// address) must be RETIRED on the HMR eval — leaving it would strand a --continue
-// process the uuid path can't see, double-resuming main.
-export const CHAT_SHAPE = 3; // 1: single-socket (unstamped); 2: multi-attach Set + geomOwner; 3: main uuid-keyed (retires the MAIN_ENV singleton)
-
-// A map entry this module version may reuse: live AND stamped by this version.
-// A foreign-shape survivor is never touched by live paths — it gets retired
-// and the chat cold-resumes from its transcript. Both predicates contain
-// their property reads: a foreign object's contract is unknown, so even a
-// throwing getter must classify it (as not-reusable / foreign) rather than
-// let the exception reach a caller with no frame — the module-eval sweep in
-// particular would abort the whole config load.
+// The session object's contract version — stamped so a TEST that plants a
+// malformed entry (or a future host that somehow double-evaluates) can never
+// hand live paths an object they don't understand: liveSession contains every
+// property read, so even a throwing getter classifies as not-reusable.
+export const CHAT_SHAPE = 3;
 const liveSession = (s) => {
   try { return !!s && !s.exited && s.shape === CHAT_SHAPE; } catch { return false; }
 };
-const foreignSession = (s) => {
-  try { return !!s && s.shape !== CHAT_SHAPE; } catch { return true; }
-};
 
-// --- machine-local live-chat registry ---
+// --- crash journal ---
 //
-// PTY liveness must be MACHINE-scoped, not process-scoped: transcripts live on
-// shared disk, so ANY dash dev server can `--resume` any session — without a
-// shared source of truth, two servers happily run the same chat twice and the
-// copies race each other (issue i-chat-collision). Each live PTY is recorded
-// as <registry>/<key>.json = { pid, port, issueId, sessionId, startedAt } —
-// key = the PTY map key (session uuid, or the `main` sentinel). Written as an
-// O_EXCL claim before the PTY spawns (claimChat), removed on PTY exit. An entry
-// is live iff its pid is alive (kill(pid, 0)); a dead pid is a crashed server's
-// leftover, which claimChat deliberately does NOT auto-reclaim (see its comment
-// for why that can't be race-free) — recovery is out-of-band, and the attach
-// path surfaces an honest stale-record error. The in-flight agent-chat write path
-// (deliverMessage) should consult liveChatOwner before its own resume-spawn when
-// it lands. LAB_CHAT_REGISTRY_DIR overrides the location so tests never touch the
-// real registry. Read lazily (not a module const) so test files with static
-// imports can still set the env first.
-function registryDir() {
-  return process.env.LAB_CHAT_REGISTRY_DIR || path.join(os.homedir(), '.claude', 'dash-live-chats');
-}
+// PTY liveness is PROCESS-scoped now: the supervisor is the only PTY host on
+// this machine, so the in-memory chats map is the whole liveness story while it
+// runs. What survives it is the crash journal (chat-journal.mjs): a provisional
+// record opened before each spawn, stamped with the child's verified identity
+// after, and durably cleared on natural exit. Boot reconciliation resumes what
+// a crash stranded and parks what it cannot prove — see reconcileChats below.
+// The old distributed claim/tomb registry (per-key O_EXCL claims, cross-server
+// redirects, lock-free reclaim) died with the multi-dash model that needed it.
 
-// The registry FILENAME for a chat map-key. A chat map-key is untrusted — the
-// session id rides in on a WebSocket query param — so it MUST be validated
-// before it can name a file, or `session=../foo` escapes the registry dir and
-// unlinks arbitrary `.json` files (path traversal). The only legal shape is a
-// uuid: every chat — issue AND main — is keyed by its session uuid, so there is
-// no sentinel key anymore. Any other shape returns null → every fs helper below
-// no-ops for it.
+// A chat map-key is untrusted — the session id rides in on a WebSocket query
+// param — so it is validated before it can key anything. The only legal shape
+// is a uuid: every chat — issue AND main — is keyed by its session uuid.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-function regPath(key) {
-  if (typeof key === 'string' && UUID_RE.test(key)) return path.join(registryDir(), `${key}.json`);
-  return null; // unsafe / unknown key — never touch the filesystem
-}
+const validKey = (key) => typeof key === 'string' && UUID_RE.test(key);
 
-// Atomic overwrite: write a temp file and rename it into place (rename is
-// atomic on a single filesystem). A concurrent reader therefore never observes
-// a half-written record it could mistake for corruption. The temp name carries
-// our pid so two processes writing the same key don't collide on the temp.
-function atomicWrite(p, data) {
-  const tmp = `${p}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, data);
-  try { fs.renameSync(tmp, p); } catch (e) { try { fs.unlinkSync(tmp); } catch {} throw e; }
-}
-
-function pidAlive(pid) {
-  // EPERM means the process EXISTS but isn't ours to signal — alive. Only
-  // ESRCH (and bad input) mean gone.
-  try { process.kill(pid, 0); } catch (e) { return e.code === 'EPERM'; }
-  // The pid exists — but a DEFUNCT (zombie) process is a dead process awaiting
-  // reaping by its parent: it holds no port and owns no chat. process.kill(0)
-  // can't see the difference (the pid lingers in the table), and `ps -o lstart`
-  // still reports its start time, so the recycled-pid guard passes too — which
-  // is exactly how a CRASHED dash server that was never reaped gets mistaken
-  // for a live owner, redirecting every chat it held to its since-rebound port
-  // forever. A zombie reads as GONE (deterministic OS signal: ps state 'Z').
-  return !pidIsZombie(pid);
-}
-
-// Is `pid` a DEFUNCT (zombie) process? Only meaningful for a pid that already
-// exists (callers gate on process.kill first). Fail-safe: a ps hiccup can't
-// disprove liveness, so an unreadable/failed probe is treated as NOT-zombie —
-// mis-reading a live owner as gone would authorize a duplicate agent.
-function pidIsZombie(pid) {
-  try {
-    const r = spawnSync('ps', ['-o', 'state=', '-p', String(pid)], { encoding: 'utf8' });
-    if (r.status !== 0) return false;
-    return (r.stdout || '').trim().toUpperCase().startsWith('Z');
-  } catch { return false; }
-}
-
-// A process's OS start time (`ps -o lstart`), the deterministic half of process
-// identity that survives pid reuse: a recycled pid names a DIFFERENT process
-// with a later start time. Comparing it defeats the "dead owner's pid got
-// reused by an unrelated live process" false-positive that pid-liveness alone
-// can't see. Async (per-action verify paths await it); null if ps fails.
-async function pidStartTime(pid) {
-  const r = await run('ps', ['-o', 'lstart=', '-p', String(pid)]);
-  return r.status === 0 ? r.stdout.trim() || null : null;
-}
-// Synchronous variant for the CLAIM path only: claimChat (and the staleness
-// checks it runs) must stay claim+spawn-in-a-single-tick — an await inside
-// would open the in-process double-claim window. Claims/reclaims are rare,
-// user-action-paced events; the board-poll paths use the async one above.
-function pidStartTimeSync(pid) {
-  try {
-    const r = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8' });
-    return r.status === 0 ? (r.stdout || '').trim() || null : null;
-  } catch { return null; }
-}
-// OUR OWN start time stays a cached synchronous one-shot: claimChat must run
-// claim+spawn in a single tick (an await inside it would open an in-process
-// double-claim window), and one ~20ms spawnSync once per process lifetime is
-// the deliberate cost of that atomicity.
-let _selfStart = undefined;
-function selfStartTime() {
-  if (_selfStart === undefined) _selfStart = pidStartTimeSync(process.pid);
-  return _selfStart;
-}
-
-// Is this registry record OUR OWN — by full identity, pid AND recorded start
-// time? Bare pid equality is not ownership: a dead server's pid can be
-// recycled into THIS very process, and treating its leftover as ours would
-// re-stamp/unlink a record whose stamped claude child may still be alive —
-// the exact double-resume the identity contract exists to prevent. Fail-safe
-// like processMatches: a record with NO startTime is accepted on pid alone.
-// That exception is deliberate, not an oversight — our own records carry
-// startTime: null whenever ps fails at stamp time, and refusing them would
-// strand our own claims (we could never re-stamp or release them). The cost:
-// a legacy no-startTime record whose dead owner's pid was recycled into this
-// process reads as ours — a triple coincidence (legacy record × pid recycled
-// × onto this exact process) accepted over stranding real claims on a ps
-// hiccup.
-function isOwnClaim(entry) {
-  return !!entry && entry.pid === process.pid
-    && (!entry.startTime || entry.startTime === selfStartTime());
-}
-
-// The HTTP port THIS server answers on — wired from vite once the http server
-// binds (setDashPort below). Registry entries carry it so another server can
-// redirect an attach to the owner. null until known.
-let dashPort = null;
-export function setDashPort(port) {
-  dashPort = port;
-  // A server coming up is the natural moment to sweep the whole registry for
-  // records stranded by stopped/crashed servers, so every card on the board is
-  // attachable again without waiting for its individual open.
-  sweepStaleClaims();
-  // Re-stamp entries claimed before the port was known (a spawn can precede
-  // the bind), so their redirect target isn't permanently null.
-  for (const [key, s] of chats) {
-    if (liveSession(s)) claimChat(key, s.issueId, s.sessionId);
+// Boot reconciliation — the supervisor calls this once, after its middlewares
+// are mounted. The journal's state machine classifies every record (see
+// chat-journal.mjs); this side only supplies HOW to resume one: the same
+// guards the human attach path uses, then a spawn with the restart note.
+export async function reconcileChats() {
+  const { resumed, blocked } = await reconcile({ resume: resumeJournalRecord });
+  if (resumed.length) console.log(`restored ${resumed.length} chat(s) the previous supervisor was running`);
+  for (const { rec, reason } of blocked) {
+    console.error(`[journal] BLOCKED ${rec.sessionId || rec.operationId}: ${reason} — not respawned; clear ${'journal.' + rec.operationId + '.json'} once resolved`);
   }
+  const legacy = await importLegacyChats();
+  return { resumed: resumed.length, blocked: blocked.length, legacy };
 }
 
-// The live owner of a chat key anywhere on this machine, or null. PURE — it
-// never deletes anything, so it can't race a concurrent claim by unlinking a
-// live entry it read as stale. `verify` enforces full process identity (pid
-// alive AND start time matches) to defeat pid reuse; it's set on the
-// redirect/claim decision paths and left off on the cheap board-poll reporting
-// paths, where a brief false-positive only shows a stale dot and never spawns.
-// An unsafe key → no path → nobody's.
-export async function liveChatOwner(key, { verify = false } = {}) {
-  const p = regPath(key);
-  if (!p) return null;
-  let entry = null;
-  try { entry = JSON.parse(await fs.promises.readFile(p, 'utf8')); } catch {}
-  // A `released` record is a graceful stop's parting note (owner relinquished,
-  // claude child possibly still dying) — nobody to redirect to.
-  if (!entry || entry.released === true || !Number.isInteger(entry.pid) || !pidAlive(entry.pid)) return null;
-  if (isOwnClaim(entry)) return entry; // ourselves (full identity) — no ps needed
-  if (verify && entry.startTime) {
-    // Defeat pid reuse — but FAIL SAFE: only a DEFINITIVE start-time mismatch
-    // (ps succeeded and disagrees) disowns the entry. A null (ps failed, e.g.
-    // transient under concurrent load) can't disprove ownership, so we keep the
-    // owner — mis-reading a live owner as gone would authorize a duplicate.
-    const st = await pidStartTime(entry.pid);
-    if (st !== null && st !== entry.startTime) return null; // recycled pid — different process
-  }
-  return entry;
-}
-
-// Does this pid name the SAME process the record described? Deterministic
-// process identity: alive, and (when the record carries one) the OS start time
-// agrees — a recycled pid names a different process with a later start time.
-// FAIL SAFE like liveChatOwner: a null start time (ps failed) can't disprove
-// identity, so the process is treated as matching.
-function processMatches(pid, startTime) {
-  if (!Number.isInteger(pid) || !pidAlive(pid)) return false;
-  if (startTime) {
-    // Self-pid compares against our cached start time — a recycled pid can
-    // land on THIS process too, and bare pid equality must never vouch for a
-    // record another process wrote.
-    const st = pid === process.pid ? selfStartTime() : pidStartTimeSync(pid); // claim-path check — must stay single-tick
-    if (st !== null && st !== startTime) return false;
-  }
-  return true;
-}
-
-// Is a well-formed registry entry a stranded leftover that can be reclaimed?
-// TWO processes must be provably gone, and both are checked by exact identity
-// (pid + start time):
-//   • the dash OWNER — dead/recycled pid, or it marked the record `released`
-//     on its way down (a graceful stop whose claude hadn't finished dying);
-//   • the claude CHILD the record stamped (ptyPid) — the process that actually
-//     holds the session. This is what keeps a dead dash's still-running claude
-//     from being double-resumed.
-// A record with a gone owner but a LIVE child is an orphan: not stale, never
-// reclaimed — the attach surfaces the child pid instead.
-//
-// A record with NO child stamped (owner died in the microseconds between the
-// pre-spawn claim and the post-spawn re-stamp) is reclaimable for an ISSUE
-// session — its cold RESUME is additionally pgrep-gated (sessionProcessAlive),
-// which catches any surviving child. Main records FAIL CLOSED (not reclaimed):
-// a main chat's identity is still the raw session uuid, which `/clear` can
-// mutate, and the `new`-spawn path is not pgrep-gated — so we keep the pre-
-// existing conservative margin (a rare manual-recovery sliver) rather than risk
-// reclaiming a still-live main thread. The durable fix is a stable chat id
-// decoupled from the mutable session uuid (a follow-up redesign).
-function claimIsStale(entry) {
-  const ownerGone = entry.released === true || !processMatches(entry.pid, entry.startTime);
-  if (!ownerGone) return false;
-  if (Number.isInteger(entry.ptyPid)) return !processMatches(entry.ptyPid, entry.ptyStartTime);
-  return entry.issueId !== MAIN_ENV;
-}
-
-// The live claude child of a key whose dash owner is gone, or null. Read-only;
-// feeds the attach path's honest "still running" message for orphaned chats.
-function claimOrphanPid(key) {
-  const p = regPath(key);
-  if (!p) return null;
-  let e = null;
-  try { e = JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
-  if (!e || !Number.isInteger(e.pid)) return null;
-  const ownerGone = e.released === true || !processMatches(e.pid, e.startTime);
-  if (ownerGone && Number.isInteger(e.ptyPid) && processMatches(e.ptyPid, e.ptyStartTime)) return e.ptyPid;
-  return null;
-}
-
-// Does this tomb hold a claim that is still LIVE (its processes not provably
-// gone)? Tomb semantics hang on the CONTENT, not the reclaimer: a live
-// displaced claim owns its key and must be preserved/restored; a stale (or
-// unreadable) one never needs restoring and is discardable by ANY process —
-// the owning reclaimer's reads and unlinks all tolerate ENOENT. Content-based
-// settling is what makes yielding livelock-free: claimants only ever stand
-// down while the displaced owner is genuinely alive, and the moment it exits
-// the tomb becomes garbage anyone clears.
-function tombHoldsLiveClaim(tombPath) {
-  let entry = null;
-  try { entry = JSON.parse(fs.readFileSync(tombPath, 'utf8')); } catch {}
-  return !!entry && Number.isInteger(entry.pid) && !claimIsStale(entry);
-}
-
-// Restore a displaced LIVE claim from its tomb into the base path. Retries on
-// EEXIST: a cooperative claimant that slipped into the path yields on its own
-// stand-down check within a beat, and a claim STRANDED there (its claimant
-// killed between wx-win and stand-down) is stale and safe to clear — while a
-// tomb exists, any new claim is contract-bound to yield, so this unlink can
-// only ever hit a stale or already-yielding claim. If the path stays occupied
-// by a live claim anyway (a pathological double-owner), the tomb is left for
-// a later settle rather than ever clobbering a live claim.
-function restoreFromTomb(tombPath, basePath) {
-  for (let i = 0; i < 20; i++) {
-    try { fs.linkSync(tombPath, basePath); fs.unlinkSync(tombPath); return; }
-    catch (e) {
-      if (e.code !== 'EEXIST') return; // tomb vanished (another settler finished) or real fs error — stop
-      let base = null;
-      try { base = JSON.parse(fs.readFileSync(basePath, 'utf8')); } catch {}
-      if (base && Number.isInteger(base.pid) && claimIsStale(base)) { try { fs.unlinkSync(basePath); } catch {} }
-      else spawnSync('sleep', ['0.05']);
+// One-shot migration from the pre-supervisor world, run as part of every boot
+// reconciliation — the first NEW boot on a machine imports whatever the old
+// per-dash registry left behind, and later boots find nothing (imported files
+// are deleted). Classification is the cutover contract: `finished` records and
+// unresumable strays are endings (deleted); a record whose stamped agent child
+// still runs is BLOCKED (kept + reported — the cutover stops the old fleet
+// first, so this is the rare straggler); the rest resume with the restart
+// note, exactly like journal records. Old lease files are inert to the new
+// world and swept unconditionally.
+async function importLegacyChats() {
+  const { resumable, finished, blocked } = await importLegacyRegistry();
+  let resumed = 0;
+  for (const { file, entry } of resumable) {
+    try {
+      const ok = await resumeJournalRecord({
+        sessionId: entry.sessionId, issueId: entry.issueId,
+        cols: entry.cols, rows: entry.rows,
+      });
+      if (ok) resumed += 1;
+    } catch (e) {
+      console.error(`[legacy] ${String(entry.sessionId).slice(0, 8)} not imported: ${e.message}`);
+      continue; // keep the file — evidence for the next boot
     }
+    try { fs.unlinkSync(path.join(registryDir(), file)); } catch {}
   }
-}
-
-// Settle a tomb encountered outside its owning reclaimer (sweep, stand-down).
-// Stale content → discard. Live content → restore if the reclaimer died
-// mid-operation; a live reclaimer is left to finish its own job. Returns true
-// iff a live displaced claim remains outstanding (the key belongs to it).
-function settleTomb(tombPath, basePath, reclaimerPid) {
-  if (!tombHoldsLiveClaim(tombPath)) {
-    try { fs.unlinkSync(tombPath); } catch {}
-    return false;
+  for (const { file } of finished) {
+    try { fs.unlinkSync(path.join(registryDir(), file)); } catch {}
   }
-  if (!pidAlive(reclaimerPid)) restoreFromTomb(tombPath, basePath);
-  return tombHoldsLiveClaim(tombPath) || fs.existsSync(basePath);
-}
-
-// Complete OUR reclaim whose claim file has already been renamed to `tomb`:
-// re-verify the displaced entry really is stale and discard it. If it turns
-// out LIVE — re-created by its owner between the staleness read and the
-// rename, the race that makes a plain unlink unsafe — restore it. Returns
-// true iff `basePath` was left free for a fresh wx-create.
-function finishReclaim(tomb, basePath) {
-  if (tombHoldsLiveClaim(tomb)) { restoreFromTomb(tomb, basePath); return false; }
-  try { fs.unlinkSync(tomb); } catch {}
-  return true;
-}
-
-// After WINNING the wx-create, stand down if a LIVE displaced claim sits in
-// any reclaim tomb for this key: its reclaimer's restore must find the base
-// path free, or — reclaimer dead — we restore it ourselves. This is the other
-// half of what makes lock-free reclaim safe: the delayed-reclaimer race
-// (stale read → rename lands on a live replacement) is survivable only
-// because no claimant keeps the base path occupied while a live tomb is
-// outstanding. Stale-content tombs are just discarded; they never block.
-// Returns true iff we kept the claim.
-function standDownForTombs(p) {
-  const dir = path.dirname(p);
-  const base = path.basename(p);
-  let files = [];
-  try { files = fs.readdirSync(dir); } catch { files = []; }
-  const tombs = [];
-  for (const f of files) {
-    if (!f.startsWith(`${base}.reclaim.`)) continue;
-    const m = f.match(/\.reclaim\.(\d+)$/);
-    if (m) tombs.push({ path: path.join(dir, f), reclaimerPid: Number(m[1]) });
-  }
-  if (!tombs.length) return true;
-  // Yield BEFORE settling when any live displaced claim exists, so a restore
-  // (ours or the reclaimer's) finds the path free.
-  const blocking = tombs.some((t) => tombHoldsLiveClaim(t.path));
-  if (blocking) { try { fs.unlinkSync(p); } catch {} }
-  for (const t of tombs) settleTomb(t.path, p, t.reclaimerPid);
-  return !blocking;
-}
-
-// Reclaim a stale claim file race-free WITHOUT a lock: atomically rename it to
-// a private tomb (exactly one renamer can win; a concurrent reclaimer gets
-// ENOENT and loses cleanly), then verify-and-discard in the tomb. After a true
-// reclaim the base path is absent, so ownership still flows through the
-// wx-create — reclaim never grants the key, it only clears a dead owner's
-// wreckage out of the way.
-function reclaimStaleClaim(p) {
-  const tomb = `${p}.reclaim.${process.pid}`;
-  try { fs.renameSync(p, tomb); } catch { return false; } // lost the reclaim race — not ours to clear
-  return finishReclaim(tomb, p);
-}
-
-// Sweep the whole registry for stranded records (dead or provably-recycled
-// pids) and leftover tombs from reclaimers that died mid-reclaim. Run at
-// server startup: after a dash stop/crash every chat it hosted is stranded at
-// once, and the sweep makes them all attachable again in one pass instead of
-// one error per card open. Live foreign records, our own records, and files
-// that aren't records are untouched.
-function sweepStaleClaims() {
-  const dir = registryDir();
-  let files = [];
-  try { files = fs.readdirSync(dir); } catch { return; }
-  for (const f of files) {
-    const full = path.join(dir, f);
-    const tomb = f.match(/^(.+)\.reclaim\.(\d+)$/);
-    if (tomb) {
-      // Settle leftover tombs: discard stale contents, restore a displaced
-      // live claim whose reclaimer died mid-operation.
-      settleTomb(full, path.join(dir, tomb[1]), Number(tomb[2]));
+  // A blocked legacy record (its agent child still runs) converts INTO the
+  // journal — state blocked, identity carried over — and its old-format file
+  // is deleted: after this pass NOTHING reads the legacy format, and the next
+  // boot reconsiders the record through the one remaining state machine.
+  const alreadyConverted = new Set(
+    (await import('./chat-journal.mjs')).journalRecords().map((r) => r.sessionId).filter(Boolean),
+  );
+  for (const { file, entry, reason } of blocked) {
+    console.error(`[legacy] BLOCKED ${String(entry.sessionId).slice(0, 8)}: ${reason}`);
+    // Idempotent: a crash between open/block/unlink re-runs this pass, and a
+    // record already converted for this session must not be minted twice.
+    if (alreadyConverted.has(entry.sessionId)) {
+      try { fs.unlinkSync(path.join(registryDir(), file)); } catch {}
       continue;
     }
-    if (!f.endsWith('.json')) continue;
-    let entry = null;
-    try { entry = JSON.parse(fs.readFileSync(full, 'utf8')); } catch { continue; }
-    if (!entry || !Number.isInteger(entry.pid) || isOwnClaim(entry)) continue;
-    if (claimIsStale(entry)) reclaimStaleClaim(full);
-  }
-}
-
-// Claim machine-wide ownership of a chat key before spawning its PTY. Returns
-// true only if THIS process now holds the key; false means someone else owns it
-// (caller must not spawn) OR the claim could not be made durable — it FAILS
-// CLOSED, because a registry we can't write can't stop a duplicate.
-//
-// The rule that makes a duplicate IMPOSSIBLE: ownership is only ever granted by
-// `wx`-creating an ABSENT claim (O_EXCL — exactly one winner) or re-stamping
-// our OWN. A foreign LIVE claim makes us fail closed (the caller redirects). A
-// foreign STALE claim — its owner pid dead, or provably a different process
-// (issue i-stale-chat-records: every dash stop used to strand its chats' records)
-// — is cleared via reclaimStaleClaim's atomic rename-to-tomb, then the claim
-// retries through the same wx gate as everyone else. Two servers cold-resuming
-// the same DORMANT session still resolve to one winner; a NEW chat's uuid is
-// minted by one server (uncontended).
-function claimChat(key, issueId, sessionId) {
-  const p = regPath(key);
-  if (!p) return false; // unsafe key: refuse rather than write outside the dir
-  // Stamp the claude child's identity when the PTY already exists (a post-spawn
-  // re-stamp, or setDashPort's port re-stamp): ptyPid + its start time are what
-  // let a LATER server verify the session's actual process is gone before it
-  // reclaims — a belt-and-suspenders check alongside the pgrep-by-argv gate.
-  const live = chats.get(key);
-  const ptyPid = liveSession(live) && Number.isInteger(live.pty?.pid) ? live.pty.pid : null;
-  const data = JSON.stringify({
-    pid: process.pid, port: dashPort, issueId, sessionId,
-    startTime: selfStartTime(), startedAt: new Date().toISOString(),
-    ptyPid, ptyStartTime: ptyPid ? pidStartTimeSync(ptyPid) : null,
-  });
-  try { fs.mkdirSync(registryDir(), { recursive: true }); } catch { return false; }
-
-  try { fs.writeFileSync(p, data, { flag: 'wx' }); } // uncontended create — sole winner…
-  catch (e) {
-    if (e.code !== 'EEXIST') return false; // real fs error — fail closed
-
-    let entry;
-    try { entry = JSON.parse(fs.readFileSync(p, 'utf8')); }
-    catch (re) { return re.code === 'ENOENT' ? claimChat(key, issueId, sessionId) : false; } // vanished → retry; unreadable → fail closed
-
-    if (isOwnClaim(entry)) { try { atomicWrite(p, data); return true; } catch { return false; } } // our own (full identity) — re-stamp
-    if (entry && Number.isInteger(entry.pid) && claimIsStale(entry) && reclaimStaleClaim(p)) {
-      return claimChat(key, issueId, sessionId); // stranded record cleared — recontend through wx
-    }
-    return false; // live foreign claim, or an orphan's — never spawn (caller redirects / names the orphan)
-  }
-  return standDownForTombs(p); // …unless a reclaim is outstanding on this key
-}
-
-// Test seam: exercise the claim without spawning a PTY, so the exclusivity
-// contract can be pinned deterministically.
-export function __claimForTest(key, issueId, sessionId) { return claimChat(key, issueId, sessionId); }
-
-// Remove OUR registry entry for a key (its PTY exited). Only ever unlinks a file
-// whose pid is our own, and only our process writes our pid — and Node is
-// single-threaded — so no lock is needed and it can never delete another live
-// process's claim.
-function releaseChat(key) {
-  const p = regPath(key);
-  if (!p) return;
-  try {
-    const entry = JSON.parse(fs.readFileSync(p, 'utf8'));
-    if (isOwnClaim(entry)) fs.unlinkSync(p);
-  } catch {}
-}
-
-// Rewrite OUR record for a key as `released`: the graceful-stop parting note
-// for a claude child that hadn't finished dying inside the shutdown wait. The
-// record keeps the child's identity (ptyPid + start time), so the next server
-// reclaims it the moment the child is provably gone — and refuses while it
-// lives. Pid-guarded like releaseChat: only our own record is ever rewritten.
-function markReleased(key) {
-  const p = regPath(key);
-  if (!p) return;
-  try {
-    const entry = JSON.parse(fs.readFileSync(p, 'utf8'));
-    if (isOwnClaim(entry)) atomicWrite(p, JSON.stringify({ ...entry, released: true }));
-  } catch {}
-}
-
-// On the way down, KILL our PTYs and settle their claims synchronously — the
-// process exits before any onExit callback would fire, so waiting for the
-// PTY-exit release path would strand every record with our soon-dead pid (the
-// i-stale-chat-records failure: each dash stop left one stale record per live
-// chat). A record is only DELETED once its claude child is verifiably dead
-// (bounded sync wait — children die in ms on SIGHUP); a straggler's record is
-// rewritten as `released` instead, handing the child's identity to the next
-// server so it can wait for the real death rather than double-resume a dying
-// session (this is what protects the main chat, which pgrep can't identify).
-// A crash that skips this handler entirely leaves a plain dead-pid record for
-// the next server's reclaim.
-// The claude child OUR OWN registry record stamped for a key, or null. The
-// fallback identity when retiring a FOREIGN-shape session: its object fields
-// can't be trusted to exist, but the record is ours and can.
-function ownClaimPtyPid(key) {
-  const p = regPath(key);
-  if (!p) return null;
-  let e = null;
-  try { e = JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
-  return isOwnClaim(e) && Number.isInteger(e.ptyPid) ? e.ptyPid : null;
-}
-
-// Kill a set of session entries and settle their claims synchronously — the
-// shared mechanics of shutdown and retirement. A record is only DELETED once
-// its claude child is verifiably dead (bounded sync wait — children die in ms
-// on SIGHUP); a straggler's record is rewritten `released` instead, handing
-// the child's identity to the next claimant rather than stranding it.
-// Callers own map membership; entries here are just killed and settled.
-//
-// `trusted: false` marks entries whose object contract is UNKNOWN (foreign-
-// shape survivors): every property touch is contained per entry (a hostile
-// getter must not abort the sweep — at module eval that would break the whole
-// config load), the child pid falls back to our own registry record's stamped
-// ptyPid when the object doesn't expose one, and an unidentifiable child is
-// marked `released` rather than deleted — the fail-safe hands reclaim to the
-// stamped-identity gate instead of asserting a death we couldn't verify.
-function killAndSettleClaims(entries, { trusted = true } = {}) {
-  const dying = [];
-  for (const [key, s] of entries) {
-    let child = null;
     try {
-      s.exited = true;
-      try { s.pty?.kill(); } catch {}
-      if (Number.isInteger(s.pty?.pid)) child = s.pty.pid;
+      journalImportBlocked({
+        agent: entry.agent || 'claude', issueId: entry.issueId,
+        sessionId: entry.sessionId, ptyPid: entry.ptyPid,
+        ptyStartTime: entry.ptyStartTime, cols: entry.cols, rows: entry.rows,
+      });
+      fs.unlinkSync(path.join(registryDir(), file));
     } catch {}
-    if (child === null && !trusted) {
-      child = ownClaimPtyPid(key);
-      // pty.kill had nothing to signal — reach the child via the record.
-      if (child !== null) { try { process.kill(child, 'SIGTERM'); } catch {} }
+  }
+  let leases = 0;
+  try {
+    for (const f of fs.readdirSync(registryDir())) {
+      const isLease = f.startsWith('lease.') && f.endsWith('.json');
+      const isTomb = /\.reclaim\.\d+$/.test(f);
+      if (isLease || isTomb) {
+        try { fs.unlinkSync(path.join(registryDir(), f)); leases += 1; } catch {}
+      }
     }
-    if (child !== null) dying.push([key, child]);
-    else if (trusted) releaseChat(key);
-    else markReleased(key);
+  } catch {}
+  if (resumed || finished.length || blocked.length || leases) {
+    console.log(`[legacy] imported: ${resumed} resumed, ${finished.length} finished cleared, ${blocked.length} blocked, ${leases} lease file(s) swept`);
   }
-  const deadline = Date.now() + 1000;
-  while (dying.some(([, pid]) => pidAlive(pid)) && Date.now() < deadline) {
-    spawnSync('sleep', ['0.05']);
-  }
-  for (const [key, pid] of dying) {
-    if (pidAlive(pid)) markReleased(key);
-    else releaseChat(key);
-  }
+  return { resumed, finished: finished.length, blocked: blocked.length, leases };
 }
 
+// The note a restored chat wakes up to. It is a NOTE, not an instruction: the
+// agent holds its own transcript and is the only thing that knows whether it was
+// mid-task or waiting on Dennis, so the message states the mechanical fact and
+// lets it decide. Anything phrased as "continue" would put words in Dennis's
+// mouth for every chat that was simply waiting for him.
+export const RESTART_NOTE = '[dash] The dash server restarted and reopened this chat — Dennis did not send this. If you were mid-task, pick up where you left off; if you were waiting on him, ignore this and stay put.';
+
+// Resume one journal record's chat — the `resume` callback reconcileChats
+// hands the journal. Every guard the human attach path uses applies, in the
+// same order: a chat already live here is skipped (idempotent re-entry), an
+// agent process still carrying this session id anywhere on the machine blocks
+// the resume (fail-closed pgrep), and a chat whose transcript or working
+// directory is gone — a merged worktree, a Cursor conversation the dash cannot
+// drive — is simply not resumable. Returns true iff a PTY is now running for
+// the record, so the journal knows to close it (false = an ending: cleared).
+async function resumeJournalRecord(rec) {
+  if (!validKey(rec.sessionId)) return false;
+  if (liveSession(chats.get(rec.sessionId))) return true;
+  if (await sessionProcessAlive(rec.sessionId)) throw new Error('session process alive outside the supervisor');
+  const { resumable, cwd, agent } = await resolveChat(rec.sessionId);
+  if (!resumable) return false;
+  const session = spawnChat({
+    issueId: rec.issueId, sessionId: rec.sessionId, mode: 'resume', cwd,
+    cols: rec.cols || 100, rows: rec.rows || 30,
+    initialPrompt: RESTART_NOTE, key: rec.sessionId, agent,
+  });
+  return !!session;
+}
+
+// END a chat for good: kill its PTY, close its journal record, drop it from
+// the map. This is the deliberate ending — /merge and /reject tearing down a
+// landed issue, the reaper stopping an idle chat — as opposed to a supervisor
+// shutdown, which leaves journal records so the next boot resumes them.
+// Closing the journal is what keeps a reaped chat dead: without it the next
+// boot would resurrect the very chat the reaper stopped. Idempotent; returns
+// whether a live PTY was actually killed, so a caller can tell "torn down"
+// from "was already gone".
+// Abort a spawned child DELIBERATELY: kill, await confirmed death, and only
+// then clear the journal — a resister keeps an 'ending' record the next boot
+// re-kills and clears (never resumes). Every post-spawn abort routes through
+// here (endChat, codex's rollout-timeout and duplicate-id aborts), so the
+// confirmed-death contract cannot drift per call site.
+async function abortSpawnedChild(journal, ptyLike) {
+  const pid = journal?.ptyPid ?? ptyLike?.pid;
+  const died = await terminateVerified(pid, journal?.ptyStartTime);
+  if (!journal) return;
+  if (died) journalClose(journal);
+  else journalEnd(journal);
+}
+
+// Removing a chat from the map and ending its detector are ONE act. The
+// detector is a view of a live PTY, so "not in the map but still publishing" is
+// never a state worth having — it would leave a needs-input dot on a card whose
+// chat the reaper stopped, and leak an emulator per ended chat. Both endings go
+// through here so a third one cannot forget; `dash/chat-activity.test.mjs`
+// refuses any other `chats.delete`.
+function dropChat(mapKey, session) {
+  chats.delete(mapKey);
+  closeSession(session.sessionId);
+}
+
+export async function endChat(sessionId) {
+  const session = chats.get(sessionId);
+  const wasLive = liveSession(session);
+  if (session) {
+    try { session.exited = true; } catch {}
+    dropChat(sessionId, session);
+    await abortSpawnedChild(session.journal, session.pty);
+  }
+  return wasLive;
+}
+
+// Kill every live PTY on the way down, leaving journal records IN PLACE: a
+// supervisor stop (graceful or not) is "something took these chats down", and
+// the untouched records are exactly what the next boot's reconciliation
+// resumes. Nothing waits for the children to die — reconcile verifies the
+// stamped child identity before ever spawning over one.
 let _shuttingDown = false;
 function shutdownChats() {
   if (_shuttingDown) return;
   _shuttingDown = true;
-  const entries = [...chats];
+  for (const [, s] of chats) {
+    // The TREE, not the leader: node-pty's own kill signals the bare pid, which
+    // left codex's helper processes running — and a helper that survives can
+    // still hold the thread's rollout open, so the very next card-open collided
+    // with a writer nothing owned (i-codex-resume-collision). Reconciliation
+    // has always signalled the group; shutdown now agrees.
+    try { s.exited = true; signalTree(s.pty?.pid); } catch {}
+    closeSession(s.sessionId); // the detector dies with the PTY it reads
+  }
   chats.clear();
-  killAndSettleClaims(entries);
 }
-
-// RETIREMENT SWEEP — runs once per module evaluation, i.e. at every vite
-// config restart. Survivors in the inherited chats map whose shape stamp
-// differs from CHAT_SHAPE were created by another module version: no live
-// path may touch them (their object contract is unknown here — the
-// i-chat-attach-crash TypeError), so they are killed and their claims settled
-// exactly like a graceful shutdown. Retirement is lossless: the transcript is
-// on disk, so the next attach cold-resumes the chat right where it was.
-// Same-stamp survivors are adopted untouched — their handler closures and
-// this module share one object contract.
-(function retireForeignShapeSessions() {
-  const foreign = [...chats].filter(([, s]) => foreignSession(s));
-  if (!foreign.length) return;
-  for (const [key] of foreign) chats.delete(key);
-  killAndSettleClaims(foreign, { trusted: false });
-})();
 
 // SIGTERM/SIGINT (how /merge and /reject kill a dev server) do NOT fire `exit`,
 // so they get their own handlers. We do NOT removeAllListeners (that would nuke
@@ -1289,13 +1229,17 @@ if (!globalThis.__labChatsExitHook) {
   }
 }
 
-// Point a client at whichever server owns the chat. Falls back to an exit
-// frame when the owner's port is unknown (it spawned before its port was
-// wired) — either way, this server never forks a duplicate.
-function redirectToOwner(ws, owner) {
-  if (owner?.port) send(ws, { type: 'redirect', port: owner.port });
-  else send(ws, { type: 'exit', code: null, error: 'chat is live in another dash server' });
-  try { ws.close(1000, 'chat live in another server'); } catch {}
+// EVERY BYTE IN AND OUT OF A CHAT, on demand. Every hard question about this
+// system is "what was on that screen, and who put it there" — a pane forwards
+// its terminal's own device/focus replies as PTY input, a stale socket can send
+// late, and a stand-in echoes all of it back as output. Guessing between those
+// costs hours; a timestamped, escaped trace answers it in one run. Off unless
+// DASH_PTY_TRACE is set, because it is a firehose of agent output.
+const PTY_TRACE = !!process.env.DASH_PTY_TRACE;
+function trace(dir, sessionId, data) {
+  if (!PTY_TRACE) return;
+  const shown = JSON.stringify(String(data).slice(0, 200));
+  console.log(`[pty-trace] ${Date.now()} ${dir} ${String(sessionId).slice(0, 8)} ${data.length}b ${shown}`);
 }
 
 const MAX_BUFFER_BYTES = 256 * 1024; // replayed to reattaching clients
@@ -1349,10 +1293,11 @@ function statusClause(status) {
 
 // Intro for an AUTONOMOUSLY-launched chat: same issue-scoping as the human
 // intro, but instead of "summarize and wait for direction" it tells the agent to
-// run the work end-to-end on its own. For claude, `flow` picks the protocol
-// skill — 'bug' (reproduce → fix) or the plain /change spine. Codex has no
-// Claude-Code skills, so it gets a plain-language end-to-end instruction. The
-// human opens the card later to monitor/unblock, not to kick it off.
+// run the work end-to-end on its own. `/change` is the one protocol; `flow`
+// only says whether this issue is a reported regression, which makes /change
+// run its reproduce prelude (step 0c) first. Codex has no Claude-Code skills,
+// so it gets a plain-language end-to-end instruction. The human opens the card
+// later to monitor/unblock, not to kick it off.
 export function autonomousChatIntro(issueId, title, flow = 'change', agent = DEFAULT_AGENT, status = null) {
   const named = title ? `\`${issueId}\` — "${title}"` : `\`${issueId}\``;
   const tail = `confirm the scope to yourself and proceed without waiting for further direction. A human will open this chat to monitor and unblock you, not to start you. When the work is candidate-complete, present receipts and the live preview link per the protocol.`;
@@ -1361,8 +1306,10 @@ export function autonomousChatIntro(issueId, title, flow = 'change', agent = DEF
   if (agent === 'codex') {
     return `This chat is scoped to issue ${named}${st}, and you were launched autonomously to implement it end-to-end. Run \`node scripts/board.mjs get ${issueId}\` to load the full issue, then implement it fully — ${tail}`;
   }
-  const skill = flow === 'bug' ? '/bug' : '/change';
-  return `This chat is scoped to issue ${named}${st}, and you were launched autonomously to implement it end-to-end. Run \`node scripts/board.mjs get ${issueId}\` to load the full issue, then invoke the \`${skill}\` skill and carry it through to completion — ${tail}`;
+  const regression = flow === 'bug'
+    ? ' This issue is a reported regression, so run `/change`\u2019s reproduce prelude (step 0c) before fixing.'
+    : '';
+  return `This chat is scoped to issue ${named}${st}, and you were launched autonomously to implement it end-to-end. Run \`node scripts/board.mjs get ${issueId}\` to load the full issue, then invoke the \`/change\` skill and carry it through to completion.${regression} — ${tail}`;
 }
 
 // Intro for a REVIEWER chat — a chat spawned to REVIEW the change on this
@@ -1399,32 +1346,31 @@ export function buildChatArgs(opts) {
 function spawnChat({ issueId, sessionId, mode, cwd, cols, rows, initialPrompt, key, model, effort, agent = DEFAULT_AGENT }) {
   // Every chat's PTY is keyed by its session uuid — issue and main alike (`key`
   // defaults to sessionId). `issueId` is the env the chat belongs to ('main' or
-  // an issue id) and rides into the session object + registry record.
+  // an issue id) and rides into the session object + journal record.
   const mapKey = key || sessionId;
   // In-process idempotence: the attach/deliver paths await I/O between their
   // "no live session" check and this call, so two concurrent requests can both
-  // reach here for one key. The claim below can't stop that (our own pid
-  // re-stamps), so the map is the guard: a live PTY for the key IS the spawn.
+  // reach here for one key. The map is the guard: a live PTY for the key IS the
+  // spawn — and with one supervisor hosting every PTY on the machine, the map
+  // is the whole ownership story.
   const existing = chats.get(mapKey);
   if (liveSession(existing)) return existing;
-  // A foreign-shape survivor that outlived the eval-time retirement sweep
-  // (planted after it, or a future gap) is retired here — never reused,
-  // never leaked alongside the fresh spawn.
-  if (foreignSession(existing)) {
-    chats.delete(mapKey);
-    killAndSettleClaims([[mapKey, existing]], { trusted: false });
-  }
-  // Machine-wide single owner: claim the key before spawning. Losing the claim
-  // means another live server already hosts (or just now claimed) this chat —
-  // returning null instead of forking a duplicate claude on the same session.
-  if (!claimChat(mapKey, issueId, sessionId)) return null;
   const adapter = agentById(agent);
   const bin = adapter.bin();
+  // The CLI isn't on this computer. Refuse with a typed error, so the attach
+  // boundary can turn it into install guidance instead of a raw `spawn …
+  // ENOENT` in the terminal pane.
+  if (!bin) throw new AgentMissingError(adapter.id);
   // Test stand-in (LAB_TERMINAL_CMD / LAB_CODEX_CMD, e.g. /bin/cat) takes no CLI
-  // flags — it must just echo. The real CLI gets its agent-specific argv.
-  const isStandIn = bin === process.env.LAB_TERMINAL_CMD || bin === process.env.LAB_CODEX_CMD;
+  // flags — it must just echo. The real CLI gets its agent-specific argv. The
+  // adapter is the single authority on whether a stand-in is in play, so this
+  // can't disagree with what bin() actually resolved.
+  const isStandIn = !!adapter.standInCmd();
   const args = isStandIn ? [] : adapter.buildArgs({ mode, sessionId, initialPrompt, model, effort });
 
+  // Intent BEFORE spawn: if we crash between here and the stamp, reconciliation
+  // finds a provisional record and parks it rather than guessing.
+  const journal = journalOpen({ agent, issueId, cwd, requestedSessionId: sessionId, cols, rows });
   let term;
   try {
     term = pty.spawn(bin, args, {
@@ -1435,38 +1381,53 @@ function spawnChat({ issueId, sessionId, mode, cwd, cols, rows, initialPrompt, k
       env: { ...process.env, TERM: 'xterm-256color' },
     });
   } catch (e) {
-    // The spawn itself failed AFTER we claimed the key: release it so a
-    // retry (here or on another server) isn't blocked by a claim with no PTY
-    // behind it. Re-throw so the caller surfaces the real error.
-    releaseChat(mapKey);
+    // The spawn itself failed: nothing to recover at the next boot.
+    journalClose(journal);
     throw e;
   }
 
-  return wireSession(term, { issueId, sessionId, mapKey, agent, cols, rows });
+  return wireSession(term, { issueId, sessionId, mapKey, agent, cols, rows, journal });
 }
 
 // Adopt a freshly-spawned PTY into the live-chat machinery: build the session
-// object, re-stamp the claim with the child's identity (ptyPid + start time),
-// register it in the chats map, and wire output/exit. Shared by spawnChat (id
-// known up front) and spawnCodexNewChat (id discovered after spawn). Returns the
-// session, or null if the post-spawn re-stamp fails (a chat later servers
-// couldn't reason about — torn down like a failed spawn).
-function wireSession(term, { issueId, sessionId, mapKey, agent, cols, rows }) {
+// object, stamp the journal with the child's identity (ptyPid + start time —
+// and, for codex, the discovered session id), register it in the chats map,
+// and wire output/exit. Shared by spawnChat (id known up front) and
+// spawnCodexNewChat (id discovered after spawn).
+//
+// `pre` is whatever the child already printed before we got here. A codex chat
+// spends SECONDS between spawn and this call while its id is discovered, and
+// everything it drew in that window — its boot, and the status line that says
+// it is working — used to be dropped on the floor. That cost the reattach
+// buffer a chunk of scrollback, and it costs the detector its whole screen: an
+// emulator that never saw the status line reads a blank viewport, so a codex
+// chat that goes quiet inside a tool would flip to "needs input" mid-turn.
+// Replaying it makes the two paths identical — every byte the child wrote is
+// buffered and fed, whichever spawn shape produced it.
+function wireSession(term, { issueId, sessionId, mapKey, agent, cols, rows, journal, pre }) {
   const session = {
-    pty: term, issueId, sessionId, agent,
+    pty: term, issueId, sessionId, agent, journal,
+    // When this PTY came up — the chat's last activity until its agent writes a
+    // first transcript line, which is what keeps a just-spawned chat at the top
+    // of a list sorted purely on activity (chatRunState).
+    startedAt: Date.now(),
     buffer: [], cols: cols || 100, rows: rows || 30,
     attached: new Set(), geomOwner: null, exited: false, shape: CHAT_SHAPE,
   };
   chats.set(mapKey, session);
-  if (!claimChat(mapKey, issueId, sessionId)) {
-    chats.delete(mapKey);
-    try { term.kill(); } catch {}
-    releaseChat(mapKey);
-    return null;
+  journalStamp(journal, { ptyPid: term.pid, sessionId });
+  // Working / needs-input detection starts with the PTY and ends with it — the
+  // supervisor's detector, not a browser pane's (see chat-activity.mjs).
+  openSession(session.sessionId, { agent, cols: session.cols, rows: session.rows });
+  for (const data of pre || []) {
+    bufferPush(session, data);
+    feedSession(session.sessionId, data);
   }
 
   term.onData((data) => {
+    trace('out', session.sessionId, data);
     bufferPush(session, data);
+    feedSession(session.sessionId, data);
     broadcast(session, { type: 'output', data });
   });
   term.onExit(({ exitCode }) => {
@@ -1474,27 +1435,28 @@ function wireSession(term, { issueId, sessionId, mapKey, agent, cols, rows }) {
     broadcast(session, { type: 'exit', code: exitCode });
     // Only remove OUR OWN map entry: a successor PTY may already own this key
     // (kill old chat → immediately respawn), and a stale exit firing late must
-    // not evict it — same guard the dev-server exit handler uses. When we DO own
-    // it, also release the machine-wide claim so the chat is resumable anywhere
-    // again (releaseChat is itself pid-guarded, but gating on our own map entry
-    // keeps a late stale exit from touching a successor's claim).
-    if (chats.get(mapKey) === session) { chats.delete(mapKey); releaseChat(mapKey); }
+    // not evict it. The journal close is the durable "this chat ended on its
+    // own" mark — gated the same way so a late stale exit can't clear a
+    // successor's record.
+    if (chats.get(mapKey) === session) { dropChat(mapKey, session); journalClose(journal); }
   });
 
   return session;
 }
 
 // Spawn a NEW codex chat and reconcile its identity. Codex mints its own session
-// id, so — unlike claude — we CANNOT claim a key before spawning: we spawn codex
-// in the worktree, read the id back from the rollout it writes (discoverSessionId,
-// matched by cwd + recency), then adopt the live PTY under that real id. There is
-// no pre-spawn claim because the id doesn't exist until codex creates it, and no
-// other server can contend an id nobody else has seen yet; the claim lands the
-// instant we know it. Returns { session, sessionId } or { error }.
+// id, so — unlike claude — the id doesn't exist until after spawn: we open a
+// provisional journal record (requestedSessionId null), spawn codex in the
+// worktree, read the id back from the rollout it writes (discoverSessionId,
+// matched by cwd + recency), then stamp the record with the real id — the
+// journal's promotion point. Returns { session, sessionId } or { error }.
 async function spawnCodexNewChat({ issueId, cwd, cols, rows, initialPrompt, model }) {
   const adapter = agentById('codex');
   const bin = adapter.bin();
-  const isStandIn = bin === process.env.LAB_TERMINAL_CMD || bin === process.env.LAB_CODEX_CMD;
+  // Codex isn't installed here — same typed refusal as the claude path, so the
+  // create endpoint answers with install guidance instead of an ENOENT throw.
+  if (!bin) throw new AgentMissingError(adapter.id);
+  const isStandIn = !!adapter.standInCmd();
   const args = isStandIn ? [] : adapter.buildArgs({ mode: 'new', initialPrompt, model });
   // Exclude every rollout that existed before this child. The caller may itself
   // be a live Codex chat in this same worktree; its rollout can advance during
@@ -1502,30 +1464,129 @@ async function spawnCodexNewChat({ issueId, cwd, cols, rows, initialPrompt, mode
   const priorRollouts = await adapter.rolloutInventory();
   const since = Date.now();
 
+  const journal = journalOpen({ agent: 'codex', issueId, cwd, requestedSessionId: null, cols, rows });
   let term;
   try {
     term = pty.spawn(bin, args, {
       name: 'xterm-256color', cols: cols || 100, rows: rows || 30, cwd,
       env: { ...process.env, TERM: 'xterm-256color' },
     });
-  } catch (e) { return { error: `codex spawn failed: ${e.message}` }; }
+  } catch (e) { journalClose(journal); return { error: `codex spawn failed: ${e.message}` }; }
+  // Hold everything the child prints while its id is being discovered. Attached
+  // BEFORE the first await, so nothing is missed; handed to wireSession, which
+  // replays it into the buffer and the detector (see wireSession's note).
+  const pre = [];
+  const preTap = term.onData((d) => pre.push(d));
+  // Identity NOW, id later: rollout discovery takes seconds, and a crash in
+  // that window must leave a record naming a verifiable child (reconcile then
+  // terminates it and clears — there is nothing to resume, the chat never
+  // spoke) rather than an identity-free record parked as blocked forever.
+  journalStamp(journal, { ptyPid: term.pid });
 
   const sessionId = await adapter.discoverSessionId({ cwd, sinceMs: since, excludeRollouts: priorRollouts });
   if (!sessionId) {
-    try { term.kill(); } catch {}
+    preTap.dispose();
+    await abortSpawnedChild(journal, term);
     return { error: 'could not determine codex session id (no rollout written) — is codex installed and authenticated?' };
   }
-  // Another server can't own a brand-new codex id, but a live PTY for it in THIS
-  // process would only exist if we somehow spawned twice — the map guard.
+  // A live PTY for this brand-new id would only exist if we somehow spawned
+  // twice — the map guard.
   const existing = chats.get(sessionId);
-  if (liveSession(existing)) { try { term.kill(); } catch {} return { session: existing, sessionId }; }
-  if (!claimChat(sessionId, issueId, sessionId)) {
-    try { term.kill(); } catch {}
-    return { error: 'codex chat is live in another dash server' };
-  }
-  const session = wireSession(term, { issueId, sessionId, mapKey: sessionId, agent: 'codex', cols, rows });
-  if (!session) return { error: 'codex chat could not be claimed' };
+  if (liveSession(existing)) { preTap.dispose(); await abortSpawnedChild(journal, term); return { session: existing, sessionId }; }
+  // Stop tapping and hand over in the SAME synchronous step wireSession wires
+  // its own listener, so no byte falls between the two.
+  preTap.dispose();
+  const session = wireSession(term, { issueId, sessionId, mapKey: sessionId, agent: 'codex', cols, rows, journal, pre });
   return { session, sessionId };
+}
+
+// --- The MAIN thread: one always-present, always-running chat ---------------
+//
+// Main differs from an issue in one behavioral way: an issue's chats are opt-in
+// (its empty state waits for a click), while main ALWAYS has a thread. That
+// invariant lives HERE, on the server, because only the server can settle it:
+// it owns the list (main-chats-store) and the PTY table, and can read both in
+// one uninterrupted step. The client used to assert it — comparing a chat list
+// against a local snapshot and minting when the snapshot looked empty — and a
+// snapshot assembled from several async sources is empty long before it is
+// EMPTY. Every page load re-ran that comparison against a not-yet-answered list
+// and minted another thread (i-main-chat-refresh).
+//
+// EAGERLY SPAWNED. A main chat is started at creation, not when a browser
+// happens to attach. That is what makes the invariant checkable by the NEXT
+// caller — a linked uuid with no PTY and no transcript is indistinguishable from
+// a dead entry, so a lazily-spawned thread would leave a window in which two
+// tabs (or two refreshes) each see "no thread" and each make one. Starting it
+// also means main's list stops accumulating linked-but-never-run ids.
+async function createMainChat(agent = DEFAULT_AGENT) {
+  const intro = mainChatIntro(agent);
+  const spawnArgs = { issueId: MAIN_ENV, cwd: MAIN_REPO, cols: 100, rows: 30, initialPrompt: intro };
+  // CODEX mints its own id, so it is spawned first and linked with the id it
+  // chose; CLAUDE takes a dash-minted uuid, so it is linked first and spawned
+  // under that id. Same two orders the issue create path uses.
+  if (!agentById(agent).dashMintsId) {
+    const r = await spawnCodexNewChat({ ...spawnArgs });
+    if (r.error) return { error: r.error };
+    const link = await linkChat(MAIN_ENV, r.sessionId, agent);
+    if (link?.error) {
+      // Never leak a live, unlinked agent — it would be invisible to the board
+      // and unaddressable. Tear it down; the caller retries.
+      // Same teardown the issue path uses: a link failure strands a live,
+      // UNLINKED codex process, and endChat is the one call that ends a chat for
+      // good — kill, drop, and leave NO record, so the next boot has nothing to
+      // resurrect. Hand-rolling the triple here would be a second copy of the
+      // ending, and the two would drift the moment the ledger gains a state.
+      await endChat(r.sessionId);
+      return { error: `link failed: ${link.error}` };
+    }
+    return { sessionId: r.sessionId, agent };
+  }
+  const sessionId = crypto.randomUUID();
+  const link = await linkChat(MAIN_ENV, sessionId, agent);
+  if (link?.error) return { error: `link failed: ${link.error}` };
+  const spawned = spawnChat({ ...spawnArgs, sessionId, mode: 'new', key: sessionId, agent });
+  if (!spawned) return { error: 'chat is live in another dash server' };
+  return { sessionId, agent };
+}
+
+// Single-flight: N tabs opening at once ask N times, and the answer must be one
+// thread, not N. The in-flight promise makes concurrent ensures share ONE
+// decision rather than each racing its own read→create window. (The supervisor
+// is the machine's only PTY host, so in-process is the whole contention
+// surface.)
+let ensuringMain = null;
+
+// Main's thread, creating it only when there genuinely isn't one. Idempotent:
+// call it on every open, from every tab; it answers with the existing thread
+// unless main has none that can run here.
+//
+// "Can run here" is live-or-resumable — a live PTY, or a transcript whose cwd
+// still exists. A list of ids whose transcripts are gone is not a thread, and
+// neither is somebody's read-only Cursor conversation in the repo root (never
+// linked, never launchable), so both fall through to creating a real one.
+export function ensureMainChat(agent = DEFAULT_AGENT) {
+  if (ensuringMain) return ensuringMain;
+  ensuringMain = (async () => {
+    // Only LINKED chats can be main's thread: a derived Cursor conversation in
+    // the repo root was never linked and can never be launched, so the list read
+    // here is the store's, not issueChats' (which also discovers those).
+    const linked = mainChatsList().map(parseHandle).filter(h => isLaunchable(h.agent));
+    // LIVE first, and cheaply — a running PTY is a map lookup plus a registry
+    // read, while resumability means scanning transcripts off disk. Newest-last
+    // is switcher order, so scanning from the end lands on the thread you were
+    // last talking to.
+    const found = (h) => ({ ok: true, sessionId: h.sessionId, agent: h.agent, mode: 'resume', created: false });
+    for (let i = linked.length - 1; i >= 0; i--) {
+      if ((await chatRunState(linked[i].sessionId)).live) return found(linked[i]);
+    }
+    for (let i = linked.length - 1; i >= 0; i--) {
+      if ((await chatRunState(linked[i].sessionId)).resumable) return found(linked[i]);
+    }
+    const r = await createMainChat(agent);
+    if (r.error) return r;
+    return { ok: true, sessionId: r.sessionId, agent: r.agent, mode: 'new', created: true };
+  })().finally(() => { ensuringMain = null; });
+  return ensuringMain;
 }
 
 // Attach a websocket to a chat's PTY. If the PTY is already live (e.g. after a
@@ -1541,6 +1602,15 @@ async function spawnCodexNewChat({ issueId, cwd, cols, rows, initialPrompt, mode
 export async function attachChat(ws, opts) {
   try { await attachChatInner(ws, opts); }
   catch (e) {
+    // The CLI simply isn't installed here. That is a normal state on a fresh
+    // machine, not a crash — report it as its own kind so the pane can render
+    // install guidance instead of printing `spawn claude ENOENT` at someone who
+    // has no way to read that. Typed, never text-matched.
+    if (e instanceof AgentMissingError) {
+      try { send(ws, { type: 'exit', code: null, error: e.message, reason: 'agent-missing', agent: e.agent, install: e.install }); } catch {}
+      try { ws.close(1011, 'agent not installed'); } catch {}
+      return;
+    }
     console.error('[dash-terminal] attach failed:', e);
     try { send(ws, { type: 'exit', code: null, error: `attach failed: ${e.message}` }); } catch {}
     try { ws.close(1011, 'attach failed'); } catch {}
@@ -1557,16 +1627,6 @@ async function attachChatInner(ws, { issueId, sessionId, mode, agent }) {
   const reattached = liveSession(session);
 
   if (!reattached) {
-    // Machine-wide single-owner check BEFORE any cold spawn: if another live
-    // dash server on this machine already hosts this chat, hand the client to
-    // it instead of forking a second claude on the same session (the
-    // i-chat-collision double-resume). verify:true enforces full process
-    // identity so a recycled pid is never mistaken for the owner.
-    const owner = await liveChatOwner(key, { verify: true });
-    if (owner && owner.pid !== process.pid) {
-      redirectToOwner(ws, owner);
-      return;
-    }
     const clientAgent = agent || DEFAULT_AGENT;
     // Codex mints its OWN id, so a codex chat is spawned eagerly at create time
     // (POST /chat) — by the time a browser attaches, its id + transcript exist.
@@ -1587,12 +1647,12 @@ async function attachChatInner(ws, { issueId, sessionId, mode, agent }) {
       const r = await resolveChat(sessionId);
       cwd = r.resumable ? r.cwd : null;
       chatAgent = r.resumable ? r.agent : clientAgent;
-      // Same belt deliverMessage wears: an agent carrying this session id in
-      // its argv is the session RUNNING, registry record or not — a manual
-      // `claude --resume` / `codex resume`, an orphan whose dash died, or a
-      // just-released chat whose process is still winding down after a
-      // graceful stop. Cold-resuming over it would fork the transcript.
-      if (cwd && await sessionProcessAlive(sessionId)) {
+      // A process holding this session — a manual `claude --resume` /
+      // `codex resume`, an orphan whose supervisor died, a chat still winding
+      // down after a graceful stop — must not be resumed OVER: that forks the
+      // transcript, and codex refuses outright. If the chat is one this
+      // environment owns, take it back; otherwise say so honestly.
+      if (cwd && !(await reclaimSession(issueId, sessionId))) {
         const err = 'an agent process for this session is alive outside any dash server — close it (or wait for it to exit) before reopening the chat here';
         send(ws, { type: 'exit', code: null, error: err });
         try { ws.close(1011, 'session process alive elsewhere') } catch {}
@@ -1621,19 +1681,8 @@ async function attachChatInner(ws, { issueId, sessionId, mode, agent }) {
     }
     session = spawnChat({ issueId, sessionId: spawnSessionId, mode: spawnMode, cwd, cols: 100, rows: 30, initialPrompt, key, agent: chatAgent });
     if (!session) {
-      // The claim was refused. A stranded (dead-owner, dead-child) record would
-      // have been reclaimed inside claimChat, so this is another server taking
-      // ownership between the check above and the spawn (→ redirect), an ORPHAN
-      // (its dash gone but its claude child still alive — name the pid so the
-      // human can wait or kill it), or a registry we couldn't write. Never fork.
-      const owner = await liveChatOwner(key, { verify: true });
-      if (owner) { redirectToOwner(ws, owner); return; }
-      const orphan = claimOrphanPid(key);
-      const err = orphan
-        ? `this chat's claude process (pid ${orphan}) is still running from a previous dash server — wait for it to exit, or kill it, then reopen`
-        : 'chat could not be claimed';
-      send(ws, { type: 'exit', code: null, error: err });
-      try { ws.close(1011, 'chat claim refused'); } catch {}
+      send(ws, { type: 'exit', code: null, error: 'chat could not be started' });
+      try { ws.close(1011, 'chat spawn refused'); } catch {}
       return;
     }
   }
@@ -1674,6 +1723,7 @@ async function attachChatInner(ws, { issueId, sessionId, mode, agent }) {
       try { msg = JSON.parse(raw.toString('utf8')); } catch { return; }
       if (session.exited) return;
       if (msg.type === 'input' && typeof msg.data === 'string') {
+        trace('in', session.sessionId, msg.data);
         session.pty.write(msg.data);
       } else if (msg.type === 'resize') {
         // Asserting a grid takes ownership of it. Only real layout intent sends
@@ -1687,6 +1737,10 @@ async function attachChatInner(ws, { issueId, sessionId, mode, agent }) {
           session.cols = cols;
           session.rows = rows;
           try { session.pty.resize(cols, rows); } catch {}
+          // The emulator behind needs-input detection is the same grid the PTY
+          // writes into; a frame is only readable in the grid it was formatted
+          // for, so geometry moves to both or to neither.
+          resizeSession(session.sessionId, cols, rows);
           broadcast(session, { type: 'grid', cols, rows }, ws);
         }
       }
@@ -1718,12 +1772,20 @@ async function attachChatInner(ws, { issueId, sessionId, mode, agent }) {
 // --- HTTP endpoints (mounted in vite.config.js) ---
 //
 // GET  /api/dash/terminal/chats?issue=<id>   → { worktree, dir, port, chats:[{sessionId,agent,name,resumable}] }
+// POST /api/dash/terminal/main-chat { agent? }
+//                                             → ensure main's always-present thread (idempotent)
+//                                               → { ok, sessionId, agent, mode, created }
 // POST /api/dash/terminal/chat-name { issue, session, name }
 //                                             → set/clear a chat's custom label → { ok, names }
-// POST /api/dash/terminal/worktree { issue }  → creates worktree (idempotent) + reserves port → { ok, dir, created, port }
+// POST /api/dash/terminal/worktree { issue, session? }
+//                                             → creates worktree (idempotent) + reserves port → { ok, dir, created, port }
+//                                               with `session`, rebuilds it at THAT chat's
+//                                               recorded path, so the chat can resume there
 // POST /api/dash/terminal/chat     { issue }  → ensures worktree + reserves port + mints a new chat
 //                                              (uuid), links it → { ok, sessionId, mode:'new', port }
-// GET  /api/dash/terminal/<id>/open           → lazy-start the issue's dev server, 302→ http://localhost:<port>/
+// GET  /api/dash/terminal/activity            → { sessions: { <session>: {state, since} } }
+// GET  /api/dash/terminal/activity/stream     → SSE: `snapshot` then `update` frames
+// GET  /api/dash/terminal/<id>/open           → lazy-start the issue's dev server, 302→ <same host>:<port>/
 // POST /api/dash/terminal/<id>/restart        → kill + relaunch the issue's dev server on its port → { ok, restarted }
 // GET  /api/dash/terminal/transcript?session=<uuid>&after=<n>
 //                                             → { sessionId, live, cursor, messages:[{i,role,text,timestamp}] }
@@ -1761,16 +1823,60 @@ export async function handleTerminalHttp(req, res, segs) {
     return json(data);
   }
 
+  // /api/dash/terminal/commits — what has landed on the issue's branch, read
+  // from git through the branch recorded on the row. The OPEN card asks for this;
+  // the board list never does (one git call per card is the freeze we don't want).
+  if (req.method === 'GET' && segs[0] === 'commits') {
+    const issueId = new URL(req.url, 'http://x').searchParams.get('issue');
+    if (!issueId) return json({ error: 'issue required' }, 400);
+    return json(await issueCommits(issueId));
+  }
+
+  // /api/dash/terminal/agents — which agent CLIs this computer can actually run,
+  // with install guidance for the ones it can't. The new-chat picker reads this
+  // so an uninstalled agent is visibly unavailable before you click it, rather
+  // than failing at spawn with a raw ENOENT.
+  if (req.method === 'GET' && segs[0] === 'agents') {
+    return json({ agents: agentAvailability() });
+  }
+
   // /api/dash/terminal/transcript — a session's spoken turns, for agent-to-agent
   // reads. `after` = the previous response's cursor for incremental polling.
+  //
+  // Local first, then the SHARED COPY. An agent asking about a chat is a reader
+  // like any other, so "not on this machine" stopped being the end of the
+  // answer: a teammate's chat reads here exactly as it does in the pane, in the
+  // same shape, with `mirrored: true` saying which copy answered. Local stays
+  // first because it is live and exact — the mirror lags by a sweep.
   if (req.method === 'GET' && segs[0] === 'transcript') {
     const q = new URL(req.url, 'http://x').searchParams;
     const sessionId = q.get('session');
     if (!sessionId) return json({ error: 'session required' }, 400);
     const after = Math.max(0, parseInt(q.get('after') || '0', 10) || 0);
     const t = await readTranscript(sessionId, after);
-    if (!t) return json({ error: `no transcript for session "${sessionId}" on this machine` }, 404);
-    return json(t);
+    if (t) return json({ ...t, mirrored: false });
+    const { mirroredChat, mirroredTurns } = await import('./chat-mirror.mjs');
+    const chat = await mirroredChat(sessionId).catch(() => null);
+    if (!chat) return json({ error: `no transcript for session "${sessionId}", here or in the shared copy` }, 404);
+    // `after` is a position in the SOURCE transcript for both copies (that is
+    // what `idx` records), so an incremental poll behaves identically whichever
+    // copy answers it.
+    const rows = await mirroredTurns(sessionId, after - 1);
+    return json({
+      sessionId, agent: chat.agent, live: false, mirrored: true,
+      owner: chat.owner, host: chat.host,
+      messages: rows.map(r => ({ i: r.idx, role: r.role, text: r.text, timestamp: r.ts })),
+      cursor: chat.cursor,
+    });
+  }
+
+  // /api/dash/terminal/mirror — push this machine's chats to the shared corpus
+  // NOW, rather than waiting for the next sweep. The sweep is the normal path;
+  // this is the "sync it, I'm watching" affordance (and what the tests drive),
+  // and it is the same one pass either way.
+  if (req.method === 'POST' && segs[0] === 'mirror') {
+    const { mirrorSweep } = await import('./mirror-sweep.mjs');
+    return json({ ok: true, ...(await mirrorSweep()) });
   }
 
   // /api/dash/terminal/message — deliver a message into an issue's chat (the
@@ -1784,16 +1890,19 @@ export async function handleTerminalHttp(req, res, segs) {
     return json(r, r.ok ? 200 : (r.status || 500));
   }
 
-  // /api/dash/terminal/git-status — main vs origin/main ahead/behind for the
-  // board's sync button. Fetches, so it's the up-to-date count, not a stale one.
+  // /api/dash/terminal/git-status?env=<main|issue-id> — that env's branch vs its
+  // origin counterpart, ahead/behind. Fetches, so it's up to date, not stale.
   if (req.method === 'GET' && segs[0] === 'git-status') {
-    return json(await gitSyncStatus());
+    const env = new URL(req.url, 'http://x').searchParams.get('env') || MAIN_ENV;
+    return json(await gitSyncStatus({ env }));
   }
 
-  // /api/dash/terminal/git-sync — one-click fast-forward-pull + push of main.
-  // A divergence drops a note into the main chat and returns { conflict:true }.
+  // /api/dash/terminal/git-sync { env } — one-click fast-forward-pull + push of
+  // that env's branch. A divergence drops a note into the env's chat and returns
+  // { conflict:true }.
   if (req.method === 'POST' && segs[0] === 'git-sync') {
-    const r = await gitSync();
+    const { env } = await readBody();
+    const r = await gitSync({ env: env || MAIN_ENV });
     return json(r, r.ok ? 200 : (r.status || 200));
   }
 
@@ -1803,6 +1912,37 @@ export async function handleTerminalHttp(req, res, segs) {
   // dormant ones.
   if (req.method === 'GET' && segs[0] === 'live') {
     return json({ sessions: await liveSessionChats() });
+  }
+
+  // /api/dash/terminal/activity[/stream] — what every live chat on this machine
+  // is DOING, as the supervisor sees it (chat-activity.mjs).
+  //
+  // The stream opens with a full SNAPSHOT and only then sends deltas, which is
+  // the whole point: a board that has just loaded knows every dot from its
+  // first frame instead of watching them arrive as panes mount. `since` stamps
+  // when each state began — the episode identity a client's "I've seen it"
+  // dismissal is keyed to. The plain GET is the same truth without a socket,
+  // for a caller that only wants to look once.
+  if (req.method === 'GET' && segs[0] === 'activity') {
+    if (segs[1] !== 'stream') return json({ sessions: activitySnapshot() });
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-store',
+      Connection: 'keep-alive',
+      // Say it to every proxy in the path: this response is not a document to
+      // be collected before forwarding.
+      'X-Accel-Buffering': 'no',
+    });
+    const frame = (event, data) => { try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch { /* client gone */ } };
+    frame('snapshot', activitySnapshot());
+    const off = subscribeActivity((u) => frame('update', u));
+    // A comment line keeps idle intermediaries from collecting the connection.
+    const beat = setInterval(() => { try { res.write(': ping\n\n'); } catch { /* client gone */ } }, 25000);
+    beat.unref?.();
+    const stop = () => { off(); clearInterval(beat); };
+    req.on('close', stop);
+    res.on('close', stop);
+    return undefined;
   }
 
   // /api/dash/terminal/<id>/open — ensure the dev server is up, then redirect.
@@ -1832,7 +1972,11 @@ export async function handleTerminalHttp(req, res, segs) {
     // param composes correctly, and .href percent-encodes any residual char so it
     // can't split the Location header. The normalized path keeps a single leading
     // slash, so the origin never moves — the same-origin check is belt-and-braces.
-    const origin = `http://localhost:${port}`;
+    // The host comes from the REQUEST, not a literal: on a box the browser is
+    // somewhere else and `localhost:<port>` would be the viewer's own laptop.
+    // Safe to build from — ws-guard already refused every Host but loopback and
+    // the operator's declared ones. See dash/src/same-host-origin.mjs.
+    const origin = sameHostOriginFor(req, port);
     const target = new URL(normalizeAppPath(row.app_path), origin);
     const cb = new URL(req.url, 'http://x').searchParams.get('cb');
     if (cb != null) target.searchParams.set('cb', cb);
@@ -1857,23 +2001,103 @@ export async function handleTerminalHttp(req, res, segs) {
   }
 
   // /api/dash/terminal/worktree
+  //
+  // With `session`, the worktree is built at the path THAT CHAT recorded rather
+  // than at the id-derived one — which is what brings a chat whose workspace was
+  // collected back to life. It has to be that exact path: a chat's home is read
+  // from its transcript's first cwd line and never changes, so a workspace
+  // rebuilt elsewhere would leave resolveChat saying cwd-gone forever. Same act,
+  // same idempotence, same port reservation: resurrection is creation aimed at a
+  // remembered path, not a second mechanism.
   if (req.method === 'POST' && segs[0] === 'worktree') {
-    const { issue } = await readBody();
+    const { issue, session } = await readBody();
     if (!issue) return json({ error: 'issue required' }, 400);
     if (!(await issueExists(issue))) return json({ error: `no such issue "${issue}"` }, 404);
-    const r = await ensureWorktree(issue);
-    if (!r.ok) return json(r, 500);
+    let dir = null;
+    let chatCwd = null;
+    if (session) {
+      if (!validKey(session)) return json({ error: 'invalid session id' }, 400);
+      // The chat must be THIS issue's. Restoring writes to the issue's row (its
+      // branch, its port) and to a directory the chat chose, so an unrelated
+      // session would let one card be rebuilt around another card's work. Same
+      // gate the message path uses — membership, by parsed handle.
+      if (!(await chatLinkedTo(issue, session))) {
+        return json({ error: `session not linked to issue "${issue}"` }, 404);
+      }
+      const chat = await resolveChat(session);
+      // Already runnable — the caller raced someone else, or the directory was
+      // never gone. Reserve the port and report the workspace it has.
+      if (!chat.resumable && !chat.restorable) {
+        return json({ error: `chat cannot be restored here (${chat.reason})`, reason: chat.reason }, 409);
+      }
+      chatCwd = chat.cwd;
+      const space = restorableWorkspace(chat.cwd);
+      if (!space) return json({ error: 'that chat did not run in a worktree of this checkout' }, 409);
+      // Membership is not OWNERSHIP. Issue↔chat links are many-to-many, so a
+      // session legitimately linked to two issues would otherwise let either one
+      // materialise ITS branch at the OTHER's directory — A's work checked out at
+      // B's path, under B's name. The workspace is a separate claim, and the
+      // board is what settles it: the folder must resolve to THIS issue (its id,
+      // or a branch it records) or to no issue at all. A folder some other card
+      // claims is that card's ground, whoever the chat belongs to.
+      const claim = await workspaceClaimants(space.workspace);
+      if (claim.error) return json({ error: claim.error }, 503);
+      if (claim.ids.length && !claim.ids.includes(issue)) {
+        return json({ error: `that chat's workspace "${space.workspace}" belongs to ${claim.ids.join(', ')} — reopen the chat from that card` }, 409);
+      }
+      dir = space.dir;
+    }
+    const r = await ensureWorktree(issue, { dir });
+    // A TYPED reason decides the status, never the shape of the sentence: a
+    // situation the caller can act on is a 409, a board we could not read is a
+    // 503, a git failure is ours (500). Matching on error text would make the
+    // message part of the interface, and rewording it would silently change what
+    // clients are told.
+    if (!r.ok) return json(r, WORKTREE_STATUS[r.reason] ?? 500);
+    // A chat may have run in a SUBDIRECTORY of its workspace, and the branch we
+    // rebuilt onto need not still contain it. Make the exact recorded directory
+    // (restoreCwdInside, which refuses anything a symlink would place outside
+    // the worktree) and then PROVE the chat can run before answering ok. A 200
+    // that leaves the chat dormant is the one outcome this endpoint must never
+    // produce: the pane would offer the same button again, forever.
+    if (chatCwd) {
+      const made = await restoreCwdInside(r.dir, chatCwd);
+      if (!made.ok) return json({ error: `rebuilt ${r.dir} but ${made.error}` }, 409);
+      const after = await resolveChat(session);
+      if (!after.resumable) {
+        return json({ error: `rebuilt ${r.dir} but the chat still cannot run here (${after.reason})`, reason: after.reason }, 500);
+      }
+    }
     const alloc = await reservePort(issue);
     return json({ ...r, port: alloc.port ?? null });
   }
 
+  // /api/dash/terminal/main-chat — ENSURE main's always-present thread.
+  // Idempotent, and the ONLY thing that decides whether main needs one: every
+  // open (and every tab) calls it unconditionally and gets back the thread it
+  // should land on. `created` says whether this call made it, which is all the
+  // client needs to know to open it as new rather than resume.
+  if (req.method === 'POST' && segs[0] === 'main-chat') {
+    const body = await readBody();
+    const agent = agentById(body.agent).id; // normalize unknown → claude
+    // Refuse before minting anything: with the CLI absent there is no thread to
+    // start, and the client renders install guidance off the typed reason.
+    if (!agentById(agent).bin()) {
+      const missing = new AgentMissingError(agent);
+      return json({ error: missing.message, reason: 'agent-missing', agent, install: missing.install }, 409);
+    }
+    const r = await ensureMainChat(agent);
+    return r.error ? json(r, 500) : json(r);
+  }
+
   // /api/dash/terminal/chat — new chat in the env, linked.
-  //   { issue }                              → mint + link a chat; PTY spawns lazily
-  //                                            when the browser attaches (human-launched).
+  //   { issue }                              → mint + link a chat; for an ISSUE the
+  //                                            PTY spawns lazily when the browser
+  //                                            attaches, for MAIN it starts now.
   //   { issue, autonomous:true, flow?, prompt? }
   //                                          → ALSO spawn the PTY server-side now, into
   //                                            the chats map (no sockets attached), running the
-  //                                            given flow (/change or /bug) end-to-end.
+  //                                            /change end-to-end (flow marks a regression).
   //                                            Opening the card later reattaches to it.
   // `issue` is 'main' for a MAIN chat (repo root, tracked in the main store, no
   // worktree/port, never an autonomous kick-off) or an issue id (its worktree).
@@ -1882,28 +2106,37 @@ export async function handleTerminalHttp(req, res, segs) {
     const { issue, flow, prompt, model, effort } = body;
     const agent = agentById(body.agent).id; // normalize unknown → claude
     if (!issue) return json({ error: 'issue required' }, 400);
-    const isMain = issue === MAIN_ENV;
+    // Refuse BEFORE making a worktree, reserving a port or minting an id: with
+    // the CLI absent there is no chat to open, and a half-built environment
+    // behind a failed spawn is worse than a clear "install it first". Structured,
+    // so the client renders guidance rather than the sentence.
+    if (!agentById(agent).bin()) {
+      const missing = new AgentMissingError(agent);
+      return json({ error: missing.message, reason: 'agent-missing', agent, install: missing.install }, 409);
+    }
     // A reviewer chat reviews a branch — always issue-scoped, never main.
     const role = body.role === 'reviewer' ? 'reviewer' : null;
-    if (role && isMain) return json({ error: 'a reviewer chat requires an issue, not main' }, 400);
+    if (issue === MAIN_ENV) {
+      if (role) return json({ error: 'a reviewer chat requires an issue, not main' }, 400);
+      // MAIN has ONE creation path — repo root, no worktree, no port, no shared
+      // selection row, started eagerly. The "+" button lands here; the
+      // always-present thread lands on the same function via ensureMainChat.
+      const r = await createMainChat(agent);
+      if (r.error) return json(r, 500);
+      return json({ ok: true, sessionId: r.sessionId, agent: r.agent, mode: 'new', dir: MAIN_REPO, port: null });
+    }
     // A reviewer FORCES the eager server-side spawn (like an autonomous kick-off)
     // so its PTY is owned by the server and survives the launcher's turn cycle —
     // that survival is the whole point of moving reviews off the reaped bash task.
-    const autonomous = (body.autonomous || role === 'reviewer') && !isMain;
-    // Main runs in the repo root with no worktree and no reserved port; an issue
-    // must exist as a row and gets a worktree + port (idempotent).
-    let dir, port = null;
-    if (isMain) {
-      dir = MAIN_REPO;
-    } else {
-      // Gate on issue existence BEFORE touching git, so a bad id never leaves an
-      // orphaned worktree behind a failed link.
-      if (!(await issueExists(issue))) return json({ error: `no such issue "${issue}"` }, 404);
-      const wt = await ensureWorktree(issue);
-      if (!wt.ok) return json(wt, 500);
-      const alloc = await reservePort(issue);
-      dir = wt.dir; port = alloc.port ?? null;
-    }
+    const autonomous = body.autonomous || role === 'reviewer';
+    // The issue must exist as a row, and gets a worktree + port (idempotent).
+    // Gate on existence BEFORE touching git, so a bad id never leaves an orphaned
+    // worktree behind a failed link.
+    if (!(await issueExists(issue))) return json({ error: `no such issue "${issue}"` }, 404);
+    const wt = await ensureWorktree(issue);
+    if (!wt.ok) return json(wt, 500);
+    const alloc = await reservePort(issue);
+    const dir = wt.dir, port = alloc.port ?? null;
     const flowVal = flow === 'bug' ? 'bug' : 'change';
     // The autonomous first turn: a reviewer gets the review brief, everything
     // else gets the implement-it brief. `prompt` overrides either.
@@ -1915,7 +2148,7 @@ export async function handleTerminalHttp(req, res, segs) {
     // speaks for), covering the + button, spawn-issue and kick-off in one place.
     // A reviewer NEVER writes selected_session, so selection can't flip to it.
     const selectChat = async (sid) => {
-      if (isMain || role === 'reviewer') return;
+      if (role === 'reviewer') return;
       const { update } = await import('./issues-store.mjs');
       // Retry once: the chat is already linked (and, when autonomous, its PTY is
       // spawned), so we must NEVER fail the request and strand a live chat — but a
@@ -1932,14 +2165,10 @@ export async function handleTerminalHttp(req, res, segs) {
     if (!agentById(agent).dashMintsId) {
       // CODEX: it mints its own id, so we spawn eagerly (human AND autonomous),
       // discover the id from its rollout, THEN link it. The browser attaches to
-      // the returned id and REATTACHES to this already-live PTY. Intro: main →
-      // trunk-mode; issue → autonomous brief when kicked off, else summarize-and-wait.
-      let intro;
-      if (isMain) intro = mainChatIntro(agent);
-      else {
-        const meta = await issueMeta(issue);
-        intro = autonomous ? autonomousIntro(meta) : issueChatIntro(issue, meta.title, meta.status);
-      }
+      // the returned id and REATTACHES to this already-live PTY. The intro is the
+      // autonomous brief when kicked off, else summarize-and-wait.
+      const meta = await issueMeta(issue);
+      const intro = autonomous ? autonomousIntro(meta) : issueChatIntro(issue, meta.title, meta.status);
       const r = await spawnCodexNewChat({ issueId: issue, cwd: dir, cols: 100, rows: 30, initialPrompt: intro, model });
       if (r.error) return json({ error: r.error }, 500);
       const link = await linkChat(issue, r.sessionId, agent, role);
@@ -1948,9 +2177,7 @@ export async function handleTerminalHttp(req, res, segs) {
         // so a link failure would strand a live, UNLINKED codex process — invisible
         // to the board and unaddressable. Tear it down rather than leak it; the
         // user retries. (Claude links before spawning, so it can't reach this.)
-        try { r.session.exited = true; r.session.pty?.kill(); } catch {}
-        releaseChat(r.sessionId);
-        chats.delete(r.sessionId);
+        await endChat(r.sessionId);
         return json({ error: `link failed: ${link.error}` }, 500);
       }
       await selectChat(r.sessionId);
@@ -1959,8 +2186,8 @@ export async function handleTerminalHttp(req, res, segs) {
     }
 
     // CLAUDE: the dash mints the uuid up front and links it; the PTY spawns
-    // lazily when the browser attaches (human, with mainChatIntro/issueChatIntro
-    // chosen there) or eagerly now (autonomous — issue only).
+    // lazily when the browser attaches (human, with issueChatIntro chosen there)
+    // or eagerly now (autonomous).
     const sessionId = crypto.randomUUID();
     const link = await linkChat(issue, sessionId, agent, role);
     if (link?.error) return json({ error: `link failed: ${link.error}` }, 500);
@@ -1995,16 +2222,13 @@ export async function handleTerminalHttp(req, res, segs) {
     const handle = handles.find(h => parseHandle(h).sessionId === session) || session;
     if (issue === MAIN_ENV) {
       unlinkMainChat(handle);
-      await setChatName(issue, session, '');
+      await forgetChatMeta(issue, session);
       return json({ ok: true });
     }
     const { removeFromArray, get, update } = await import('./issues-store.mjs');
     const r = await removeFromArray(issue, 'conversations', [handle]);
     if (r?.error) return json({ error: `unlink failed: ${r.error}` }, 500);
-    // A name belongs to the LINK, not to the transcript: drop it with the
-    // association so an unlinked-then-relinked chat starts from the default and
-    // the map can't accumulate keys for chats the env no longer has.
-    await setChatName(issue, session, '');
+    await forgetChatMeta(issue, session);
     // Keep the invariant: selected_session must point at a LINKED chat. If we just
     // unlinked the selected one, clear it so auto-open falls back and the board
     // stops warming a chat this issue no longer tracks. Authoritative here (not
@@ -2018,7 +2242,7 @@ export async function handleTerminalHttp(req, res, segs) {
   }
 
   // POST /api/dash/terminal/chat-name { issue, session, name } — set or clear a
-  // chat's custom display name within its env (an issue's chat_names column, or
+  // chat's custom display name within its env (an issue's chat_meta column, or
   // the main store's names file). An empty/absent name clears back to the
   // derived label. Returns the whole updated map so the client repaints from the
   // response instead of re-resolving the chat list.

@@ -18,7 +18,7 @@
 
 import { WebSocketServer } from 'ws';
 import react from '@vitejs/plugin-react';
-import { isAllowedWsHandshake, ensureTerminalToken, isLoopbackHost, selectTerminalSubprotocol } from './server/ws-guard.mjs';
+import { isAllowedWsHandshake, ensureMachineToken, isLoopbackHost, selectTerminalSubprotocol } from './server/ws-guard.mjs';
 // Load DASH_SUPABASE_* from .env / .env.local into process.env BEFORE anything
 // reads it (the dev middleware store writes with the service role). The browser
 // bundle never imports this file.
@@ -43,7 +43,10 @@ const defineSupabase = {
 // Host-header validation — so pin server.allowedHosts to the loopback names plus
 // whatever hostnames DASH_ALLOWED_ORIGINS names, never the permissive `true`.
 const DEV_HOST = process.env.DASH_HOST || '127.0.0.1';
-const DEV_TOKEN = ensureTerminalToken(!isLoopbackHost(DEV_HOST));
+// Loopback: a token is optional (only when pinned via DASH_TERMINAL_TOKEN).
+// Exposed on the network: mint a durable machine token so the WS handshake
+// requires one.
+const DEV_TOKEN = isLoopbackHost(DEV_HOST) ? (process.env.DASH_TERMINAL_TOKEN || '') : ensureMachineToken();
 const ALLOWED_HOSTS = ['localhost', '127.0.0.1', '[::1]'].concat(
   (process.env.DASH_ALLOWED_ORIGINS || '')
     .split(',')

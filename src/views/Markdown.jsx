@@ -1,4 +1,5 @@
 import React from 'react';
+import { Link } from 'react-router-dom';
 import { ZoomImg } from './ZoomImg.jsx';
 
 // Tiny markdown renderer for recap/note bodies. Handles the subset we use:
@@ -8,10 +9,28 @@ import { ZoomImg } from './ZoomImg.jsx';
 //
 // Not a complete CommonMark — but enough for Dash's hand-edited prose.
 
-export function Markdown({ text }) {
+export function Markdown({ text, onToggleTask }) {
   if (!text) return null;
   const blocks = parseBlocks(text);
-  return <div className="recap-body">{blocks.map((b, i) => renderBlock(b, i))}</div>;
+  // Task-list checkboxes render in document order; each carries its ordinal so a
+  // click can flip the matching `[ ]`/`[x]` in the source. `ctx.taskIndex` is a
+  // render-time counter — deterministic per render, mutated as blocks map.
+  const ctx = { taskIndex: 0, onToggleTask };
+  return <div className="recap-body">{blocks.map((b, i) => renderBlock(b, i, ctx))}</div>;
+}
+
+// Flip the `index`-th task-list checkbox in `md` to `checked`, returning the new
+// markdown. Scans lines in the SAME document order the renderer counts them, so
+// the ordinal a clicked checkbox reports lines up with the source line here.
+export function toggleTask(md, index, checked) {
+  let n = -1;
+  return (md || '').split('\n').map(line => {
+    const m = line.match(/^(\s*(?:[-*]|\d+\.)\s+)\[( |x|X)\]/);
+    if (!m) return line;
+    n++;
+    if (n !== index) return line;
+    return line.replace(/^(\s*(?:[-*]|\d+\.)\s+)\[( |x|X)\]/, `$1[${checked ? 'x' : ' '}]`);
+  }).join('\n');
 }
 
 function parseBlocks(text) {
@@ -91,7 +110,7 @@ function parseListItems(lines) {
   return items;
 }
 
-function renderBlock(b, key) {
+function renderBlock(b, key, ctx) {
   switch (b.type) {
     case 'heading': {
       const Tag = `h${Math.min(b.level + 1, 6)}`; // demote h1→h2 since the page already has an h2
@@ -104,16 +123,34 @@ function renderBlock(b, key) {
     case 'quote':
       return <blockquote key={key}>{renderInline(b.text)}</blockquote>;
     case 'list': {
+      const hasTask = b.items.some(it => /^\[( |x|X)\]\s/.test(it));
       const Tag = b.ordered ? 'ol' : 'ul';
-      return React.createElement(Tag, { key }, b.items.map((it, j) => (
-        <li key={j}>{renderInline(it)}</li>
-      )));
+      return React.createElement(Tag, { key, className: hasTask ? 'md-tasklist' : undefined },
+        b.items.map((it, j) => renderListItem(it, j, ctx)));
     }
     case 'code':
       return <pre key={key}><code>{b.text}</code></pre>;
     default:
       return null;
   }
+}
+
+// A list item; a `[ ]`/`[x]` prefix makes it an interactive task item. The
+// checkbox is disabled unless the caller passed `onToggleTask` (read-only
+// views are read-only; only the issue detail wires persistence).
+function renderListItem(text, key, ctx) {
+  const m = text.match(/^\[( |x|X)\]\s+([\s\S]*)$/);
+  if (!m) return <li key={key}>{renderInline(text)}</li>;
+  const checked = m[1].toLowerCase() === 'x';
+  const idx = ctx.taskIndex++;
+  const interactive = typeof ctx.onToggleTask === 'function';
+  return (
+    <li key={key} className="md-task">
+      <input type="checkbox" className="md-task-check" checked={checked} disabled={!interactive}
+        onChange={interactive ? () => ctx.onToggleTask(idx, !checked) : undefined} />
+      <span className={checked ? 'md-task-done' : undefined}>{renderInline(m[2])}</span>
+    </li>
+  );
 }
 
 // Inline: bold, italic, code, links, autolinks for H-ids and bench-N names.
@@ -185,18 +222,22 @@ function applyBoldItalicLink(text) {
   ];
 }
 
-// Auto-link worktree-agent-* references to their board change route.
+// Auto-link H-ids (H001) and bench-N entries to Dash routes
 function linkify(text) {
   if (typeof text !== 'string') return text;
-  const re = /\b(worktree-agent-[a-z0-9]+)\b/g;
+  const re = /\b(H\d{3}[a-z]?(?!\w)|bench-\d+[a-z0-9-]*|worktree-agent-[a-z0-9]+)\b/g;
   const out = [];
   let lastIdx = 0;
   let m;
   while ((m = re.exec(text))) {
     if (m.index > lastIdx) out.push(text.slice(lastIdx, m.index));
     const token = m[0];
-    const href = `#/changes/${encodeURIComponent(token.replace(/^worktree-agent-/, ''))}`;
-    out.push(<a key={m.index} href={href}>{token}</a>);
+    // Router links (basename-relative — BrowserRouter prepends /dash), so a click
+    // does a real in-app navigation to the path URL, not a dead hash write.
+    let to = '';
+    if (/^bench-/.test(token)) to = `/tests/${encodeURIComponent(token)}`;
+    else if (/^worktree-agent-/.test(token)) to = `/issues/${encodeURIComponent(token.replace(/^worktree-agent-/, ''))}`;
+    out.push(<Link key={m.index} to={to}>{token}</Link>);
     lastIdx = m.index + token.length;
   }
   if (lastIdx < text.length) out.push(text.slice(lastIdx));

@@ -6,8 +6,9 @@
 // (`hk(id)`), the tooltip pulls its rendered caps (`hkCaps(id)` / `hkTitle(id)`),
 // and the overlay (ShortcutsOverlay.jsx) renders the whole list grouped by scope.
 //
-// It does NOT replace `useHotkey` (src/hotkeys.js) — it FEEDS it: the focus-model
-// that keeps chords alive over the chat terminal still lives there; this only owns
+// This is the source of truth `docs/hotkeys.md` now points at. It does NOT
+// replace `useHotkey` (dash/src/hotkeys.js) — it FEEDS it: the focus-model that
+// keeps chords alive over the chat terminal still lives there; this only owns
 // which combo each named shortcut is and how it reads on screen.
 //
 // An entry is `{ id, (combos | keys), label, scope, twin? }`:
@@ -21,7 +22,9 @@
 //   • label — what the shortcut does, in plain words.
 //   • scope — which surface it fires on; groups the overlay and (optionally) dims
 //     out-of-context rows. See SCOPES.
-//   • twin — the pointer affordance that mirrors it, if any. Metadata, not rendered.
+//   • twin — the pointer affordance that mirrors it, if any (a control whose
+//     tooltip sources from this entry, or a raw gesture like drag/click). Its
+//     presence is `hasPointerTwin`; it's metadata + documentation, not rendered.
 
 const IS_MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform || '');
 
@@ -97,8 +100,8 @@ export const SCOPES = [
 ];
 
 // Every Dash shortcut, once. Grouped by scope in declaration order (that's the
-// overlay's order too). Combos MUST match the `useHotkey` (or `matchesCombo`)
-// call sites verbatim — `hk(id)` feeds them straight back in.
+// overlay's order too). Combos MUST match the `useHotkey` call sites verbatim —
+// `hk(id)` feeds them straight back in.
 export const HOTKEYS = [
   // ── Everywhere ──────────────────────────────────────────────────────────
   { id: 'search', combos: ['Mod+KeyK'], label: 'Search issues', scope: 'global', twin: 'search icon' },
@@ -111,20 +114,30 @@ export const HOTKEYS = [
   { id: 'boardJump', keys: { top: 'Alt+ArrowUp', bottom: 'Alt+ArrowDown' }, label: 'Jump to column top / bottom', scope: 'board' },
   { id: 'boardExtend', keys: { up: 'Shift+ArrowUp', down: 'Shift+ArrowDown' }, label: 'Extend selection up / down', scope: 'board' },
   { id: 'boardReorder', keys: { up: 'Mod+ArrowUp', down: 'Mod+ArrowDown' }, label: 'Reorder selected card', scope: 'board', twin: 'drag' },
-  { id: 'boardOpen', combos: ['Enter'], label: 'Open the selected card', scope: 'board', twin: 'click' },
+  { id: 'boardOpen', combos: ['Enter'], label: 'Open card · toggle column', scope: 'board', twin: 'click' },
+  { id: 'boardCopyId', combos: ['Mod+KeyS'], label: "Copy selected card's id", scope: 'board' },
+  { id: 'boardDismissFlag', combos: ['Mod+Escape'], label: "Dismiss selected card's needs-input flag", scope: 'board' },
+  { id: 'focusChat', combos: ['Mod+ArrowRight'], label: 'Move focus to the chat', scope: 'board' },
+  { id: 'focusBoard', combos: ['Mod+ArrowLeft'], label: 'Move focus to the board', scope: 'board' },
+  { id: 'viewToggle', combos: ['Mod+KeyL'], label: 'Board / list layout', scope: 'board', twin: 'view toggle' },
 
   // ── Issue detail ────────────────────────────────────────────────────────
   // Two keys for one action — the ⌘← chord (fires over the chat terminal) and a
   // bare Esc (yields to it). Both navigate to the list; both belong in the list.
   { id: 'detailBack', keys: { arrow: 'Mod+ArrowLeft', esc: 'Escape' }, label: 'Back to the issues list', scope: 'detail', twin: 'issues crumb' },
+  { id: 'issuePrev', combos: ['Mod+ArrowUp'], label: 'Previous issue', scope: 'detail', twin: 'crumb chevron' },
+  { id: 'issueNext', combos: ['Mod+ArrowDown'], label: 'Next issue', scope: 'detail', twin: 'crumb chevron' },
+  { id: 'detailDismissFlag', combos: ['Mod+Escape'], label: "Dismiss this issue's needs-input flag", scope: 'detail', twin: '✕ idle button' },
   { id: 'detailCopyId', combos: ['Mod+KeyS'], label: "Copy this issue's id", scope: 'detail', twin: 'copy-id crumb' },
 
   // ── App panel ───────────────────────────────────────────────────────────
   { id: 'appCode', combos: ['Mod+KeyE'], label: 'Toggle App / Code', scope: 'panel', twin: 'App/Code tabs' },
+  { id: 'appLink', keys: { prev: 'Mod+Alt+ArrowUp', next: 'Mod+Alt+ArrowDown' }, label: 'Previous / next app link', scope: 'panel', twin: 'address ⌃⌄ steppers' },
 
   // ── Text editors ────────────────────────────────────────────────────────
-  { id: 'bodySave', combos: ['Mod+Enter'], label: 'Save the description', scope: 'text', twin: 'Save button' },
-  { id: 'bodyCancel', combos: ['Escape'], label: 'Cancel editing', scope: 'text', twin: 'Cancel button' },
+  // The description saves itself as you pause, so there is nothing to commit or
+  // abandon — both combos mean the same thing: stop editing.
+  { id: 'bodyDone', combos: ['Mod+Enter', 'Escape'], label: 'Finish editing the description', scope: 'text', twin: 'click outside' },
 ];
 
 // Normalize: a cluster declares `keys` (name→combo); its `combos` (the display

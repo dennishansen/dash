@@ -6,10 +6,41 @@
 // navbar host label both resolve the app through here so they can never drift.
 export const MAIN_ENV = 'main';
 
-// The URL that loads env's running app. Same-origin, so it works directly as the
-// app panel's iframe src.
-export function appUrlForEnv(env) {
-  return env === MAIN_ENV ? '/' : `/api/dash/terminal/${encodeURIComponent(env)}/open`;
+// The URL that loads env's running app on `appPath`. Same-origin, so it works
+// directly as the app panel's iframe src. An issue env resolves its route
+// SERVER-side — /open reads the stored app_path off the row and redirects onto
+// it — so the path is not in the URL there; MAIN is this origin, so its route is
+// simply the path itself.
+export function appUrlForEnv(env, appPath = '/') {
+  return env === MAIN_ENV ? normalizeAppPath(appPath) : `/api/dash/terminal/${encodeURIComponent(env)}/open`;
+}
+
+// The routes every dev server in this repo serves, so they need no storage: the
+// canvas and the dash. Every env's link list starts here.
+export const BASE_APP_PATHS = ['/', '/dash/'];
+
+// An env's full ordered link list: the base set, then its saved custom routes,
+// then the selected route if it is neither. Normalized and deduped, so a custom
+// entry can never shadow a base one — and the selected route is ALWAYS in the
+// list, which is what makes "step to the next link" total rather than a lookup
+// that can miss.
+export function appLinkList(custom, selected) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of [...BASE_APP_PATHS, ...(Array.isArray(custom) ? custom : []), selected]) {
+    if (raw == null) continue;
+    const p = normalizeAppPath(raw);
+    if (seen.has(p)) continue;
+    seen.add(p);
+    out.push(p);
+  }
+  return out;
+}
+
+// Is this route one of the base three? Base links are the floor of every list —
+// they can be selected but not removed.
+export function isBaseAppPath(path) {
+  return BASE_APP_PATHS.includes(normalizeAppPath(path));
 }
 
 // The port shown on the link. Main shows this origin's port (the canvas);
@@ -32,7 +63,7 @@ export function appPortForEnv(env, port) {
 //     them. (The server ALSO rebuilds the redirect through the URL API, which
 //     percent-encodes anything left — belt and suspenders.)
 // null / '' / '/' all mean the canvas root. Query/hash are preserved (a stored
-// `/dash/#/tests` is legitimate); the server merges its cache-bust correctly.
+// `/dash/issues?tag=x` is legitimate); the server merges its cache-bust correctly.
 export function normalizeAppPath(path) {
   const p = (path ?? '').replace(/[\x00-\x1f\x7f]/g, '').trim();
   if (!p || p === '/') return '/';

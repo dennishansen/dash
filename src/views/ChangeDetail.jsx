@@ -1,25 +1,36 @@
-import React, { useEffect, useLayoutEffect, useState, useRef, useMemo } from 'react';
+import React, { Fragment, useCallback, useEffect, useLayoutEffect, useState, useRef, useMemo } from 'react';
 import { Link, useParams, useNavigate, useLocation } from 'react-router-dom';
-import { useAsync, useIssuesRealtime, fmtDate } from '../api.js';
-import { changeDetail, renameChange, updateChangeField, setChangeStatus, setChangeDep, deleteChange, listChanges } from '../board-store.js';
-import { BUCKETS } from './ChangesBoard.jsx';
+import { useIssues, useFetch, fmtDate } from '../api.js';
+import { changeDetail, listChanges, renameChange, updateChangeField, setChangeStatus, setChangeDep, deleteChange } from '../board-store.js';
+import { COLUMNS, DEFAULT_STATUS } from '../board-columns.mjs';
 import { useLocalBackend } from '../capabilities.js';
-import { useSelection, useIssueNav } from '../selection.jsx';
-import { useActivity } from '../activity-store.js';
-import { Markdown } from './Markdown.jsx';
+import { useSelection, useIssueNav, isDetailRoute } from '../selection.jsx';
+import { useActivity, issueActivity, dismissIssueIdle } from '../activity-store.js';
+import { useHotkey, matchesCombo } from '../hotkeys.js';
+import { hk, hkCaps } from '../hotkey-registry.js';
+import { Markdown, toggleTask } from './Markdown.jsx';
 import { CopyButton } from './CopyButton.jsx';
-import { useChatControl } from '../chat-control.jsx';
+import { normalizeBody } from '../mdx-body.js';
 import { X, Pencil, Trash, User, ArrowUpRight } from '../icons.jsx';
 import { Avatar, PersonLabel, usePeople, useDismiss, normalizeEmail } from '../profiles.jsx';
 import { OptionMenu } from '../OptionMenu.jsx';
 import { useAnchoredPopover } from '../popover.js';
 import { tagPillClass } from '../tag-style.js';
+import {
+  MDXEditor, headingsPlugin, listsPlugin, quotePlugin, thematicBreakPlugin,
+  linkPlugin, linkDialogPlugin, imagePlugin, tablePlugin, codeBlockPlugin,
+  codeMirrorPlugin, markdownShortcutPlugin, toolbarPlugin,
+  UndoRedo, BoldItalicUnderlineToggles, BlockTypeSelect, ListsToggle,
+  CreateLink, InsertCodeBlock,
+} from '@mdxeditor/editor';
+import '@mdxeditor/editor/style.css';
+import { getTheme, onThemeChange } from '../theme.js';
 
 // Inline-editable issue title. Looks like the static <h2> (CSS .title-edit),
 // gaining a box outline only on hover / focus. Enter or blur saves via
 // renameChange (Supabase, works remotely too); Escape reverts. On a failed
 // write we restore the prior title rather than leave a phantom edit on screen.
-function EditableTitle({ id, title, onSaved, autoFocus }) {
+function EditableTitle({ id, title, autoFocus }) {
   const [val, setVal] = useState(title);
   const skipBlur = useRef(false);
   const ref = useRef(null);
@@ -70,7 +81,6 @@ function EditableTitle({ id, title, onSaved, autoFocus }) {
     try {
       const r = await renameChange(id, next);
       if (r && r.error) throw new Error(r.error);
-      onSaved && onSaved();
     } catch {
       setVal(title);
     }
@@ -105,11 +115,11 @@ function EmptySlot({ label }) {
 }
 
 // One chip inside a ChipMultiSelect trigger. A plain display pill (the trigger
-// wrapper owns the click that opens the editor). When the chip carries a `to` it
-// also gets a hover/focus-reveal external-link glyph (the .field-pill--reveal
-// pattern) that navigates straight to that target; stopPropagation keeps that
-// click from also toggling the menu. Long labels truncate. (OSS uses this only
-// for tags today — tags carry no `to` — but it stays generic to match private.)
+// wrapper owns the click that opens the editor). When the chip carries a `to`,
+// it also gets a hover-reveal external-link glyph (the .field-pill--reveal
+// pattern) that navigates straight to that target — the ONLY navigation out of a
+// chip; the body-click opens the editor instead. `stopPropagation` keeps the
+// glyph's click from also toggling the menu. Long labels (issue titles) truncate.
 function Chip({ label, className = '', to }) {
   const body = <span className="chip-label">{label}</span>;
   if (!to) return <span className={`field-pill ${className}`}>{body}</span>;
@@ -124,34 +134,106 @@ function Chip({ label, className = '', to }) {
   );
 }
 
-// The shared chip-multiselect shell. The value ITSELF is the trigger: the chips
-// (or an "Empty" placeholder) are clickable and open the editor. The dropdown IS
-// the shared OptionMenu (the same popover the board filters use): a search/create
-// header, then the whole vocabulary as a checklist with the SELECTED members
-// floated to the top. When `onCreate` is supplied (free-text tags) a "Create
-// <query>" row appears for a query that matches nothing.
+// A run of value pills that wraps to at most `lines` rows; whatever doesn't fit
+// collapses into a trailing "+N". Each pill self-truncates at 140px, and wrapped
+// rows carry a vertical gap. How many pills fit is MEASURED off a hidden twin
+// that lays out the full set at the run's real width — so the visible count is a
+// pure function of width, with no flicker loop (the twin never changes with the
+// decision it drives). This is the ONE truncation rule behind every property
+// value — tags, requires, unlocks, branch, sessions — so they all read the same.
+//
+//   items: [{ key, node, text, pillClass? }]  node = the real (interactive) pill;
+//          text/pillClass size the twin and fill the "+N" tooltip. The run keys
+//          each node off item.key itself, so callers hand over a bare pill.
+//   lines: the row budget — 1 in the collapsed strip, 3 in the sidebar column.
+function PillRun({ items, lines }) {
+  const ref = useRef(null);
+  // shown = how many pills render; budget = the width the run wraps within, only
+  // PINNED onto the run when it actually truncates (a cell with a short value
+  // still sizes to its content — the cap only bites when the value overflows).
+  const [fit, setFit] = useState({ shown: items.length, budget: 0 });
+  useLayoutEffect(() => {
+    const host = ref.current;
+    if (!host) return;
+    const twin = host.querySelector('.pill-run-measure');
+    const measure = () => {
+      // The wrap width: in the sidebar column the value fills a fixed track, so
+      // its own box is the budget; in the collapsed strip a cell is content-sized
+      // (no definite width to wrap against), so use its max-width cap instead.
+      const cell = host.closest('.prop-cell');
+      const inColumn = !!host.closest('.props-strip--column');
+      const cap = cell ? parseFloat(getComputedStyle(cell).maxWidth) : NaN;
+      const budget = inColumn || !Number.isFinite(cap)
+        ? host.parentElement.clientWidth
+        : cap;
+      twin.style.width = `${budget}px`;
+      const kids = [...twin.children];
+      if (!kids.length) { setFit({ shown: 0, budget }); return; }
+      const tops = [];
+      for (const k of kids) { const t = k.offsetTop; if (!tops.includes(t)) tops.push(t); }
+      const lastTop = tops[Math.min(lines, tops.length) - 1];
+      const inBudget = kids.filter(k => k.offsetTop <= lastTop + 1);
+      if (inBudget.length === kids.length) { setFit({ shown: kids.length, budget }); return; }
+      // Overflow: reserve room for the "+N" on the last budgeted row, popping
+      // trailing pills off that row until the badge fits.
+      const right = twin.getBoundingClientRect().right;
+      const RESERVE = 42;
+      const lastRow = inBudget.filter(k => k.offsetTop === lastTop);
+      let keep = inBudget.length, i = lastRow.length - 1;
+      while (i >= 0 && right - lastRow[i].getBoundingClientRect().right < RESERVE) { keep--; i--; }
+      setFit({ shown: Math.max(keep, 1), budget });
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(host.parentElement);
+    return () => ro.disconnect();
+  }, [items, lines]);
+
+  const more = items.length - fit.shown;
+  return (
+    <span className="pill-run" ref={ref}
+      style={more > 0 && fit.budget ? { width: fit.budget } : undefined}>
+      {items.slice(0, fit.shown).map(it => <Fragment key={it.key}>{it.node}</Fragment>)}
+      {more > 0 ? (
+        <span className="field-pill chip-overflow" title={items.slice(fit.shown).map(it => it.text).join('\n')}>+{more}</span>
+      ) : null}
+      {/* The measuring twin: plain ghosts (NO semantic pill classes — those would
+          double-count in queries and leak dangling/tag styling), so the ghost's
+          only styling is the shared 140px cap that governs a pill's width. */}
+      <span className="pill-run-measure" aria-hidden="true">
+        {items.map(it => (
+          <span key={it.key} className="field-pill pill-run-ghost">{it.text}</span>
+        ))}
+      </span>
+    </span>
+  );
+}
+
+// The shared chip-multiselect shell — one control behind tags, requires AND
+// unlocks. The value ITSELF is the trigger: the chips (or an "Empty" placeholder)
+// are clickable and open the editor. The dropdown IS the shared OptionMenu (the
+// same popover the board filters use): a search/create header, then the whole
+// vocabulary as a checklist with the SELECTED members floated to the top — so you
+// see the whole set and add/remove by clicking. When `onCreate` is supplied
+// (free-text tags) a "Create <query>" row appears for a query that matches
+// nothing. The three axes tags and deps differ on are all props: the chip
+// `label`/`className`/`to` (tag string vs issue title-via-`known`, with a dangling
+// fallback and an external-link out), the add-vocabulary `options`, and the
+// `onToggle`/`onCreate` mutations (updateChangeField vs setChangeDep, which
+// maintains the inverse edge).
 //
 //   selected: [{ key, label, className?, to? }]  the chips currently on
 //   options:  [{ key, label }]                   the add-vocabulary (selected filtered out)
 //   onToggle(key)   flip membership       onCreate(query)?  add a brand-new member
-function ChipMultiSelect({ selected, options, onToggle, onCreate, triggerTitle, emptyLabel = 'nothing set', searchPlaceholder = 'Search…', emptyHint }) {
+function ChipMultiSelect({ selected, options, onToggle, onCreate, triggerTitle, emptyLabel = 'nothing set', searchPlaceholder = 'Search…', emptyHint, lines = 1 }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState('');
   const inputRef = useRef(null);
   const close = () => { setOpen(false); setQ(''); };
   const wrapRef = useDismiss(open, close);
-  // Capture phase + stopPropagation so Escape closes the menu WITHOUT also
-  // reaching the detail view's "Escape → back to board" listener — the same
-  // pattern StatusPill / OwnerAvatar use (OSS ChangeDetail avoids useHotkey here).
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
-    window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
-  }, [open]);
+  useHotkey('Escape', close, { enabled: open, terminal: 'handle', allowInInput: true });
   useEffect(() => { if (open) inputRef.current?.focus(); }, [open]);
 
-  const VISIBLE = 2; // chips shown inline before collapsing the rest into "+N"
   const query = q.trim();
   const match = (label) => label.toLowerCase().includes(query.toLowerCase());
   const selectedKeys = new Set(selected.map(s => s.key));
@@ -169,17 +251,20 @@ function ChipMultiSelect({ selected, options, onToggle, onCreate, triggerTitle, 
 
   return (
     <span className="chip-select" ref={wrapRef}>
-      {/* role=button (not <button>) so a chip can legally nest its reveal <Link>.
-          Enter/Space open; the whole value is one click target. */}
+      {/* role=button (not <button>) so dep chips can legally nest their reveal
+          <Link>. Enter/Space open; the whole value is one click target. */}
       <div className="chip-trigger" role="button" tabIndex={0} title={triggerTitle}
         aria-haspopup="listbox" aria-expanded={open}
         onClick={() => setOpen(o => !o)}
+        // Only the trigger's OWN Enter/Space opens the menu — a keydown that
+        // bubbled up from a chip's focused reveal <Link> must be left alone so
+        // keyboard Enter follows the link instead of toggling the menu.
         onKeyDown={e => { if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) { e.preventDefault(); setOpen(o => !o); } }}>
         {selected.length ? (
-          <>
-            {selected.slice(0, VISIBLE).map(s => <Chip key={s.key} {...s} />)}
-            {selected.length > VISIBLE ? <span className="field-pill chip-overflow">+{selected.length - VISIBLE}</span> : null}
-          </>
+          <PillRun lines={lines} items={selected.map(({ key, ...chip }) => ({
+            key, text: chip.label, pillClass: chip.className,
+            node: <Chip {...chip} />,
+          }))} />
         ) : <EmptySlot label={emptyLabel} />}
       </div>
       {open ? (
@@ -211,22 +296,19 @@ function ChipMultiSelect({ selected, options, onToggle, onCreate, triggerTitle, 
 }
 
 // Tags configured on the shared shell: free-text labels over the board's tag
-// vocabulary, create-on-miss, no external link. The mutation is updateChangeField
-// (then onChanged refreshes the detail, matching OSS's other field writers).
-function TagSelect({ id, tags, allTags, onChanged }) {
-  const toggle = async (t) => {
+// vocabulary, create-on-miss, no external link. The mutation is updateChangeField.
+function TagSelect({ id, tags, allTags, lines }) {
+  const toggle = (t) => {
     const tag = t.trim();
     if (!tag) return;
-    const next = tags.includes(tag) ? tags.filter(x => x !== tag) : [...tags, tag];
-    const r = await updateChangeField(id, 'tags', next);
-    if (!(r && r.error)) onChanged?.();
+    updateChangeField(id, 'tags', tags.includes(tag) ? tags.filter(x => x !== tag) : [...tags, tag]);
   };
   const selected = tags.map(t => ({ key: t, label: t, className: tagPillClass(t) }));
   const options = (allTags || []).map(t => ({ key: t, label: t }));
   return (
     <ChipMultiSelect selected={selected} options={options} onToggle={toggle} onCreate={toggle}
       triggerTitle="Edit tags" searchPlaceholder="Search or create…"
-      emptyHint="no tags yet" />
+      emptyHint="no tags yet" lines={lines} />
   );
 }
 
@@ -234,14 +316,12 @@ function TagSelect({ id, tags, allTags, onChanged }) {
 // (from `known`, with the id as a dangling fallback), each with an external-link
 // out; the add-vocabulary is every other issue by title (no free-text create).
 // The mutation is setChangeDep, which maintains the INVERSE edge on the other
-// issue's row — dropping a `requires` drops the matching `unlocks` there — then
-// re-fetches so both chip rows repaint.
-function DepSelect({ id, field, list, known, onChanged }) {
-  const toggle = async (dep) => {
+// issue's row — dropping a `requires` drops the matching `unlocks` there.
+function DepSelect({ id, field, list, known, lines }) {
+  const toggle = (dep) => {
     if (!dep || dep === id) return;
     const has = list.includes(dep);
-    const r = await setChangeDep(id, field, dep, !has);
-    if (!(r && r.error)) onChanged?.();
+    setChangeDep(id, field, dep, !has, has ? list.filter(d => d !== dep) : [...list, dep]);
   };
   const selected = list.map(dep => {
     const meta = known.get(dep);
@@ -249,7 +329,7 @@ function DepSelect({ id, field, list, known, onChanged }) {
       key: dep,
       label: meta ? (meta.title || dep) : dep,
       className: meta ? 'deps-chip' : 'deps-chip deps-chip--dangling',
-      to: `/changes/${encodeURIComponent(dep)}`,
+      to: `/issues/${encodeURIComponent(dep)}`,
     };
   });
   const options = [...known.values()]
@@ -259,42 +339,215 @@ function DepSelect({ id, field, list, known, onChanged }) {
   return (
     <ChipMultiSelect selected={selected} options={options} onToggle={toggle}
       triggerTitle={`Edit ${field}`} searchPlaceholder="Search issues…"
-      emptyHint="no other issues" />
+      emptyHint="no other issues" lines={lines} />
   );
 }
 
-// A convo pill (opens the chat) whose hover-X is a two-step unlink: first click
-// swaps the pill into a remove/cancel confirm (it severs a chat link), mirroring
-// Terminal.jsx's ChatSwitcher. Only on confirm do we write the shortened list.
-function ConvoPill({ id, convo, conversations, onChanged, onOpen }) {
-  const [confirming, setConfirming] = useState(false);
-  const remove = async (e) => {
-    e.stopPropagation();
-    const next = conversations.filter(c => c !== convo);
-    const r = await updateChangeField(id, 'conversations', next);
-    setConfirming(false);
-    if (!(r && r.error)) onChanged();
+// Clickable status pill: looks like the static bucket pill but opens a menu of
+// the six columns. Picking one writes the issue's status directly (setStatus —
+// no column reorder, the card just changes lanes) and refreshes. This is the
+// detail-view twin of dragging a card between columns on the board. Click-
+// outside or Escape closes; the current status is marked and disabled.
+function StatusPill({ id, status }) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef(null);
+  const { ref: menuRef, style: menuStyle } = useAnchoredPopover(open);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e) => { if (!wrapRef.current?.contains(e.target)) setOpen(false); };
+    window.addEventListener('pointerdown', onDown);
+    return () => window.removeEventListener('pointerdown', onDown);
+  }, [open]);
+  // Escape closes the menu — capture phase, so it wins over the detail view's
+  // bubble-phase "Escape → back to board" without also navigating.
+  useHotkey('Escape', () => setOpen(false), { enabled: open, terminal: 'handle', allowInInput: true });
+
+  // Menu closes at pick time; the write-through mutation paints the new status
+  // in the same breath and confirms (or rolls back) behind it.
+  const pick = (next) => {
+    setOpen(false);
+    if (next !== status) setChangeStatus(id, next);
   };
+
   return (
-    <span className="field-pill field-pill--reveal">
-      <button type="button" className="convo-open" title="Open this chat"
-        style={{ all: 'unset', cursor: 'pointer' }}
-        onClick={() => onOpen?.()}>{String(convo).slice(0, 8)}</button>
-      {confirming ? (
-        <span className="pill-confirm" onClick={e => e.stopPropagation()}>
-          <button type="button" className="issue-chat-confirm-yes" title="Confirm remove"
-            onClick={remove}>remove</button>
-          <button type="button" className="issue-chat-confirm-no" title="Cancel"
-            onClick={(e) => { e.stopPropagation(); setConfirming(false); }}>cancel</button>
-        </span>
-      ) : (
-        <button type="button" className="pill-reveal pill-reveal--remove"
-          title="Remove this chat from the issue" aria-label="Remove chat"
-          onClick={(e) => { e.stopPropagation(); setConfirming(true); }}>
-          <X size={12} />
-        </button>
-      )}
+    <span className="status-menu-wrap" ref={wrapRef}>
+      <button type="button" className={`pill bucket bucket-${status} status-trigger`}
+        aria-haspopup="listbox" aria-expanded={open}
+        title="Change status" onClick={() => setOpen(o => !o)}>
+        {status}
+      </button>
+      {open ? (
+        <ul className="status-menu" role="listbox" ref={menuRef} style={menuStyle}>
+          {COLUMNS.map(b => (
+            <li key={b.key} className={`status-item${b.key === status ? ' is-current' : ''}`}>
+              <button type="button" className={`status-pick pill bucket bucket-${b.key}`}
+                role="option" aria-selected={b.key === status}
+                disabled={b.key === status} onClick={() => pick(b.key)}>
+                {b.title}
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </span>
+  );
+}
+
+// Editable issue body. Renders markdown read-only with a reveal-on-hover pencil;
+// clicking it swaps to a WYSIWYG markdown editor (MDXEditor — headings, lists,
+// code blocks format as you type; the markdown string stays the source of
+// truth). ⌘/Ctrl+Enter or Save commits via updateChangeField (a write-through
+// mutation — every view repaints off the bus, so no onSaved callback); Escape
+// or Cancel reverts. The empty state is itself the entry point — click "add a
+// description" to start.
+// The description. There is ONE thing you can do to it — write in it — so there
+// is no save and no cancel: it writes itself once you pause, and leaving the
+// editor writes whatever is left. What remains are two RENDERINGS of the same
+// text, not two commit modes: the reading view does things the editor cannot
+// (receipt gifs open to full size, task boxes tick), so it stays.
+const AUTOSAVE_MS = 700;
+
+function BodyEditor({ id, body }) {
+  const [editing, setEditing] = useState(false);
+  const [theme, setTheme] = useState(getTheme());
+  // The editor is uncontrolled: markdown={} is the initial value only, and the
+  // live string lives in a ref. Feeding onChange back into markdown={} would
+  // reset the editor (and the caret) on every keystroke.
+  const cur = useRef(body || '');
+  // What the row already holds, so a pause that changed nothing writes nothing
+  // and an issue's `updated` stamp still means someone edited it.
+  const saved = useRef(body || '');
+  const timer = useRef(null);
+  const box = useRef(null);
+  useEffect(() => onThemeChange(setTheme), []);
+  // While not editing, follow the row — another window's edit, or our own write
+  // coming back through the store.
+  useEffect(() => { if (!editing) { cur.current = body || ''; saved.current = body || ''; } }, [body, editing]);
+
+  // One writer, whatever prompted it — a pause in typing, leaving the editor, or
+  // this pane unmounting under you.
+  //
+  // MDXEditor serializes a trailing space in the last paragraph as the hex entity
+  // `&#x20;` (Lexical's way of preserving whitespace markdown would otherwise
+  // strip). A description never wants trailing whitespace, so normalize the tail.
+  const flush = useCallback(() => {
+    clearTimeout(timer.current);
+    const next = normalizeBody(cur.current);
+    if (next === saved.current) return;
+    saved.current = next;
+    updateChangeField(id, 'body', next);
+  }, [id]);
+
+  // Navigating away mid-sentence must not lose it — the unmount is the last
+  // chance to write, and it is exactly the case a debounce would drop.
+  useEffect(() => () => flush(), [flush]);
+
+  // Clicking anywhere outside the editor ends the edit. This is what replaced
+  // Save/Cancel: the text is already written, so leaving is the whole gesture.
+  useEffect(() => {
+    if (!editing) return;
+    const onDoc = (e) => {
+      if (box.current && !box.current.contains(e.target)) { flush(); setEditing(false); }
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [editing, flush]);
+
+  const open = () => { cur.current = body || ''; saved.current = body || ''; setEditing(true); };
+
+  if (editing) {
+    return (
+      <div
+        ref={box}
+        className="recap-body recap-body--editing"
+        // ⌘↵ and Esc both mean "done" now that there is nothing to commit or
+        // abandon — component-owned keys, kept local (not a global hotkey) so
+        // they never fire from the title/tag inputs, and MDXEditor's inner
+        // dialogs (link popup) take Escape first. The combo is SOURCED from the
+        // registry (matchesCombo) like every other shortcut, so it can't drift.
+        onKeyDown={e => {
+          if (matchesCombo(e, hk('bodyDone'))) { e.preventDefault(); flush(); setEditing(false); }
+        }}
+      >
+        <MDXEditor
+          className={`body-mdx ${theme === 'dark' ? 'dark-theme' : ''}`}
+          markdown={body || ''}
+          autoFocus
+          placeholder="Write a description… (markdown)"
+          onChange={v => {
+            cur.current = v;
+            clearTimeout(timer.current);
+            timer.current = setTimeout(flush, AUTOSAVE_MS);
+          }}
+          plugins={[
+            headingsPlugin(), listsPlugin(), quotePlugin(), thematicBreakPlugin(),
+            linkPlugin(), linkDialogPlugin(), imagePlugin(), tablePlugin(),
+            codeBlockPlugin({ defaultCodeBlockLanguage: '' }),
+            codeMirrorPlugin({ codeBlockLanguages: { js: 'JavaScript', jsx: 'JSX', ts: 'TypeScript', css: 'CSS', html: 'HTML', bash: 'Bash', sh: 'Shell', json: 'JSON', md: 'Markdown', '': 'Plain' } }),
+            markdownShortcutPlugin(),
+            toolbarPlugin({
+              toolbarContents: () => (<>
+                <UndoRedo />
+                <BoldItalicUnderlineToggles />
+                <BlockTypeSelect />
+                <ListsToggle />
+                <CreateLink />
+                <InsertCodeBlock />
+              </>),
+            }),
+          ]}
+        />
+      </div>
+    );
+  }
+
+  if (!body) {
+    return (
+      <button type="button" className="empty body-empty-add" onClick={open}>
+        <Pencil size={12} /> add a description
+      </button>
+    );
+  }
+
+  return (
+    <div className="recap-body recap-body--editable">
+      <button type="button" className="body-edit-btn" title="Edit description"
+        aria-label="Edit description" onClick={open}><Pencil size={13} /></button>
+      <Markdown text={body} onToggleTask={async (idx, checked) => {
+        const next = toggleTask(body, idx, checked);
+        if (next !== body) await updateChangeField(id, 'body', next);
+      }} />
+    </div>
+  );
+}
+
+// Destructive delete for the whole issue, top-right of the detail head. Double
+// opt-in (the issue body's requirement): a resting trash icon, first click
+// reveals a "delete / cancel" confirm, only the second click drops the Supabase
+// row — and leaves the now-dead detail route in the SAME breath (the mutation
+// nulls this detail's cache synchronously, so lingering here would flash "not
+// found" until the write round-trips). Write-through owns the rest: failure
+// rolls back and the card visibly returns to the board. A two-step confirm,
+// escalated to red because this can't be undone.
+function DeleteIssue({ id, onDeleted }) {
+  const [confirming, setConfirming] = useState(false);
+  const del = () => {
+    deleteChange(id);
+    onDeleted?.();
+  };
+  if (confirming) {
+    return (
+      <span className="issue-delete-confirm">
+        <button type="button" className="issue-delete-yes"
+          title="Permanently delete this issue" onClick={del}>delete</button>
+        <button type="button" className="issue-delete-no"
+          title="Cancel" onClick={() => setConfirming(false)}>cancel</button>
+      </span>
+    );
+  }
+  return (
+    <button type="button" className="icon-btn issue-delete-btn" title="Delete this issue"
+      aria-label="Delete this issue" onClick={() => setConfirming(true)}><Trash size={15} /></button>
   );
 }
 
@@ -315,15 +568,7 @@ function OwnerAvatar({ id, owner }) {
   const { ref: menuRef, style: menuStyle } = useAnchoredPopover(picking);
   const people = usePeople();
   const wrapRef = useDismiss(picking, () => setPicking(false));
-  // Escape closes the picker without also reaching the detail view's bubble-
-  // phase "Escape → back to board" listener — capture phase + stopPropagation,
-  // the same pattern StatusPill uses.
-  useEffect(() => {
-    if (!picking) return;
-    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); setPicking(false); } };
-    window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
-  }, [picking]);
+  useHotkey('Escape', () => setPicking(false), { enabled: picking, terminal: 'handle', allowInInput: true });
 
   const assign = (email) => {
     setPicking(false);
@@ -331,8 +576,8 @@ function OwnerAvatar({ id, owner }) {
   };
   const key = normalizeEmail(owner);
   // The avatar is nameless on its face, so the tooltip/label must carry WHO —
-  // otherwise a hover reads "Change owner" and the assignee's name is lost.
-  // Resolve from the roster; fall back to the email.
+  // otherwise a hover reads "Change owner" and the assignee's name is lost (it
+  // used to sit in the row). Resolve from the roster; fall back to the email.
   const name = key ? (people.find(p => p.email === key)?.name || key) : null;
   const label = name ? `Owner: ${name} — click to change` : 'Assign an owner';
 
@@ -369,20 +614,33 @@ function OwnerAvatar({ id, owner }) {
   );
 }
 
-// Read-only value pills (branch names, commit shas, session ids: derived
-// worktree/chat metadata, not user-set). Capped at two visible with the rest
-// collapsing into a "+N" — the same truncation the chip trigger uses — so a
-// cell's width stays predictable however many an issue collects. Empty reads a
-// dashed slot like every other empty cell.
-const PILL_CAP = 2;
-function PillValue({ values }) {
-  if (!values.length) return <EmptySlot label="nothing set" />;
-  const extra = values.length - PILL_CAP;
+// A labelled property cell: a small grey label ABOVE its value. EVERY property
+// wears this shape — status, owner, tags, dependencies, branch, sessions, the
+// timestamps — so the block reads as one Notion-style strip. `width` caps the
+// cell so a long value truncates inside itself instead of shoving its neighbours
+// off the row. `offRow` is a cell that wrapped past the first row while the
+// strip is collapsed: hidden by visibility, so it keeps its place in the layout
+// (and stays measurable) but is neither visible nor tabbable.
+function PropCell({ label, width, offRow, children, ...rest }) {
   return (
-    <span className="prop-pills">
-      {values.slice(0, PILL_CAP).map(v => <span key={v} className="field-pill" title={v}>{v}</span>)}
-      {extra > 0 ? <span className="field-pill chip-overflow" title={values.slice(PILL_CAP).join('\n')}>+{extra}</span> : null}
-    </span>
+    <div className={`prop-cell${offRow ? ' prop-cell--offrow' : ''}`}
+      style={width ? { maxWidth: width } : undefined} {...rest}>
+      <span className="prop-label">{label}</span>
+      <span className="prop-value">{children}</span>
+    </div>
+  );
+}
+
+// Read-only value pills (branch names, session ids: derived worktree/chat
+// metadata, not user-set). Same PillRun truncation as the editable chips — a line
+// budget, each pill self-truncating — so every property value reads the same.
+// Empty reads a dashed slot.
+function PillValue({ values, lines }) {
+  if (!values.length) return <EmptySlot label="nothing set" />;
+  return (
+    <PillRun lines={lines} items={values.map(v => ({
+      key: v, text: v, node: <span className="field-pill" title={v}><span className="pill-text">{v}</span></span>,
+    }))} />
   );
 }
 
@@ -401,36 +659,70 @@ function PillValue({ values }) {
 // menu on a visible cell spill past the strip instead of being clipped. Expand
 // state is per-mount — the parent keys this by issue id, so navigating to
 // another issue resets it (no persistence).
-function IssueProperties({ data, known, local, allTags, column, refresh }) {
+// What has actually landed on this issue's branch. Read through the branch
+// recorded on the row — never re-derived from the issue id, which is exactly the
+// assumption readable branch names invalidate.
+//
+// The states are deliberately distinct. "No branch yet", "that branch isn't on
+// this computer" and "the branch exists with nothing past main" are three
+// different facts, and reporting all of them as an empty list would present
+// unseen work as no work.
+function IssueCommits({ id, lines }) {
+  // No polling: commits change when the branch is committed to, which the card
+  // has no way to observe anyway — one read per open, not a timer per card.
+  const { data } = useFetch(`/api/dash/terminal/commits?issue=${encodeURIComponent(id)}`, { pollMs: 0 });
+  if (!data) return <span className="field-word-empty">…</span>;
+  if (data.state === 'no-branch') return <span className="field-word-empty">no branch yet</span>;
+  if (data.state === 'branch-absent') return <span className="field-word-empty" title={`branch "${data.branch}" isn't on this computer`}>not on this computer</span>;
+  if (data.state === 'no-commits') return <span className="field-word-empty">nothing past main</span>;
+  // Same PillRun truncation as every other property value — a line budget, each
+  // pill capped — so commits can't spill past the cell / the sidebar box either.
+  return (
+    <PillRun lines={lines} items={data.commits.map(c => ({
+      key: c.sha, text: c.short,
+      node: <span className="field-pill" title={`${c.short} — ${c.subject}`}><span className="pill-text">{c.short}</span></span>,
+    }))} />
+  );
+}
+
+function IssueProperties({ data, known, local, allTags, column }) {
   const [open, setOpen] = useState(false);
   const [rowH, setRowH] = useState(0);
   const [fit, setFit] = useState(0);
   const stripRef = useRef(null);
   const id = data.id;
-  const status = data.status || 'next';
+  const status = data.status || DEFAULT_STATUS;
   const requires = data.requires || [];
   const unlocks = data.unlocks || [];
   const branches = (data.branches?.length ? data.branches : [data.branch]).filter(Boolean);
   const sessions = data.sessions || [];
 
+  // Pills wrap to ONE line in the collapsed strip (the strip only shows its first
+  // row of cells anyway), THREE lines in the sidebar column (it has the height).
+  const lines = column ? 3 : 1;
+
   const pinned = [
-    { key: 'status', label: 'status', value: <StatusPill id={id} status={status} onChanged={refresh} /> },
+    { key: 'status', label: 'status', value: <StatusPill id={id} status={status} /> },
     { key: 'owner', label: 'owner', value: <OwnerAvatar id={id} owner={data.owner} /> },
-    { key: 'tags', label: 'tags', width: 190, value: <TagSelect id={id} tags={data.tags || []} allTags={allTags} onChanged={refresh} /> },
+    { key: 'tags', label: 'tags', width: 190, value: <TagSelect id={id} tags={data.tags || []} allTags={allTags} lines={lines} /> },
   ];
-  // Dependencies are cells like any other property — an empty one reads as a
-  // dashed slot and is still the editor's trigger, which is how a first edge
-  // gets added.
+  // Dependencies are cells like any other property — an empty one reads "Empty"
+  // and is still the editor's trigger, which is how a first edge gets added.
   const rest = [
-    { key: 'requires', label: 'requires', width: 210, has: requires.length > 0, attrs: { 'data-dep-field': 'requires' }, value: <DepSelect id={id} field="requires" list={requires} known={known} onChanged={refresh} /> },
-    { key: 'unlocks', label: 'unlocks', width: 210, has: unlocks.length > 0, attrs: { 'data-dep-field': 'unlocks' }, value: <DepSelect id={id} field="unlocks" list={unlocks} known={known} onChanged={refresh} /> },
+    { key: 'requires', label: 'requires', width: 210, has: requires.length > 0, attrs: { 'data-dep-field': 'requires' }, value: <DepSelect id={id} field="requires" list={requires} known={known} lines={lines} /> },
+    { key: 'unlocks', label: 'unlocks', width: 210, has: unlocks.length > 0, attrs: { 'data-dep-field': 'unlocks' }, value: <DepSelect id={id} field="unlocks" list={unlocks} known={known} lines={lines} /> },
   ];
   // branch/sessions are read-only worktree/chat metadata. When empty they only
   // exist on a LOCAL backend — remotely they are structurally always empty, so
   // listing them there would be permanent noise. `local !== false` keeps them in
   // while the probe is still deciding (null).
-  if (branches.length || local !== false) rest.push({ key: 'branch', label: 'branch', width: 200, has: branches.length > 0, value: <PillValue values={branches} /> });
-  if (sessions.length || local !== false) rest.push({ key: 'sessions', label: 'sessions', width: 200, has: sessions.length > 0, value: <PillValue values={sessions} /> });
+  if (branches.length || local !== false) rest.push({ key: 'branch', label: 'branch', width: 200, has: branches.length > 0, value: <PillValue values={branches} lines={lines} /> });
+  if (sessions.length || local !== false) rest.push({ key: 'sessions', label: 'sessions', width: 200, has: sessions.length > 0, value: <PillValue values={sessions} lines={lines} /> });
+  // Commits are DERIVED from the branch recorded on the row, not stored — so
+  // they can't drift and nobody has to remember to append a SHA. Fetched only
+  // here, for the one open card: doing this per card on the board would be a git
+  // call per card, which is the repository scan that used to freeze the dash.
+  if (local !== false) rest.push({ key: 'commits', label: 'commits', width: 230, has: false, value: <IssueCommits id={id} lines={lines} /> });
 
   const cells = [
     ...pinned,
@@ -488,179 +780,25 @@ function IssueProperties({ data, known, local, allTags, column, refresh }) {
   );
 }
 
-// A labelled property cell: a small grey label ABOVE its value. EVERY property
-// wears this shape — status, owner, tags, dependencies, branch, sessions, the
-// timestamps — so the block reads as one Notion-style strip. `width` caps the
-// cell so a long value truncates inside itself instead of shoving its neighbours
-// off the row. `offRow` is a cell that wrapped past the first row while the
-// strip is collapsed: hidden by visibility, so it keeps its place in the layout
-// (and stays measurable) but is neither visible nor tabbable.
-function PropCell({ label, width, offRow, children, ...rest }) {
-  return (
-    <div className={`prop-cell${offRow ? ' prop-cell--offrow' : ''}`}
-      style={width ? { maxWidth: width } : undefined} {...rest}>
-      <span className="prop-label">{label}</span>
-      <span className="prop-value">{children}</span>
-    </div>
-  );
-}
-
 // The properties column is a FIXED 200 with 32 of air beside it; the body keeps
 // its 560px reading measure when there's room and gives way down to 360 when
 // there isn't. So the column appears as soon as the pane can hold the narrow
 // body plus the column — not only once the body is at full width — and the two
 // together stay centred in the pane.
+//
+// These four numbers are the ONE definition of the detail's geometry. The
+// threshold is computed here and the same values are handed to CSS as custom
+// properties on .detail (DETAIL_GEOMETRY below), so the stylesheet can never
+// drift from the measurement that decides which layout it is styling — and a
+// test reads the live values off the element instead of restating them.
 const BODY_MIN = 360, BODY_MAX = 560, PROPS_W = 200, PROPS_GAP = 32;
 const SIDEBAR_MIN = BODY_MIN + PROPS_GAP + PROPS_W;
-
-// Clickable status pill: looks like the static bucket pill but opens a menu of
-// the six columns. Picking one writes the issue's status directly (setStatus —
-// no column reorder, the card just changes lanes) and refreshes. This is the
-// detail-view twin of dragging a card between columns on the board. Click-
-// outside or Escape closes; the current status is marked and disabled.
-function StatusPill({ id, status, onChanged }) {
-  const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const wrapRef = useRef(null);
-  const { ref: menuRef, style: menuStyle } = useAnchoredPopover(open);
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e) => { if (!wrapRef.current?.contains(e.target)) setOpen(false); };
-    // Capture phase + stopPropagation so Escape closes the menu WITHOUT also
-    // reaching the detail view's bubble-phase "Escape → back to board" listener.
-    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); setOpen(false); } };
-    window.addEventListener('pointerdown', onDown);
-    window.addEventListener('keydown', onKey, true);
-    return () => { window.removeEventListener('pointerdown', onDown); window.removeEventListener('keydown', onKey, true); };
-  }, [open]);
-
-  const pick = async (next) => {
-    if (next === status) { setOpen(false); return; }
-    setBusy(true);
-    const r = await setChangeStatus(id, next);
-    setBusy(false);
-    setOpen(false);
-    if (!(r && r.error)) onChanged?.();
-  };
-
-  return (
-    <span className="status-menu-wrap" ref={wrapRef}>
-      <button type="button" className={`pill bucket-${status} status-trigger`}
-        aria-haspopup="listbox" aria-expanded={open} disabled={busy}
-        title="Change status" onClick={() => setOpen(o => !o)}>
-        {status}
-      </button>
-      {open ? (
-        <ul className="status-menu" role="listbox" ref={menuRef} style={menuStyle}>
-          {BUCKETS.map(b => (
-            <li key={b.key} className={`status-item${b.key === status ? ' is-current' : ''}`}>
-              <button type="button" className={`status-pick pill bucket-${b.key}`}
-                role="option" aria-selected={b.key === status}
-                disabled={busy || b.key === status} onClick={() => pick(b.key)}>
-                {b.title}
-              </button>
-            </li>
-          ))}
-        </ul>
-      ) : null}
-    </span>
-  );
-}
-
-// Editable issue body. Renders markdown read-only with a reveal-on-hover pencil;
-// clicking it swaps to a raw-markdown textarea. ⌘/Ctrl+Enter or Save commits via
-// updateChangeField (Supabase, works remotely); Escape or Cancel reverts. The
-// empty state is itself the entry point — click "add a description" to start.
-function BodyEditor({ id, body, onSaved }) {
-  const [editing, setEditing] = useState(false);
-  const [val, setVal] = useState(body || '');
-  const ref = useRef(null);
-  useEffect(() => { if (!editing) setVal(body || ''); }, [body, editing]);
-  useEffect(() => { if (editing) { const el = ref.current; if (el) { el.focus(); el.style.height = 'auto'; el.style.height = `${el.scrollHeight}px`; } } }, [editing]);
-
-  const save = async () => {
-    const next = val;
-    if (next === (body || '')) { setEditing(false); return; }
-    const r = await updateChangeField(id, 'body', next);
-    if (!(r && r.error)) { setEditing(false); onSaved?.(); }
-    else setEditing(false);
-  };
-
-  if (editing) {
-    return (
-      <div className="recap-body recap-body--editing">
-        <textarea
-          ref={ref}
-          className="body-edit"
-          value={val}
-          spellCheck={false}
-          aria-label="issue body (markdown)"
-          placeholder="Write a description… (markdown)"
-          onChange={e => { setVal(e.target.value); const el = e.target; el.style.height = 'auto'; el.style.height = `${el.scrollHeight}px`; }}
-          onKeyDown={e => {
-            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); save(); }
-            else if (e.key === 'Escape') { e.preventDefault(); setVal(body || ''); setEditing(false); }
-          }}
-        />
-        <div className="body-edit-actions">
-          <button type="button" className="body-edit-save" onClick={save}>Save</button>
-          <button type="button" className="body-edit-cancel" onClick={() => { setVal(body || ''); setEditing(false); }}>Cancel</button>
-          <span className="body-edit-hint">⌘↵ to save · esc to cancel</span>
-        </div>
-      </div>
-    );
-  }
-
-  if (!body) {
-    return (
-      <button type="button" className="empty body-empty-add" onClick={() => setEditing(true)}>
-        <Pencil size={12} /> add a description
-      </button>
-    );
-  }
-
-  return (
-    <div className="recap-body recap-body--editable">
-      <button type="button" className="body-edit-btn" title="Edit description"
-        aria-label="Edit description" onClick={() => setEditing(true)}><Pencil size={13} /></button>
-      <Markdown text={body} />
-    </div>
-  );
-}
-
-// Destructive delete for the whole issue, top-right of the detail head. Double
-// opt-in (the issue body's requirement): a resting trash icon, first click
-// reveals a "delete / cancel" confirm, only the second click drops the Supabase
-// row — then we leave the now-dead detail route and return to the board. Mirrors
-// ConvoPill's two-step pattern, escalated to red because this can't be undone.
-function DeleteIssue({ id, onDeleted }) {
-  const [confirming, setConfirming] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState(null);
-  const del = async () => {
-    setBusy(true); setErr(null);
-    const r = await deleteChange(id);
-    if (r && r.error) { setErr(r.error); setBusy(false); setConfirming(false); return; }
-    onDeleted?.();
-  };
-  if (confirming) {
-    return (
-      <span className="issue-delete-confirm">
-        <button type="button" className="issue-delete-yes" disabled={busy}
-          title="Permanently delete this issue" onClick={del}>
-          {busy ? 'deleting…' : 'delete'}
-        </button>
-        <button type="button" className="issue-delete-no" disabled={busy}
-          title="Cancel" onClick={() => { setConfirming(false); setErr(null); }}>cancel</button>
-        {err ? <span className="error">{err}</span> : null}
-      </span>
-    );
-  }
-  return (
-    <button type="button" className="icon-btn issue-delete-btn" title="Delete this issue"
-      aria-label="Delete this issue" onClick={() => setConfirming(true)}><Trash size={15} /></button>
-  );
-}
+const DETAIL_GEOMETRY = {
+  '--detail-body-min': `${BODY_MIN}px`,
+  '--detail-body-max': `${BODY_MAX}px`,
+  '--detail-props-w': `${PROPS_W}px`,
+  '--detail-props-gap': `${PROPS_GAP}px`,
+};
 
 // Unified detail for a single change. Reads the issue straight from Supabase
 // (board-store), so it works remotely. The live-branch (kind 'branch') variant
@@ -673,29 +811,33 @@ export function ChangeDetail() {
   const focusTitle = location.state?.focusTitle === true;
   const local = useLocalBackend();
   const { setSelection } = useSelection();
-  const requestChat = useChatControl();
   const activity = useActivity();
-  // Read the issue straight from Supabase (board-store) so detail works remotely.
-  const { data, err, loading, refresh } = useAsync(`change:${id}`, () => changeDetail(id));
+  // Latest-value ref so the route-level chord handler (registered once) can
+  // dismiss the CURRENT idle episode without re-subscribing on every activity
+  // tick. Assigned below once `idle`/`data` are known; null until then.
+  const dismissIdleRef = useRef(null);
+  // Read the issue straight from Supabase (board-store) so detail works
+  // remotely. useIssues refetches on every issues-change signal — including the
+  // writes THIS view makes (rename, status, tags, body, convo unlink), which is
+  // why the widgets below carry no refresh callbacks: they write, the bus
+  // repaints every mounted view, board included.
+  const { data, err, loading } = useIssues(`change:${id}`, () => changeDetail(id));
+  // Known issues for the deps panel: id→row, powering the requires/unlocks chip
+  // tooltips, typeahead options, and dangling detection. Shares the board's
+  // 'changes' cache key — warm if the board's been visited, one cheap list fetch
+  // (no bodies) otherwise.
+  const { data: allIssues } = useIssues('changes', listChanges);
+  const known = useMemo(() => new Map((allIssues || []).map(r => [r.id, r])), [allIssues]);
   // Every tag in use across the board — the tag multiselect's option list (issue
   // tags are free text, so this is a convenience set, not a closed vocabulary).
-  // Shares the board's 'changes' cache key, so it's already warm.
-  const { data: allIssues } = useAsync('changes', listChanges);
   const allTags = useMemo(() => [...new Set((allIssues || []).flatMap(r => r.tags || []))].sort(), [allIssues]);
-  // Known issues for the deps panel: id→row, powering the requires/unlocks chip
-  // titles, typeahead options, and dangling detection. Shares the same 'changes'
-  // cache as allTags — one cheap list fetch (no bodies).
-  const known = useMemo(() => new Map((allIssues || []).map(r => [r.id, r])), [allIssues]);
-  // Live updates everywhere: any issue row change arrives over the browser-side
-  // Supabase Realtime subscription the board uses (realtime.js), so convos /
-  // branches refresh without a poll wait — local and remote alike.
-  useIssuesRealtime(refresh);
 
-  // Record which card we came in on, so ⌘← / Esc returns the board cursor here.
+  // Record which card we came in on, so ⌘← / Esc returns the board cursor here
+  // (and prev/next nav below drags the board cursor along with it).
   useEffect(() => { setSelection(id); }, [id, setSelection]);
-  // Neighbors on the board's published order — used to park the cursor after a
-  // delete (the card that slides into the deleted slot).
-  const { prevId, nextId } = useIssueNav(id);
+  // Prev/next nav on the board's published rail — the same `go` the breadcrumb
+  // chevrons use (main.jsx), so both surfaces share one navigation semantics.
+  const { prevId, nextId, go } = useIssueNav(id);
   // Properties ride to the RIGHT of the body once the pane is wide enough to
   // hold both, and sit above it as a strip when it isn't. The pane is what
   // changes width here (the chat/app docks open and close beside it), so this
@@ -715,50 +857,65 @@ export function ChangeDetail() {
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
-  useEffect(() => {
-    const onKey = (e) => {
-      const t = e.target;
-      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
-      // ⌘← (not bare ←, which collides with text-cursor / nav) or Esc → board.
-      if ((e.key === 'ArrowLeft' && (e.metaKey || e.ctrlKey)) || e.key === 'Escape') {
-        e.preventDefault();
-        navigate('/');
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [navigate]);
+  // Nav chords belong to the ROUTE, not the focused pane. As modifier chords they
+  // fire even while the chat terminal owns focus (the shared primitive's chord-
+  // transparency), yet real text fields — the inline title/body editors — keep
+  // every key. ⌘← (not bare ←, which collides with text-cursor / nav) → board;
+  // ⌘↑/⌘↓ walk the board's visible order without leaving the detail (clamped at
+  // the ends by `go`); ⌘Esc dismisses this issue's needs-input dot.
+  // `isDetailRoute` is the event-time twin of the board's `isBoardRoute` gate:
+  // after ⌘← navigates to the board, this detail stays mounted for a frame (its
+  // listeners still attached), so without the route check a fast ⌘↓ would fire a
+  // stale `go()` — re-navigating into an issue from the board. The board and
+  // detail scopes are thus mutually exclusive at keydown, not a render behind.
+  // ⌘↑/↓ check the route INSIDE the handler rather than via `when`, so they still
+  // CONSUME the key in that hand-off frame (returning undefined → preventDefault)
+  // instead of letting it native-scroll — the mirror of the board's reorder gate.
+  useHotkey(hk('detailBack', 'arrow'), () => navigate('/issues'), { terminal: 'handle', when: isDetailRoute });
+  useHotkey(hk('issuePrev'), () => { if (isDetailRoute()) go('up'); }, { terminal: 'handle' });
+  useHotkey(hk('issueNext'), () => { if (isDetailRoute()) go('down'); }, { terminal: 'handle' });
+  useHotkey(hk('detailDismissFlag'), () => dismissIdleRef.current?.(), { terminal: 'handle', when: isDetailRoute });
+  // ⌘S copies the open issue's id — handled by the breadcrumb (CrumbCopy), so the
+  // keystroke and a click on the crumb share ONE copy affordance and the same
+  // "copied ✓" feedback, rather than a separate title flash.
+  // Bare Esc → back to the board. Bubble phase (capture:false) so an open overlay
+  // (status menu, lightbox) that stops Escape in capture wins first; it yields to
+  // the terminal (default) so a focused terminal keeps Esc for the PTY.
+  useHotkey(hk('detailBack', 'esc'), () => navigate('/issues'), { capture: false, when: isDetailRoute });
 
   if (loading && !data) return <div className="spin">loading…</div>;
   if (err) return <div className="error">{err}</div>;
   if (!data) return <div className="error">not found</div>;
 
   const isIssue = data.kind === 'issue';
-  const status = data.status || (data.live ? 'next' : 'next');
+  const status = data.status || DEFAULT_STATUS;
   // Same idle-chat marker as the board card, with the same gate: only an
   // in-progress issue's idle chat flags. Off that column, no flag.
-  const idle = status === 'in-progress' && activity[data.id] === 'idle';
+  const idle = status === 'in-progress' && issueActivity(activity, data) === 'idle';
+  // Keep the ⌘Esc handler pointed at the current idle state.
+  dismissIdleRef.current = () => { if (idle) dismissIssueIdle(activity, data); };
   const body = data.body ?? data.recap_text ?? null;
 
   return (
-    <div className={`detail${wide && isIssue ? ' detail--sidebar' : ''}`}>
+    <div className={`detail${wide && isIssue ? ' detail--sidebar' : ''}`} style={DETAIL_GEOMETRY}>
       <div className="detail-head">
         <div className="title-block">
           <div className="detail-title-row">
-            {idle ? <span className="kcard-idle-dot" title="chat idle — needs your input" /> : null}
+            {idle ? (
+              <button type="button" className="kcard-idle-dot detail-idle-dismiss"
+                title={`chat idle — needs your input · click or ${hkCaps('detailDismissFlag')} to dismiss (also dismisses the selected card on the board)`}
+                aria-label="Dismiss needs-input indicator"
+                onClick={() => dismissIssueIdle(activity, data)}>
+                <span className="idle-dot-fill"><X size={11} /></span>
+              </button>
+            ) : null}
             {isIssue
-              ? <EditableTitle id={data.id} title={data.title || data.id} onSaved={refresh} autoFocus={focusTitle} />
+              ? <EditableTitle id={data.id} title={data.title || data.id} autoFocus={focusTitle} />
               : <h2>{data.title || data.id}</h2>}
           </div>
-          {/* Issue properties now live in the strip below (IssueProperties), so
-              the sub-line is only the live tag (when a local worktree is live)
-              for an issue, and the branch/created summary for a live-branch. */}
-          {isIssue ? (
-            data.live ? <div className="detail-sub"><span className="pill live-tag">● live</span></div> : null
-          ) : (
+          {isIssue ? null : (
             <div className="detail-sub">
-              {data.live ? <span className="pill live-tag">● live</span> : null}
-              {!data.live ? <span className={`pill bucket-${status}`}>{status}</span> : null}
+              <span className={`pill bucket bucket-${status}`}>{status}</span>
               <span className="itag" style={{ marginLeft: 8 }}>branch</span>
               {data.created ? <span className="dim" style={{ marginLeft: 8 }}>created {fmtDate(data.created)}</span> : null}
             </div>
@@ -769,38 +926,25 @@ export function ChangeDetail() {
             above (prevId). Set before navigating so the board's auto-park keeps it
             instead of jumping to the top of In Progress. */}
         {isIssue ? <DeleteIssue id={data.id}
-          onDeleted={() => { setSelection(nextId ?? prevId ?? null); navigate('/'); }} /> : null}
+          onDeleted={() => { setSelection(nextId ?? prevId ?? null); navigate('/issues'); }} /> : null}
       </div>
 
       <div className="issue-fields">
         {isIssue ? (
           <IssueProperties key={data.id} data={data} known={known} local={local} allTags={allTags}
-            column={wide} refresh={refresh} />
+            column={wide} />
         ) : (
           <div className="props-strip">
             {(data.branches?.length ? data.branches : [data.branch]).filter(Boolean).length ? (
-              <PropCell label="branch" width={200}><PillValue values={(data.branches?.length ? data.branches : [data.branch]).filter(Boolean)} /></PropCell>
+              <PropCell label="branch" width={200}><PillValue lines={1} values={(data.branches?.length ? data.branches : [data.branch]).filter(Boolean)} /></PropCell>
             ) : null}
-            {data.commits?.length ? <PropCell label="commits" width={200}><PillValue values={data.commits.map(c => String(c).slice(0, 9))} /></PropCell> : null}
-            {data.sessions?.length ? <PropCell label="sessions" width={200}><PillValue values={data.sessions} /></PropCell> : null}
+            {data.sessions?.length ? <PropCell label="sessions" width={200}><PillValue lines={1} values={data.sessions} /></PropCell> : null}
           </div>
         )}
-        {data.conversations?.length ? (
-          <div className="field-row">
-            <span className="k">convos</span>
-            <span className="v">{data.conversations.map(c => (
-              <ConvoPill key={c} id={data.id} convo={c} conversations={data.conversations}
-                onChanged={refresh} onOpen={() => requestChat?.(data.id, c)} />
-            ))}</span>
-          </div>
-        ) : null}
-        {data.live_pid ? (
-          <div className="field-row"><span className="k">live pid</span><span className="v"><span className="field-pill">{data.live_pid}</span></span></div>
-        ) : null}
       </div>
 
       {isIssue ? (
-        <BodyEditor id={data.id} body={body} onSaved={refresh} />
+        <BodyEditor id={data.id} body={body} />
       ) : body ? (
         <div className="recap-body"><Markdown text={body} /></div>
       ) : (

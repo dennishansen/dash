@@ -1,7 +1,7 @@
 // supabase.mjs — WHERE the project is and WHO we are when we talk to it.
 //
 // Three stores sit on one Supabase project: `issues` (the board), `dash_profiles`
-// (people), and — if you use them — storage buckets (avatars). They used to each
+// (people), and the corpus buckets (gifs, sessions, metrics). They used to each
 // carry their own copy of the host, the anon key, and the service-key fallback —
 // so the identity a signed-in browser pushes in (setAuthToken) reached the issues
 // store and nothing else. Storage writes were hard-wired to the service key,
@@ -11,18 +11,21 @@
 //
 // Plain fetch, no @supabase/* client — a fresh clone needs no install step, and
 // this module is isomorphic (node tools AND the browser bundle import it), so it
-// must never touch node APIs at module scope. Which project + which keys is read
-// in ONE place — dash-config.mjs (process.env in node, Vite build defines in the
-// browser). There are NO hardcoded fallbacks: bring your own Supabase.
+// must never touch node APIs at module scope. `process` doesn't exist in the
+// browser; read env through a guarded shim.
 
+// Which project + which keys is read in ONE place — dash-config.mjs (process.env
+// in node, Vite build defines in the browser). There are NO hardcoded fallbacks:
+// bring your own Supabase.
 import { SUPABASE_URL, SUPABASE_ANON, SUPABASE_SERVICE } from './dash-config.mjs';
 
 export const URL = SUPABASE_URL;
 export const ANON = SUPABASE_ANON;
 
-// What grants access is the BEARER token, and it varies by caller:
-//   - node tools (bin/dash.mjs, dev middleware, CI): the service key, which
-//     bypasses RLS entirely. NODE ONLY — never shipped to the browser.
+// The committed anon key only IDENTIFIES the project (the `apikey` header). What
+// grants access is the BEARER token, and it varies by caller:
+//   - node tools (bin/dash.mjs, dev middleware, CI): DASH_SUPABASE_SERVICE_KEY, which
+//     bypasses RLS entirely.
 //   - browser: ANON until a user signs in, then their access token (pushed here
 //     by auth.js). A bare anon key reads and writes nothing once RLS is locked
 //     to authenticated + allow-listed emails — that's what makes the board safe
@@ -53,6 +56,23 @@ export function headers(extra) {
 
 // --- PostgREST ---------------------------------------------------------------
 
+export class SupabaseHttpError extends Error {
+  constructor(message, status, { retryAfterMs = null } = {}) {
+    super(message);
+    this.name = 'SupabaseHttpError';
+    this.status = status;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+function retryAfterMilliseconds(value) {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const at = Date.parse(value);
+  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : null;
+}
+
 // One REST call against `base` (a full table/rpc URL) with `query` appended.
 // Throws on any non-2xx — callers must surface "unavailable" rather than
 // silently rendering empty data.
@@ -64,7 +84,11 @@ export async function rest(base, method, query, body, prefer) {
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => '');
-    throw new Error(`supabase ${method} ${base}${query} → ${res.status} ${detail}`);
+    throw new SupabaseHttpError(
+      `supabase ${method} ${base}${query} → ${res.status} ${detail}`,
+      res.status,
+      { retryAfterMs: retryAfterMilliseconds(res.headers.get('retry-after')) },
+    );
   }
   const text = await res.text();
   return text ? JSON.parse(text) : null;
@@ -144,28 +168,63 @@ export async function putObject(bucket, key, source, contentType, { upsert = tru
   return publicUrl(bucket, key);
 }
 
-// List one folder of `bucket`. Returns matching file names (no folder rows).
-export async function listBucketFolder(bucket, prefix, match = /.*/) {
+// One page of `bucket` under `prefix`, as the storage rows themselves. A row
+// carries more than its name — `created_at` and `metadata.size` — and `sortBy`
+// is applied by the server, so "the 40 objects that landed most recently" is one
+// request instead of a full listing sorted here. The name-only helpers below are
+// the common case; this is what to reach for when you need the clock.
+//
+// Folder placeholders (`id: null`) come back alongside files; callers pick.
+//
+// THROWS on a failed listing. An outage and an empty bucket are different facts,
+// and a reader that cannot tell them apart tells the person "nothing has been
+// recorded" while storage is down. The name-only helpers below keep the older,
+// forgiving behaviour their callers were written against, but they say so.
+export async function listBucketObjects(bucket, prefix = '', { limit = 1000, offset = 0, search = undefined, sortBy = { column: 'name', order: 'asc' } } = {}) {
   const res = await fetch(`${URL}/storage/v1/object/list/${bucket}`, {
     method: 'POST',
     headers: headers(),
-    body: JSON.stringify({ prefix, limit: 1000, sortBy: { column: 'name', order: 'asc' } }),
+    // `prefix` is a FOLDER path, not a string prefix — `recordings/9e58` matches
+    // nothing. `search` is the name filter within a folder, which is how you ask
+    // for one object's keys without reading the folder it lives in.
+    body: JSON.stringify({ prefix, limit, offset, sortBy, ...(search ? { search } : {}) }),
   });
-  if (!res.ok) return [];
-  const rows = await res.json();
+  if (!res.ok) {
+    throw new SupabaseHttpError(
+      `list ${bucket}/${prefix} → ${res.status} ${await res.text().catch(() => '')}`, res.status);
+  }
+  return res.json();
+}
+
+// List one folder of `bucket`. Returns matching file names (no folder rows).
+// An unreachable listing is an EMPTY one here — the gif gallery and the session
+// id list are decorations over a corpus that may legitimately be empty, and they
+// predate anything that could report an outage.
+export async function listBucketFolder(bucket, prefix, match = /.*/) {
+  const rows = await listBucketObjects(bucket, prefix).catch(() => []);
   // Storage returns files with a non-null id; folder placeholders have id null.
   return rows.filter(r => r && r.id && match.test(r.name)).map(r => r.name);
 }
 
-// Top-level folder names of `bucket` (the placeholder rows, id null).
+// Top-level folder names of `bucket` (the placeholder rows, id null). Same
+// forgiving contract as listBucketFolder.
 export async function listBucketFolders(bucket) {
-  const res = await fetch(`${URL}/storage/v1/object/list/${bucket}`, {
+  return (await listBucketObjects(bucket).catch(() => []))
+    .filter(r => r && r.id == null).map(r => r.name);
+}
+
+// Move an object within `bucket`. Needs a service key (or an identity the
+// bucket's policies accept) — used to correct a key that landed in the wrong
+// namespace, never as part of an ordinary write.
+export async function moveObject(bucket, from, to) {
+  if (!isAuthenticated()) throw new Error('moveObject needs a service key or a signed-in session');
+  const res = await fetch(`${URL}/storage/v1/object/move`, {
     method: 'POST',
     headers: headers(),
-    body: JSON.stringify({ prefix: '', limit: 1000 }),
+    body: JSON.stringify({ bucketId: bucket, sourceKey: from, destinationKey: to }),
   });
-  if (!res.ok) return [];
-  return (await res.json()).filter(r => r && r.id == null).map(r => r.name);
+  if (!res.ok) throw new Error(`moveObject ${bucket} ${from} -> ${to} ${res.status} ${await res.text().catch(() => '')}`);
+  return to;
 }
 
 // Delete objects from `bucket` by full key path.

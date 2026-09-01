@@ -59,6 +59,19 @@ export function useMyProfile() {
 // result if the epoch has moved on.
 let epoch = 0;
 let inFlight = null;
+
+// Has the roster question been ANSWERED at least once (fetch finished, even
+// empty or failed)? Consumers that must not act on a not-yet-loaded roster —
+// main's saved-chat restore reads profile.selected_chat — wait on this instead
+// of mistaking "still loading" for "no saved choice". The first settle
+// republishes so useSyncExternalStore subscribers re-render and re-check.
+let settled = false;
+export function rosterSettled() { return settled; }
+// Reactive form: consumers whose EFFECTS gate on the settle (main's saved-chat
+// restore) need the flip itself to re-render them — a profile that is null both
+// before and after settling would otherwise never re-fire their deps.
+export function useRosterSettled() { return useSyncExternalStore(subscribe, rosterSettled); }
+
 export async function refreshProfiles() {
   if (!inFlight) {
     const startedAt = epoch;
@@ -73,7 +86,10 @@ export async function refreshProfiles() {
       // Only ever clear OUR OWN slot: a fetch retired by an identity change
       // lands after the next one has already started, and blindly nulling here
       // would drop the live fetch's slot and let a third caller duplicate it.
-      finally { if (inFlight === run) inFlight = null; }
+      finally {
+        if (inFlight === run) inFlight = null;
+        if (!settled) { settled = true; publish({ ...snapshot }); }
+      }
     })();
     inFlight = run;
   }

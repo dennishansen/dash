@@ -4,7 +4,7 @@
 // board no longer joins any git-derived branch liveness (that scan was the dash
 // terminal-freeze cause). Keep this free of node imports so the browser bundle
 // can import it. `body` is attached by detail callers, never here.
-import { readChatNames } from './issues-store.mjs';
+import { readChatMeta } from './issues-store.mjs';
 
 export function shapeRow(row) {
   const branches = Array.isArray(row.branches) ? row.branches : [];
@@ -21,25 +21,30 @@ export function shapeRow(row) {
     tags: Array.isArray(row.tags) ? row.tags : [],
     branches,
     sessions: Array.isArray(row.sessions) ? row.sessions : [],
-    commits: Array.isArray(row.commits) ? row.commits : [],
     conversations: Array.isArray(row.conversations) ? row.conversations : [],
-    // Custom display names for this issue's chats, keyed by full session uuid.
-    // Rides beside conversations[]; {} = every chat shows its derived default.
-    chat_names: readChatNames(row),
+    // Per-chat metadata (name + whose computer it lives on), keyed by full
+    // session uuid. Rides beside conversations[]; {} = nothing recorded yet.
+    chat_meta: readChatMeta(row),
     requires: Array.isArray(row.requires) ? row.requires : [],
     unlocks: Array.isArray(row.unlocks) ? row.unlocks : [],
     port: row.port != null ? Number(row.port) : null,
     // The App-pane target path (null = '/', the canvas). Stored beside `port`;
-    // the /open redirect lands the iframe on localhost:<port><app_path>.
+    // the /open redirect lands the iframe on localhost:<port><app_path>. It is
+    // the SELECTED route — one of the pane's links, like selected_session is one
+    // of the chats.
     app_path: row.app_path ?? null,
+    // The extra routes saved for this issue's App pane, beyond the base set every
+    // dev server serves. The address bar's dropdown and ⌃/⌄ steppers move
+    // between base ∪ these.
+    app_paths: Array.isArray(row.app_paths) ? row.app_paths : [],
     // The EXPLICIT chat to open for this issue (null = never selected). Source of
     // truth for the switcher's auto-open and the board's attach-only-selected
     // seed; written on switch / non-reviewer chat create, never by a reviewer.
     selected_session: row.selected_session ?? null,
     created: row.created || null,
     // The DB insert timestamp — the reliable "when created" (the legacy `created`
-    // date column above is often null). Surfaced as a read-only detail property;
-    // undefined on list rows (LIST_COLS omits it), which is fine — only detail shows it.
+    // date column above is often null). Surfaced as a read-only detail property
+    // and as an optional card property, so LIST_COLS carries it too.
     created_at: row.created_at || null,
     updated: row.updated_at || null,
     closed: row.closed_at || null,   // when it entered done/rejected (sorts the archive cols)

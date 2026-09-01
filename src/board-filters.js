@@ -17,28 +17,33 @@ export const FILTER_FIELDS = ['owner', 'tags', 'created'];
 // likewise a single "is within".)
 export const SINGLE_SELECT_FIELDS = new Set(['created']);
 
+// EMPTINESS IS A VALUE. "Has no owner" is a thing an owner filter can look for,
+// exactly like "has owner Dennis" is — so it belongs in the value list rather
+// than in a second, parallel axis of operators. That collapses four operators
+// (contains / does not contain / is empty / is not empty) into two, and buys
+// composition the old model couldn't express: "contains: (none), dash" is one
+// filter for untagged-or-tagged-dash, which needed two filters before.
+//
+// The sentinel carries a NUL, which no tag and no email can contain — so it can
+// never collide with a real value, and it survives JSON for the stored filters.
+export const EMPTY_VALUE = '\u0000empty';
+export const EMPTY_LABEL = '(none)';
+
 // The operators owner/tags can take (created is a single-select recency horizon
-// and takes none). Each operator is its OWN authority — its label, whether it
-// needs a value list, and how it tests an issue's value set against the selected
-// values. `fieldActive`, `fieldMatches`, and the UI all read THIS one table, so
-// there is no second place that knows what "not-contains" means, and an operator
-// not in this table is inert everywhere (it can never silently blank the board).
-// Semantics mirror Notion's multi-select filter — `not-contains` on an UNSET
-// field is true (it contains none of them), so it surfaces unowned/untagged cards.
+// and takes none). Each operator is its OWN authority — its label and how it
+// tests an issue's value set against the selected values. `fieldActive`,
+// `fieldMatches`, and the UI all read THIS one table, so there is no second
+// place that knows what "not-contains" means, and an operator not in this table
+// is inert everywhere (it can never silently blank the board).
 const someIn = (owned, values) => { for (const v of values) if (owned.has(v)) return true; return false; };
 export const FILTER_OPERATORS = [
-  { value: 'contains',     label: 'Contains',         needsValues: true,  test: (owned, values) => someIn(owned, values) },
-  { value: 'not-contains', label: 'Does not contain', needsValues: true,  test: (owned, values) => !someIn(owned, values) },
-  { value: 'empty',        label: 'Is empty',         needsValues: false, test: (owned) => owned.size === 0 },
-  { value: 'not-empty',    label: 'Is not empty',     needsValues: false, test: (owned) => owned.size > 0 },
+  { value: 'contains',     label: 'Is',     test: (owned, values) => someIn(owned, values) },
+  { value: 'not-contains', label: "Isn't", test: (owned, values) => !someIn(owned, values) },
 ];
 const OPERATOR = Object.fromEntries(FILTER_OPERATORS.map(o => [o.value, o]));
 export const DEFAULT_OP = 'contains';
 // Which fields expose the operator selector — created does not.
 export function fieldHasOperators(field) { return field !== 'created'; }
-// Does this operator require a value list? (empty / not-empty do not; an unknown
-// operator does not — it's inert, so nothing offers it values.)
-export function valuesNeeded(op) { return OPERATOR[op]?.needsValues ?? false; }
 
 // Created-date buckets, newest→oldest, each an inclusive [minAgeDays, maxAgeDays]
 // window on how many days ago the issue was created. Labels name the ROLLING
@@ -65,13 +70,13 @@ export function emptyFilters() {
 }
 
 // A filter set is the board's QUESTION — which issues you are looking at — so
-// it has to outlive a reload the way the collapsed columns already do. Sets
-// don't survive JSON and a stored value can be older than the code reading it,
-// so these two are the only places that know how a filter state flattens and how
-// it comes back. Anything unrecognised is dropped rather than trusted: a value
-// that isn't a string, a field the catalogue no longer has, or an operator the
-// table no longer knows (which would restore a field that looks set but
-// constrains nothing).
+// it has to outlive a reload the way the view mode and the collapsed columns
+// already do. Sets don't survive JSON and a stored value can be older than the
+// code reading it, so these two are the only places that know how a filter state
+// flattens and how it comes back. Anything unrecognised is dropped rather than
+// trusted: a value that isn't a string, a field the catalogue no longer has, or
+// an operator the table no longer knows (which would restore a field that looks
+// set but constrains nothing).
 export function serializeFilters(filters) {
   const out = {};
   for (const field of FILTER_FIELDS) {
@@ -82,12 +87,28 @@ export function serializeFilters(filters) {
   return out;
 }
 
+// The two operators that emptiness-as-a-value replaced. A filter saved before
+// that change still means something exact, so it is translated rather than
+// dropped: "is empty" was contains-nothing, "is not empty" was contains-anything
+// -but-nothing. Restoring the default instead would silently widen someone's
+// board to every row.
+const RETIRED_OPS = {
+  empty:       { op: 'contains',     values: [EMPTY_VALUE] },
+  'not-empty': { op: 'not-contains', values: [EMPTY_VALUE] },
+};
+
 export function parseFilters(raw) {
   const next = emptyFilters();
   if (!raw || typeof raw !== 'object') return next;
   for (const field of FILTER_FIELDS) {
     const sel = raw[field];
     if (!sel || typeof sel !== 'object') continue;
+    const retired = RETIRED_OPS[sel.op];
+    if (retired) {
+      next[field].op = retired.op;
+      next[field].values = new Set(retired.values);
+      continue;
+    }
     next[field].op = OPERATOR[sel.op] ? sel.op : DEFAULT_OP;
     next[field].values = new Set(
       (Array.isArray(sel.values) ? sel.values : []).filter(v => typeof v === 'string'),
@@ -96,16 +117,13 @@ export function parseFilters(raw) {
   return next;
 }
 
-// Is this field constraining the board? created is active once a bucket is
-// chosen. For owner/tags: a values-free operator (empty/not-empty) constrains on
-// its own; a valued one (contains/not-contains) needs ≥1 value; an UNKNOWN
-// operator is inert (the single-authority table has no entry for it).
+// Is this field constraining the board? One rule now that emptiness is just a
+// value: it needs at least one value chosen. An UNKNOWN operator is inert (the
+// single-authority table has no entry for it), so it can never blank the board.
 export function fieldActive(field, sel) {
   if (!sel) return false;
-  if (!fieldHasOperators(field)) return sel.values.size > 0;   // created
-  const op = OPERATOR[sel.op];
-  if (!op) return false;                                        // unknown operator → inert
-  return op.needsValues ? sel.values.size > 0 : true;
+  if (!sel.values.size) return false;
+  return fieldHasOperators(field) ? !!OPERATOR[sel.op] : true;
 }
 
 // Is any field constraining the board? Drives the funnel's lit state and (with
@@ -139,14 +157,14 @@ export function createdMatches(created, bucketValue, now) {
   return age >= bucket.minAgeDays && age <= bucket.maxAgeDays;
 }
 
-// The issue's OWN values for a set-valued field: the owner as a one-element set
-// (empty when unowned) or the tag set. Created is not set-valued — matched inline.
+// What an issue "has" for a field — and an issue that has nothing has the EMPTY
+// sentinel, which is what lets one `contains` test answer both "owned by X" and
+// "owned by nobody" without the matcher knowing emptiness is special.
 function issueValueSet(field, issue) {
-  if (field === 'owner') {
-    const e = normalizeEmail(issue.owner);
-    return e ? new Set([e]) : new Set();
-  }
-  return new Set(issue.tags ?? []);
+  const owned = field === 'owner'
+    ? (normalizeEmail(issue.owner) ? new Set([normalizeEmail(issue.owner)]) : new Set())
+    : new Set(issue.tags ?? []);
+  return owned.size ? owned : new Set([EMPTY_VALUE]);
 }
 
 // One ACTIVE field against one issue. Created is a recency OR over its buckets;
@@ -177,6 +195,13 @@ export function tagOptions(issues) {
   const s = new Set();
   for (const i of issues ?? []) for (const t of i.tags ?? []) s.add(t);
   return [...s].sort();
+}
+
+// The value list a set-valued field offers, with "(none)" leading it. Emptiness
+// is a value, so it is a row like any other — first, because it is the one
+// choice that is always available whatever the corpus happens to hold.
+export function withEmptyOption(options) {
+  return [{ value: EMPTY_VALUE, label: EMPTY_LABEL }, ...options];
 }
 
 // Normalized owner emails that hold ≥1 issue — the owner field's candidate
