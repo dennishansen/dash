@@ -1,9 +1,9 @@
 import path from 'node:path';
 
 export const RUN_SCOPED_TEST_TABLES = Object.freeze({
-  ARTIFACT_ISSUES_TABLE: 'dash_test_issues',
-  ARTIFACT_PROFILES_TABLE: 'dash_test_profiles',
-  ARTIFACT_CHATS_TABLE: 'dash_test_chats',
+  DASH_ISSUES_TABLE: 'dash_test_issues',
+  DASH_PROFILES_TABLE: 'dash_test_profiles',
+  DASH_CHATS_TABLE: 'dash_test_chats',
 });
 
 export const RUN_OWNED_RESOURCE_DIRS = Object.freeze({
@@ -30,14 +30,14 @@ export function withRunScopedTestStores(env = {}) {
 // instead of falling back to machine-global transcript, registry, or debug
 // files. Callers may preselect a path; a detached root clears inherited values
 // before invoking this helper and therefore mints a fresh tree.
-export function withRunOwnedTestResources(env = {}, testTmp = env.ARTIFACT_TEST_TMP) {
-  if (!testTmp) throw new Error('run-owned test resources require ARTIFACT_TEST_TMP');
-  const owned = { ...env, ARTIFACT_TEST_TMP: testTmp };
+export function withRunOwnedTestResources(env = {}, testTmp = env.DASH_TEST_TMP) {
+  if (!testTmp) throw new Error('run-owned test resources require DASH_TEST_TMP');
+  const owned = { ...env, DASH_TEST_TMP: testTmp };
   for (const [key, relative] of Object.entries(RUN_OWNED_RESOURCE_DIRS)) {
     if (!owned[key]) owned[key] = path.join(testTmp, relative);
   }
-  if (!owned.ARTIFACT_DEBUG_FILE) {
-    owned.ARTIFACT_DEBUG_FILE = path.join(testTmp, 'artifact-debug.json');
+  if (!owned.DASH_DEBUG_FILE) {
+    owned.DASH_DEBUG_FILE = path.join(testTmp, 'artifact-debug.json');
   }
   return owned;
 }
