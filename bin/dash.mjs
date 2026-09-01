@@ -32,7 +32,7 @@ import { WebSocketServer } from 'ws';
 import '../server/node-env.mjs';
 import { dashApi } from '../server/dash-api.js';
 import { assertConfigured } from '../server/dash-config.mjs';
-import { isAllowedWsHandshake, ensureTerminalToken, isLoopbackHost, selectTerminalSubprotocol, isAllowedApiRequest } from '../server/ws-guard.mjs';
+import { isAllowedWsHandshake, ensureMachineToken, isLoopbackHost, selectTerminalSubprotocol, isAllowedApiRequest } from '../server/ws-guard.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -45,7 +45,7 @@ const HOST = process.env.DASH_HOST || '127.0.0.1';
 // non-browser network client — so require a secret token on the terminal
 // handshake. Auto-generated here (and printed below) unless the operator pinned
 // DASH_TERMINAL_TOKEN. Loopback stays token-free.
-const TERMINAL_TOKEN = ensureTerminalToken(!isLoopbackHost(HOST));
+const TERMINAL_TOKEN = isLoopbackHost(HOST) ? (process.env.DASH_TERMINAL_TOKEN || '') : ensureMachineToken();
 
 // Fail loudly if the user hasn't brought a Supabase project.
 try {

@@ -41,8 +41,9 @@ import fs from 'fs';
 import '../server/node-env.mjs';
 import {
   listAll, get, create, update, appendToArray, removeFromArray,
-  setStatus, setOwner, remove, exists, VALID_STATUS,
+  setStatus, setOwner, remove, exists,
 } from '../server/issues-store.mjs';
+import { VALID_STATUS } from '../src/board-columns.mjs';
 import { freePort } from '../server/ports.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
